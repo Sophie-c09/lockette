@@ -1,0 +1,136 @@
+@import "tailwindcss";
+
+@theme {
+  /* Text — soft near-black ink, never pure black. Left untouched by the
+     brand-green pass below: ink/ink-soft/muted are used for body and
+     heading text throughout the app, and text must stay dark/neutral for
+     readability regardless of what happens to non-text UI fills. */
+  --color-ink: #1c1c1e;
+  --color-ink-soft: #6b6b73;
+  --color-muted: #a1a1aa;
+
+  /* The brand's darkest green — the "black" of this app. Every non-text
+     black UI element (solid fills, translucent image-overlay scrims,
+     hairline borders, drop shadows) routes through this one value instead
+     of true black, so the whole app reads as a single cohesive dark tone
+     rather than a generic near-black. */
+  --color-darkgreen: #0f2a1f;
+
+  /* ink-strong is reserved for the one true "dark anchor" fill (primary
+     buttons, the CTA banner) — aliased to darkgreen rather than kept as
+     its own near-black value, so this fill and the rest of the non-text
+     black sweep can never drift apart. Kept as a separate token name (not
+     inlined as bg-darkgreen everywhere) since its ROLE — "the dark anchor
+     fill" — is what call sites actually care about, independent of
+     whatever color currently backs it. */
+  --color-ink-strong: var(--color-darkgreen);
+
+  /* Layered neutral surface system: page → card → inner section. No glass,
+     no translucency — every surface is a flat, matte, opaque tone. */
+  --color-surface: #ffffff;
+  --color-inner: #f5f6f8;
+  --color-parchment: #ffffff;
+  --color-parchment-deep: #f5f6f8;
+  /* Hairline borders — tinted toward the brand darkgreen instead of
+     neutral black, at the same low opacities as before (these are alpha
+     values, not solid fills, so the visual shift is subtle by design). */
+  --color-border: rgba(15, 42, 31, 0.05);
+  --color-border-soft: rgba(15, 42, 31, 0.04);
+  --color-border-button: rgba(15, 42, 31, 0.08);
+
+  /* Structure — the soft teal that anchors nav/tab chrome, distinct from
+     the pastel tag tokens even though the tone overlaps. */
+  --color-nav: #f0fdff;
+
+  /* Muted, fabric-like accent inks — used sparingly for icons, links, and
+     small text, never as large fills. Desaturated on purpose: sun-faded,
+     not saturated-app-UI. */
+  --color-oxblood: #8b3a5e;
+  --color-oxblood-deep: #73304c;
+  --color-teal: #5fa8a3;
+  --color-teal-deep: #4c8b86;
+  --color-gold: #8b3a5e;
+  --color-olive: #5fa8a3;
+
+  /* Tonal tints — tags, icon badges, small highlights only. Exactly three
+     families (pink / teal / cream) per the brand's color roles. */
+  --color-tag-pink: #f7e4ec;
+  --color-tag-pink-ink: #8b3a5e;
+  --color-tag-teal: #e6f4f3;
+  --color-tag-teal-ink: #5fa8a3;
+  --color-tag-yellow: #fdf6d8;
+  --color-tag-yellow-ink: #8a5a2b;
+  --color-teal-soft: #e6f4f3;
+  --color-pink-soft: #f7e4ec;
+
+  /* Warm cream highlight surfaces — featured sections, empty states,
+     onboarding moments. One consistent tone, not for page-level fills. */
+  --color-highlight-cream: #fdf6d8;
+  --color-highlight-cream-ink: #8a5a2b;
+  --color-highlight-yellow: #fdf6d8;
+
+  --font-display: var(--font-display-raw);
+  --font-sans: var(--font-body-raw);
+
+  --radius-card: 1.25rem;
+  --radius-pill: 999px;
+  /* Drop shadows tinted toward darkgreen instead of neutral black, same
+     low opacities as before — a subtle branding touch on card elevation. */
+  --shadow-soft: 0 8px 28px rgba(15, 42, 31, 0.05);
+  --shadow-card: 0 10px 40px rgba(15, 42, 31, 0.06);
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+/* One flat, barely-there warm tint behind the whole app — atmospheric,
+   almost white, not a dominant color. No gradient, no glow — depth comes
+   from layered neutrals and soft matte shadows instead. */
+body {
+  background: #fffcfe;
+  color: var(--color-ink);
+  font-family: var(--font-body-raw), "Helvetica Neue", Arial, sans-serif;
+  letter-spacing: 0.01em;
+}
+
+.paper-grain {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  opacity: 0.03;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+@keyframes toast-fade {
+  0% {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  10% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  80% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+.animate-toast {
+  animation: toast-fade 1.5s ease forwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .animate-toast {
+    animation-duration: 1ms;
+  }
+}

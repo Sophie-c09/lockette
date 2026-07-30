@@ -1,0 +1,53 @@
+# dependencies
+/node_modules
+
+# next.js
+/.next/
+/out/
+
+# production
+/build
+
+# misc
+.DS_Store
+*.pem
+
+# debug / logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+logs/
+.debug-import-pipeline/
+
+# env files — every variant (.env, .env.local, .env.production, etc.),
+# never the checked-in template
+.env
+.env*.local
+.env.local
+.env.production
+.env*
+!.env.local.example
+
+# Supabase — local CLI state can cache service-role/db credentials
+.supabase/
+
+# playwright
+/test-results/
+/playwright-report/
+/playwright/.cache/
+.playwright/
+
+# typescript
+*.tsbuildinfo
+next-env.d.ts
+
+# editor/assistant local state
+.claude/
+
+# accidental root-level clutter (browser saves, stray shell-redirect
+# artifacts) — not part of the app; excluded rather than deleted
+*_files/
+next
+reworn@0.1.0
+thriftmatch@0.1.0

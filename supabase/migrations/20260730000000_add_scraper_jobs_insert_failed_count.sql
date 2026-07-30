@@ -1,0 +1,20 @@
+-- Inventory Growth/Bulk Importer architecture-parity fix — dashboard
+-- requirement "Database insert failures" needs its own persisted column,
+-- distinct from rejected_count (already live): rejected_count is
+-- everything that never reached insert at all (failed to extract, or
+-- failed the quality gate); insert_failed_count is specifically a
+-- candidate that scored well, wasn't a duplicate, and still failed the
+-- actual Supabase insert (a real infrastructure problem — bad columns, a
+-- constraint violation, connectivity), never lumped into rejected_count
+-- since neither of those is what actually happened.
+--
+-- Verified directly against the live database before writing this file:
+-- `select insert_failed_count from scraper_jobs limit 1` fails with
+-- 42703 "column scraper_jobs.insert_failed_count does not exist" —
+-- consistent with every other scraper_jobs column added here, this is a
+-- brand new column, not a "never applied" gap in an existing one.
+--
+-- This is a straight copy of the corresponding line just added to
+-- supabase/schema.sql (search that file for "Database insert failures")
+-- — same SQL, actually run as a real migration this time.
+alter table public.scraper_jobs add column if not exists insert_failed_count integer not null default 0;
