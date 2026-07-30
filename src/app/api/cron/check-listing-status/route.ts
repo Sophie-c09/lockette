@@ -1,7 +1,17 @@
 // Periodic "is this still for sale on the original site" sweep — triggered
-// by Vercel Cron (see vercel.json) every 20 minutes. Never linked from the
-// app itself; the only caller is Vercel's scheduler (or a manual curl with
-// the right secret, for testing).
+// by Vercel Cron (see vercel.json) once a day at 06:00 UTC. Never linked
+// from the app itself; the only caller is Vercel's scheduler (or a manual
+// curl with the right secret, for testing).
+//
+// SCHEDULE NOTE: this originally ran every 20 minutes, but Vercel's Hobby
+// plan only allows once-daily cron schedules, so vercel.json's entry was
+// changed to "0 6 * * *" to keep deploys working. The route's own
+// RECHECK_INTERVAL_MINUTES below is unrelated to the cron's own cadence
+// (it's the "how stale can a listing's last check be before this run picks
+// it up again" window) and is left as-is; it just means, at once-a-day
+// invocation, effectively every active listing is eligible each run rather
+// than only the ones stale by exactly 20 minutes. Move to a sub-daily
+// schedule (or a paid plan) later if fresher availability data is needed.
 //
 // Batches (25 listings/run, oldest-checked-first) and rate-limits its own
 // concurrency (see CONCURRENCY below) rather than firing all requests at

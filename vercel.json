@@ -2,7 +2,7 @@
   "crons": [
     {
       "path": "/api/cron/check-listing-status",
-      "schedule": "*/20 * * * *"
+      "schedule": "0 6 * * *"
     }
   ]
 }
