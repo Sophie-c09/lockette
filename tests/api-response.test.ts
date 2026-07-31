@@ -32,7 +32,15 @@ test("successful JSON response is parsed and returned as-is", async () => {
   assert.deepEqual(data, { success: true, jobId: "abc-123", status: "queued" });
 });
 
-test("a thrown server error with a JSON {error} body surfaces that exact message", async () => {
+test("a thrown server error with a JSON {error, details} body surfaces BOTH — the generic label and the real underlying reason", async () => {
+  // "Do not replace the message with another generic error" — this
+  // app's own route handlers deliberately split a stable, generic
+  // `error` label from the SPECIFIC exception message in `details` (see
+  // sanitizedErrorResponse in both /api/admin-scraper/run and
+  // /api/admin-scraper/large-scale); parseApiResponse must surface both,
+  // not just the generic label, or a real failure (a missing env var, a
+  // missing Playwright file, anything) reads identically to every other
+  // failure.
   const response = jsonResponse(500, "Internal Server Error", {
     error: "Failed to start inventory growth",
     code: "INVENTORY_GROWTH_START_FAILED",
@@ -41,7 +49,17 @@ test("a thrown server error with a JSON {error} body surfaces that exact message
 
   await assert.rejects(() => parseApiResponse(response), (error: unknown) => {
     assert.ok(error instanceof ApiResponseError);
-    assert.equal(error.message, "Failed to start inventory growth");
+    assert.equal(error.message, "Failed to start inventory growth: SUPABASE_SERVICE_ROLE_KEY is not set");
+    return true;
+  });
+});
+
+test("a JSON {error} body with no details field surfaces just the error, with no trailing ': '", async () => {
+  const response = jsonResponse(500, "Internal Server Error", { error: "Not authorized." });
+
+  await assert.rejects(() => parseApiResponse(response), (error: unknown) => {
+    assert.ok(error instanceof ApiResponseError);
+    assert.equal(error.message, "Not authorized.");
     return true;
   });
 });

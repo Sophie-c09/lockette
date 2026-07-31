@@ -62,11 +62,27 @@ export async function parseApiResponse<T = unknown>(response: Response, featureL
       data && typeof data === "object" && "error" in data && typeof data.error === "string"
         ? data.error
         : null;
+    // The real underlying reason (e.g. "Cannot find module
+    // '.../playwright-core/browsers.json'") — this app's own route
+    // handlers (sanitizedErrorResponse in both /api/admin-scraper/run and
+    // /api/admin-scraper/large-scale) deliberately keep `error` a stable,
+    // generic label and put the SPECIFIC exception message in `details`,
+    // same "never show the raw internal error as the headline, but never
+    // hide it entirely either" balance those routes already strike
+    // server-side. Appending it here is what stops a real failure from
+    // reading as just "Failed to start the scraper" with no way to tell
+    // WHY — this feature's own "do not replace the message with another
+    // generic error" requirement.
+    const jsonDetails =
+      data && typeof data === "object" && "details" in data && typeof data.details === "string" ? data.details : null;
 
     throw new ApiResponseError(
-      jsonMessage ??
-        `${featureLabel} failed (${response.status} ${response.statusText}). ` +
-          `Response: ${rawBody.slice(0, 300)}`,
+      jsonMessage
+        ? jsonDetails
+          ? `${jsonMessage}: ${jsonDetails}`
+          : jsonMessage
+        : `${featureLabel} failed (${response.status} ${response.statusText}). ` +
+            `Response: ${rawBody.slice(0, 300)}`,
     );
   }
 

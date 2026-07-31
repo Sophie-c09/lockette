@@ -71,12 +71,29 @@ function parseStringArray(value: unknown): string[] | null {
 // Sanitized shape, same convention as /api/admin-scraper/large-scale's own
 // sanitizedErrorResponse — a stable code + a short details string, never
 // a raw internal error. The full error (message + stack) is always
-// logged server-side first, in every catch block below.
+// logged server-side first, in every catch block below. `error` is a
+// generic, stable label — `details` is where the REAL underlying reason
+// lives (e.g. "Cannot find module '.../playwright-core/browsers.json'"),
+// per this feature's own "do not hide the actual exception behind a
+// generic message" requirement — see parseApiResponse's own handling of
+// this same field (src/lib/api-response.ts).
 function sanitizedErrorResponse(details: string, status: number) {
   return NextResponse.json(
     { error: "Failed to start the scraper", code: "ADMIN_SCRAPER_RUN_START_FAILED", details },
     { status },
   );
+}
+
+// Structured per-stage tracing (Continuous Import startup-failure
+// investigation) — one line per stage of the 7-step start flow, so a
+// future failure can be pinned to an EXACT stage from logs alone, rather
+// than only "the handler threw, somewhere."
+function logStartStage(stage: string, createdJobId: string | null): void {
+  console.info("[CONTINUOUS_IMPORT][START_STAGE]", {
+    stage,
+    jobId: createdJobId,
+    timestamp: new Date().toISOString(),
+  });
 }
 
 export async function POST(request: Request) {
@@ -114,16 +131,19 @@ export async function POST(request: Request) {
   // RUNTIME — inside this function, inside this try block — so its
   // rejection is just another value this catch already handles.
   try {
+    logStartStage("authenticate_user", createdJobId);
     const supabase = await createClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
 
+    logStartStage("verify_admin", createdJobId);
     if (!user || !(await isCurrentUserAdmin(supabase, user.id))) {
       console.warn(`[${routeName}] Unauthorized start attempt`, { userId: user?.id ?? null });
       return NextResponse.json({ error: "Not authorized." }, { status: 401 });
     }
 
+    logStartStage("parse_request", createdJobId);
     let body: unknown;
     try {
       body = await request.json();
@@ -146,6 +166,7 @@ export async function POST(request: Request) {
       limit,
     };
 
+    logStartStage("create_scraper_job", createdJobId);
     const { job, error: createError } = await createScraperJob(limit);
     if (!job) {
       console.error(`[${routeName}] createScraperJob failed`, { userId: user.id, createError });
@@ -154,6 +175,7 @@ export async function POST(request: Request) {
     createdJobId = job.id;
 
     console.log(`[${routeName}] Job created`, { userId: user.id, jobId: job.id, limit });
+    logStartStage("scraper_job_created", createdJobId);
 
     // Dynamic import, not a top-level one — see this function's own
     // comment above for why. Evaluated here, still inside this try block,
@@ -163,8 +185,11 @@ export async function POST(request: Request) {
     // crashing uncaught (the original bug) or silently returning a
     // `{ jobId }` success response for a job that can now never actually
     // run.
+    logStartStage("dynamic_import_admin_scraper", createdJobId);
     const { runContinuousAdminScraper } = await import("@/lib/admin-scraper");
+    logStartStage("dynamic_import_succeeded", createdJobId);
 
+    logStartStage("register_background_runner", createdJobId);
     after(async () => {
       try {
         await markScraperJobRunning(job.id);
@@ -200,8 +225,15 @@ export async function POST(request: Request) {
       }
     });
 
+    logStartStage("return_response", createdJobId);
     return NextResponse.json({ jobId: job.id });
   } catch (error) {
+    // Whatever stage's log line above this is the LAST one that printed
+    // is the stage that was in progress when this fired — there's no
+    // stage-by-stage try/catch (that would just re-implement the same
+    // "mark failed, return JSON" logic seven times), so this one catch
+    // covers every stage; the log trail is what pins down which one.
+    logStartStage("failed", createdJobId);
     // Full server-side log — route name, and the complete stack. The
     // client only ever sees the sanitized shape below.
     const message = error instanceof Error ? error.message : "Unexpected server error.";

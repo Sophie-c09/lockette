@@ -22,6 +22,30 @@ const nextConfig: NextConfig = {
   // documented guidance for native/binary Node dependencies (Playwright,
   // sharp, etc.) in Route Handlers.
   serverExternalPackages: ["playwright"],
+  // Continuous Import / Style-Aware Scraper root cause (the "Failed to
+  // start the scraper" investigation) — confirmed live via the real
+  // scraper_jobs.error_message this app's own failScraperJob recorded:
+  // "Failed to load external module playwright-...: Error: Cannot find
+  // module '/var/task/node_modules/playwright-core/browsers.json'".
+  // serverExternalPackages above correctly stops Next from bundling
+  // playwright's SOURCE into the JS bundle (leaving it as a plain
+  // runtime `require`), but Vercel's own deployment file-tracer
+  // (@vercel/nft, which decides which node_modules files actually ship
+  // with each serverless Function) can't always tell that a package left
+  // "external" this way still needs its own non-JS files (browsers.json,
+  // the browser-registry manifest, etc.) physically present alongside
+  // it — those are read via dynamic paths inside playwright-core's own
+  // code, not statically-analyzable `require()` calls the tracer can
+  // follow. outputFileTracingIncludes force-includes the whole
+  // playwright/playwright-core package trees for the two routes that
+  // actually launch a browser (this app never runs Playwright anywhere
+  // else — see this repo's own "never import admin-scraper.ts from a
+  // route real users' browsers wait on" convention), so the file the
+  // deployed Function actually reaches for is there.
+  outputFileTracingIncludes: {
+    "/api/admin-scraper/run": ["./node_modules/playwright/**", "./node_modules/playwright-core/**"],
+    "/api/admin-scraper/large-scale/process-batch": ["./node_modules/playwright/**", "./node_modules/playwright-core/**"],
+  },
   // Default Server Action body limit is 1MB — too small for Recreate This
   // Outfit's photo upload (RecreateOutfitForm.tsx posts the image File
   // directly to classifyOutfitPhotoForRecreation, a Server Action), which
