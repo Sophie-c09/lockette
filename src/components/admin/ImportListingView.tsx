@@ -1036,6 +1036,18 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
+
+      // TEMPORARY diagnostic — "still getting Unexpected token '<'"
+      // investigation. response.clone() so this read doesn't consume the
+      // body parseApiResponse still needs below (a fetch Response body can
+      // only be read once). Remove once a fresh test confirms which
+      // request is actually returning non-JSON.
+      const diagnosticClone = response.clone();
+      console.log("[continuous-import][DIAGNOSTIC] url", diagnosticClone.url);
+      console.log("[continuous-import][DIAGNOSTIC] status", diagnosticClone.status);
+      console.log("[continuous-import][DIAGNOSTIC] content-type", diagnosticClone.headers.get("content-type"));
+      console.log("[continuous-import][DIAGNOSTIC] body (first 500 chars)", (await diagnosticClone.text()).slice(0, 500));
+
       // Never response.json() directly — see src/lib/api-response.ts's own
       // header comment for the exact production incident (a framework-
       // level 500 HTML page, not this route's JSON) this replaced. This is
