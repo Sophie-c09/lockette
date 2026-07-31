@@ -600,7 +600,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         body: JSON.stringify({ jobId }),
         signal: abortController.signal,
       });
-      await parseApiResponse(response);
+      await parseApiResponse(response, "Inventory Growth");
     } catch (err) {
       // Not surfaced as largeScaleError — a single failed batch call
       // shouldn't interrupt the dashboard; the job's own polled status
@@ -721,7 +721,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       // Never response.json() directly — see src/lib/api-response.ts's own
       // header comment for the exact production incident (a framework-
       // level 500 HTML page, not this route's JSON) this replaced.
-      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response);
+      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response, "Inventory Growth");
 
       if (!data.jobId) {
         throw new Error("Failed to start large-scale ingestion.");
@@ -771,7 +771,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resumeJobId: largeScaleJob.id }),
       });
-      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response);
+      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response, "Inventory Growth");
 
       if (!data.jobId) {
         throw new Error("Failed to resume large-scale ingestion.");
@@ -994,7 +994,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       // Never response.json() directly — see src/lib/api-response.ts's own
       // header comment for the exact production incident (a framework-
       // level 500 HTML page, not this route's JSON) this replaced.
-      const data = await parseApiResponse<{ jobId?: string }>(response);
+      const data = await parseApiResponse<{ jobId?: string }>(response, "Style-Aware Scraper");
 
       if (!data.jobId) {
         throw new Error("Failed to start the scraper.");
@@ -1031,22 +1031,32 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
     window.localStorage.removeItem(CONTINUOUS_JOB_STORAGE_KEY);
 
     try {
-      const response = await fetch("/api/admin-scraper/run", {
-        method: "POST",
+      const requestUrl = "/api/admin-scraper/run";
+      const requestMethod = "POST";
+      const response = await fetch(requestUrl, {
+        method: requestMethod,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
 
-      // TEMPORARY diagnostic — "still getting Unexpected token '<'"
-      // investigation. response.clone() so this read doesn't consume the
-      // body parseApiResponse still needs below (a fetch Response body can
-      // only be read once). Remove once a fresh test confirms which
-      // request is actually returning non-JSON.
+      // TEMPORARY diagnostic — "mismatched error message" investigation
+      // (the displayed error said "Inventory Growth failed" for a
+      // Continuous Import click — see parseApiResponse's own featureLabel
+      // param, which is the actual fix for that; this logging is purely
+      // to confirm what this specific request's own response looks like).
+      // response.clone() so this read doesn't consume the body
+      // parseApiResponse still needs below (a fetch Response body can
+      // only be read once). Remove once a fresh test confirms the real
+      // status/content-type this request gets back.
       const diagnosticClone = response.clone();
-      console.log("[continuous-import][DIAGNOSTIC] url", diagnosticClone.url);
-      console.log("[continuous-import][DIAGNOSTIC] status", diagnosticClone.status);
-      console.log("[continuous-import][DIAGNOSTIC] content-type", diagnosticClone.headers.get("content-type"));
-      console.log("[continuous-import][DIAGNOSTIC] body (first 500 chars)", (await diagnosticClone.text()).slice(0, 500));
+      console.log("[DIAGNOSTIC]", {
+        feature: "continuous-import",
+        url: requestUrl,
+        method: requestMethod,
+        status: diagnosticClone.status,
+        contentType: diagnosticClone.headers.get("content-type"),
+        body: (await diagnosticClone.text()).slice(0, 500),
+      });
 
       // Never response.json() directly — see src/lib/api-response.ts's own
       // header comment for the exact production incident (a framework-
@@ -1058,8 +1068,10 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       // client-side guard means ANY non-JSON response (a proxy error, a
       // platform-level timeout page, anything neither side anticipated)
       // still surfaces a real, readable error instead of a raw parse
-      // exception.
-      const data = await parseApiResponse<{ jobId?: string }>(response);
+      // exception. "Continuous Import" (not "Inventory Growth") is what
+      // this now actually says on failure — see parseApiResponse's own
+      // featureLabel param.
+      const data = await parseApiResponse<{ jobId?: string }>(response, "Continuous Import");
 
       if (!data.jobId) {
         throw new Error("Failed to start continuous import.");

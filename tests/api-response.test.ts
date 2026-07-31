@@ -110,3 +110,44 @@ test("an unauthenticated-style 401 JSON response (not an HTML redirect page) par
     return true;
   });
 });
+
+// Regression guard for a real, reported bug: every caller (Inventory
+// Growth, Continuous Import, Style-Aware Scraper) used to get the exact
+// same hardcoded "Inventory Growth failed" fallback message regardless of
+// which feature's own request actually failed — so a Continuous Import
+// click that hit a non-JSON response displayed "Inventory Growth failed"
+// to the admin, misidentifying which feature broke.
+test("the fallback error message uses the caller's own featureLabel, not a hardcoded feature name", async () => {
+  // A fresh Response per call — a Response body can only be read once,
+  // and parseApiResponse always reads it (via .text()).
+  const html = "<!DOCTYPE html><html id=\"__next_error__\">...";
+
+  await assert.rejects(() => parseApiResponse(htmlResponse(500, "Internal Server Error", html), "Continuous Import"), (error: unknown) => {
+    assert.ok(error instanceof ApiResponseError);
+    assert.match(error.message, /^Continuous Import failed/);
+    assert.doesNotMatch(error.message, /Inventory Growth/);
+    return true;
+  });
+
+  await assert.rejects(() => parseApiResponse(htmlResponse(500, "Internal Server Error", html), "Style-Aware Scraper"), (error: unknown) => {
+    assert.ok(error instanceof ApiResponseError);
+    assert.match(error.message, /^Style-Aware Scraper failed/);
+    return true;
+  });
+
+  await assert.rejects(() => parseApiResponse(htmlResponse(500, "Internal Server Error", html), "Inventory Growth"), (error: unknown) => {
+    assert.ok(error instanceof ApiResponseError);
+    assert.match(error.message, /^Inventory Growth failed/);
+    return true;
+  });
+});
+
+test("featureLabel defaults to a generic 'Request' when a caller doesn't pass one, not a specific feature name", async () => {
+  const response = htmlResponse(500, "Internal Server Error", "<!DOCTYPE html>...");
+
+  await assert.rejects(() => parseApiResponse(response), (error: unknown) => {
+    assert.ok(error instanceof ApiResponseError);
+    assert.match(error.message, /^Request failed/);
+    return true;
+  });
+});

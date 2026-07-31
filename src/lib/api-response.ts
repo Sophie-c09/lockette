@@ -11,6 +11,13 @@
 // domain redirect, or a proxy in front of the app can all substitute an
 // HTML (or empty, or plain-text) body for the JSON this app's own route
 // handlers always intend to send.
+//
+// Now shared by every admin-scraper feature (Inventory Growth, Continuous
+// Import, Style-Aware Scraper) — each caller passes its OWN featureLabel
+// (see parseApiResponse below) so a failure is reported as e.g.
+// "Continuous Import failed", not the first feature this was built for
+// regardless of which one actually broke — a real, reported bug in its
+// own right, distinct from whatever caused the underlying failure.
 export class ApiResponseError extends Error {}
 
 /**
@@ -23,8 +30,18 @@ export class ApiResponseError extends Error {}
  * response. On a non-OK response, prefers a JSON `{ error }` field when
  * one was actually parsed, falling back to the same status+body-snippet
  * message otherwise.
+ *
+ * `featureLabel` names whichever feature is actually calling this in
+ * every fallback message — this used to be hardcoded to "Inventory
+ * Growth" (the first feature this was built for), which meant a
+ * Continuous Import or Style-Aware Scraper failure displayed "Inventory
+ * Growth failed" to the admin: a real, reported bug (the error message
+ * misidentified which feature actually failed) distinct from whatever
+ * caused the failure itself. Defaults to "Request" for any caller that
+ * doesn't pass one, rather than silently reintroducing a wrong-but-named
+ * feature as the fallback.
  */
-export async function parseApiResponse<T = unknown>(response: Response): Promise<T> {
+export async function parseApiResponse<T = unknown>(response: Response, featureLabel = "Request"): Promise<T> {
   const contentType = response.headers.get("content-type") ?? "";
   const rawBody = await response.text();
 
@@ -35,7 +52,7 @@ export async function parseApiResponse<T = unknown>(response: Response): Promise
       data = JSON.parse(rawBody);
     } catch {
       throw new ApiResponseError(
-        `Server returned invalid JSON (${response.status}): ${rawBody.slice(0, 300)}`,
+        `${featureLabel} returned invalid JSON (${response.status}): ${rawBody.slice(0, 300)}`,
       );
     }
   }
@@ -48,7 +65,7 @@ export async function parseApiResponse<T = unknown>(response: Response): Promise
 
     throw new ApiResponseError(
       jsonMessage ??
-        `Inventory Growth failed (${response.status} ${response.statusText}). ` +
+        `${featureLabel} failed (${response.status} ${response.statusText}). ` +
           `Response: ${rawBody.slice(0, 300)}`,
     );
   }
@@ -59,7 +76,7 @@ export async function parseApiResponse<T = unknown>(response: Response): Promise
   // a caller crash later on `data.jobId` or similar.
   if (!(contentType.includes("application/json") && rawBody)) {
     throw new ApiResponseError(
-      `Expected a JSON response but got ${response.status} with content-type "${contentType || "none"}": ` +
+      `${featureLabel} expected a JSON response but got ${response.status} with content-type "${contentType || "none"}": ` +
         `${rawBody.slice(0, 300)}`,
     );
   }

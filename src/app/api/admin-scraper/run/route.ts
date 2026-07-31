@@ -41,7 +41,13 @@ import { revalidatePath } from "next/cache";
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
 import { SCRAPER_CONFIG } from "@/lib/scraper-config";
-import { runContinuousAdminScraper, type AdminScraperOptions } from "@/lib/admin-scraper";
+// Type-only — erased entirely at compile time (no runtime import/require
+// call ever happens for it), so this can never be the source of a
+// module-evaluation crash the way a VALUE import of "@/lib/admin-scraper"
+// could be (see this route's own dynamic import of runContinuousAdminScraper
+// below, and that module's own transitively-Playwright-importing
+// dependency graph).
+import type { AdminScraperOptions } from "@/lib/admin-scraper";
 import {
   createScraperJob,
   markScraperJobRunning,
@@ -77,21 +83,36 @@ export async function POST(request: Request) {
   const routeName = "admin-scraper/run";
   console.log(`[${routeName}] Scraper started — request received`);
 
-  // "Continuous Import returns HTML instead of JSON" root cause: this
-  // handler had NO outer try/catch — any synchronous throw before the
-  // response was sent (createClient()/auth.getUser() failing,
-  // isCurrentUserAdmin's own DB query erroring, or createScraperJob's
-  // createAdminClient() throwing when SUPABASE_SERVICE_ROLE_KEY isn't
-  // loaded — a real, previously-documented failure mode, see
-  // src/lib/supabase/admin.ts) propagated straight out of POST() as an
-  // uncaught exception. Next.js/Vercel's own crash handling then serves
-  // its generic HTML error page instead of this route's JSON, which is
-  // exactly what turns into the frontend's "Unexpected token '<',
-  // \"<!DOCTYPE \"... is not valid JSON" — the same class of bug already
-  // fixed in the sibling /api/admin-scraper/large-scale routes (see that
-  // route's own header comment), just never applied here. Wrapping
-  // everything below in one try/catch, same as those two routes, is what
-  // makes this handler ALWAYS return a Response no matter what throws.
+  // Set the moment createScraperJob returns a row — if the dynamic import
+  // below (or anything else after this point) throws, this job must be
+  // left 'failed' with a real error, not orphaned at its initial status
+  // forever — same reasoning as /api/admin-scraper/large-scale's own
+  // createdJobId tracking.
+  let createdJobId: string | null = null;
+
+  // "Continuous Import returns HTML instead of JSON" root cause #1
+  // (fixed previously): this handler had NO outer try/catch — any
+  // synchronous throw before the response was sent propagated straight
+  // out of POST() as an uncaught exception, and Next.js/Vercel's own
+  // crash handling served its generic HTML error page instead of this
+  // route's JSON. Wrapping everything below in one try/catch, same as
+  // the sibling /api/admin-scraper/large-scale routes, is what makes this
+  // handler ALWAYS return a Response no matter what throws.
+  //
+  // Root cause #2 (this pass): a try/catch INSIDE this function body
+  // cannot catch a failure in this file's own top-level `import`
+  // statements — those are evaluated when the MODULE loads, before any
+  // of this function's own code (including the try block itself) ever
+  // runs. "@/lib/admin-scraper" (runContinuousAdminScraper) transitively
+  // imports Playwright (browser-concurrency.ts, extraction/
+  // browser-extractor.ts, marketplace-discovery.ts, inventory/
+  // scaled-discovery.ts — confirmed via `npx madge` against this exact
+  // route) — if evaluating that module ever throws, on the module graph
+  // built for THIS route specifically, no try/catch written here could
+  // ever have caught it, no matter how defensively this function body is
+  // written. A dynamic `await import(...)`, by contrast, runs AT
+  // RUNTIME — inside this function, inside this try block — so its
+  // rejection is just another value this catch already handles.
   try {
     const supabase = await createClient();
     const {
@@ -130,8 +151,19 @@ export async function POST(request: Request) {
       console.error(`[${routeName}] createScraperJob failed`, { userId: user.id, createError });
       return sanitizedErrorResponse(createError ?? "Failed to create the scraper job.", 500);
     }
+    createdJobId = job.id;
 
     console.log(`[${routeName}] Job created`, { userId: user.id, jobId: job.id, limit });
+
+    // Dynamic import, not a top-level one — see this function's own
+    // comment above for why. Evaluated here, still inside this try block,
+    // BEFORE the response is returned: if loading this module throws, the
+    // outer catch below marks the already-created job 'failed' (via
+    // createdJobId) and returns a real error response, instead of either
+    // crashing uncaught (the original bug) or silently returning a
+    // `{ jobId }` success response for a job that can now never actually
+    // run.
+    const { runContinuousAdminScraper } = await import("@/lib/admin-scraper");
 
     after(async () => {
       try {
@@ -173,10 +205,20 @@ export async function POST(request: Request) {
     // Full server-side log — route name, and the complete stack. The
     // client only ever sees the sanitized shape below.
     const message = error instanceof Error ? error.message : "Unexpected server error.";
-    console.error(`[${routeName}] Uncaught error in POST handler`, {
+    console.error("[CONTINUOUS_IMPORT][UNHANDLED]", {
+      route: routeName,
       message,
       stack: error instanceof Error ? error.stack : undefined,
     });
+
+    // A job row already exists at this point only if the exception
+    // happened AFTER createScraperJob returned (e.g. the dynamic import
+    // above throwing) — that row must not be left at its initial status
+    // forever with no error recorded.
+    if (createdJobId) {
+      await failScraperJob(createdJobId, message);
+    }
+
     return sanitizedErrorResponse(message, 500);
   }
 }
