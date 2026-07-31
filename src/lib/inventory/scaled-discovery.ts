@@ -41,6 +41,7 @@ import {
 } from "@/lib/inventory/discovery-history";
 import { recordDiscoveryAttempt, isPlatformEnabled } from "@/lib/inventory/marketplace-health";
 import { acquirePooledBrowser, releasePooledBrowser } from "@/lib/browser-concurrency";
+import { DISCOVERY_CONCURRENCY } from "@/lib/scraper-config";
 import os from "node:os";
 
 // Discovery redesign requirement 5 — "marketplace-specific discovery
@@ -196,7 +197,11 @@ function debugLog(message: string): void {
 // SCALED_SOURCES above still bounds its own local fan-out, but this is the
 // real ceiling now: replaces the old aggressive-mode concurrencyOverride
 // entirely (see runAggressiveRound's own call site in admin-scraper.ts).
-export const DISCOVERY_CONCURRENCY = Number(process.env.DISCOVERY_CONCURRENCY) || 5;
+// Lives in scraper-config.ts now (Inventory Growth "HTML 500" fix — see
+// this file's own import of it, and that file's own comment) — re-export
+// kept here so nothing that still imports it from
+// "@/lib/inventory/scaled-discovery" breaks.
+export { DISCOVERY_CONCURRENCY };
 
 let activeDiscoverySlots = 0;
 const discoveryWaitQueue: Array<() => void> = [];

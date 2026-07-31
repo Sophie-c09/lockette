@@ -131,6 +131,7 @@ import {
   OVERNIGHT_MAX_PAGES_PER_QUERY,
   OVERNIGHT_AGGRESSIVE_CONFIG,
   PER_BATCH_MAX_RUNTIME_MS,
+  MAX_EXTRACTION_CONCURRENCY,
   type ScraperMode,
 } from "@/lib/scraper-config";
 import { forceCloseAllTrackedBrowsers } from "@/lib/browser-concurrency";
@@ -341,10 +342,11 @@ const EXTRACTION_BATCH_SIZE = Number(process.env.EXTRACTION_BATCH_SIZE) || 100;
 // extraction; batching above does not introduce a second one.
 // mapWithConcurrency is still the only primitive that actually runs
 // workers, both here and in runAggressiveRound's own claim loop.
-// Exported so the metrics API route can report the same configured
-// ceiling as "current extraction workers active" without duplicating
-// the env-var default here.
-export const MAX_EXTRACTION_CONCURRENCY = Number(process.env.MAX_EXTRACTION_CONCURRENCY) || 10;
+// MAX_EXTRACTION_CONCURRENCY itself now lives in scraper-config.ts (see
+// this file's own import of it, and that file's own comment) — re-export
+// kept here so nothing that still imports it from "@/lib/admin-scraper"
+// breaks.
+export { MAX_EXTRACTION_CONCURRENCY };
 
 // Wraps each individual extractListingFromUrl call (Step 5) — NOT a
 // replacement for the timeouts already inside html-extractor.ts

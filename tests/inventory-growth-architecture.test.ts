@@ -28,6 +28,10 @@ const processBatchSource = readFileSync(
   join(__dirname, "../src/app/api/admin-scraper/large-scale/process-batch/route.ts"),
   "utf-8",
 );
+const metricsSource = readFileSync(
+  join(__dirname, "../src/app/api/admin-scraper/large-scale/metrics/route.ts"),
+  "utf-8",
+);
 
 test("the Start/Resume route never imports the long-running scraper", () => {
   assert.doesNotMatch(routeSource, /from ["']@\/lib\/admin-scraper["']/);
@@ -107,4 +111,38 @@ test("process-batch actually passes the single-call overrides and an interim onP
   assert.match(processBatchSource, /perBatchTimeoutMs:\s*SINGLE_BATCH_CALL_TIMEOUT_MS/);
   assert.match(processBatchSource, /maxAttemptsPerBatch:\s*SINGLE_BATCH_CALL_MAX_ATTEMPTS/);
   assert.match(processBatchSource, /onProgress:\s*async/);
+});
+
+// Regression guard for the "Next.js HTML 500 error page" fix: the metrics
+// route was importing DISCOVERY_CONCURRENCY/MAX_EXTRACTION_CONCURRENCY
+// from @/lib/inventory/scaled-discovery and @/lib/admin-scraper — both
+// transitively import Playwright — and had no try/catch at all, despite
+// being polled every couple of seconds for as long as Inventory Growth
+// stays open (far more often than the one-shot start/resume calls).
+// Actual import-statement syntax specifically (require the `import`
+// keyword on the same match) — this file's own header comment names both
+// old import paths in prose to document the fix, which a bare source
+// match on the path string alone would false-positive on, same hazard
+// IMPORTS_AFTER_FROM_NEXT_SERVER above already guards against.
+test("the metrics route never imports the scraper or its heavy discovery module — both concurrency constants come from the plain scraper-config.ts", () => {
+  assert.doesNotMatch(metricsSource, /import\s*{[^}]*}\s*from\s*["']@\/lib\/admin-scraper["']/);
+  assert.doesNotMatch(metricsSource, /import\s*{[^}]*}\s*from\s*["']@\/lib\/inventory\/scaled-discovery["']/);
+  assert.match(metricsSource, /DISCOVERY_CONCURRENCY/);
+  assert.match(metricsSource, /MAX_EXTRACTION_CONCURRENCY/);
+  assert.match(metricsSource, /import\s*{[^}]*}\s*from\s*["']@\/lib\/scraper-config["']/);
+});
+
+test("the metrics route's whole GET handler is wrapped in a try/catch that returns NextResponse.json from the catch block", () => {
+  const getStart = metricsSource.indexOf("export async function GET(");
+  assert.notEqual(getStart, -1, "expected to find the GET handler");
+  const getBody = metricsSource.slice(getStart);
+
+  const tryIndex = getBody.indexOf("try {");
+  assert.notEqual(tryIndex, -1, "expected an outer try block in GET");
+
+  const catchIndex = getBody.indexOf("} catch (error) {", tryIndex);
+  assert.notEqual(catchIndex, -1, "expected a matching outer catch block");
+
+  const catchBody = getBody.slice(catchIndex);
+  assert.match(catchBody, /return sanitizedErrorResponse\(/, "expected the catch block to return a JSON response, not rethrow or fall through");
 });

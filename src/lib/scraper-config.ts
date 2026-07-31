@@ -203,3 +203,27 @@ export const SINGLE_BATCH_CALL_MAX_ATTEMPTS = 1;
 // marshaling) so the watchdog reliably resolves and gets its result
 // persisted BEFORE Vercel's platform-level kill could ever preempt it.
 export const SINGLE_BATCH_CALL_TIMEOUT_MS = 45 * 1000;
+
+// ---------------------------------------------------------------------------
+// Dashboard-only concurrency numbers — moved here (Inventory Growth
+// "Next.js HTML 500 error page" fix) from src/lib/admin-scraper.ts and
+// src/lib/inventory/scaled-discovery.ts respectively. Both are trivial
+// env-var-derived numbers, but /api/admin-scraper/large-scale/metrics/
+// route.ts — polled every JOB_POLL_INTERVAL_MS (2s) for as long as
+// Inventory Growth stays open, far more often than the one-shot start/
+// resume calls — was importing them straight from those two modules,
+// which transitively import Playwright (browser-concurrency.ts,
+// extraction/browser-extractor.ts, marketplace-discovery.ts, and
+// scaled-discovery.ts itself) — exactly the same class of "native-binary
+// package pulled into a real, frequently-hit request path" issue already
+// fixed once for /api/admin-scraper/large-scale's own start/resume route
+// (see that route's own header comment) — just never applied to the
+// metrics route, which on top of that had NO try/catch at all, so any
+// resulting crash (or anything else) propagated as an uncaught exception
+// straight into Next's own generic HTML error page. Defined here instead
+// — a pure, zero-import file — so nothing that needs just a number has to
+// pull in a scraper implementation to get it. admin-scraper.ts/
+// scaled-discovery.ts both still import + re-export their own name below
+// so every existing internal caller keeps working unchanged.
+export const MAX_EXTRACTION_CONCURRENCY = Number(process.env.MAX_EXTRACTION_CONCURRENCY) || 10;
+export const DISCOVERY_CONCURRENCY = Number(process.env.DISCOVERY_CONCURRENCY) || 5;
