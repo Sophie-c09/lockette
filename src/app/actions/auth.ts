@@ -3,6 +3,7 @@
 import { redirect } from "next/navigation";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
+import { logAuthError } from "@/lib/auth-diagnostics";
 
 const SignUpSchema = z.object({
   name: z
@@ -85,7 +86,7 @@ export async function signUp(
     // Full server-side log (code/status/message) — see signIn's own
     // comment on why this is never shown to the user verbatim, but must
     // never be silently dropped either.
-    console.error("[auth] signUp failed:", { code: error.code ?? null, status: error.status ?? null, message: error.message });
+    logAuthError("signUp", error, { email });
     return { message: error.message };
   }
 
@@ -128,23 +129,33 @@ export async function signIn(
 
   if (error) {
     // Full server-side log of the REAL Supabase Auth error — the only
-    // place it's ever visible. The generic client-facing message below
-    // (for every code except email_not_confirmed) is a deliberate security
-    // choice: never let a login failure reveal "no such user" vs "wrong
-    // password" vs anything else, which would be a user-enumeration leak.
-    console.error("[auth] signInWithPassword failed:", { code: error.code ?? null, status: error.status ?? null, message: error.message });
+    // place it's ever visible.
+    logAuthError("signInWithPassword", error, { email });
 
-    // email_not_confirmed is the one code safe to surface distinctly — it
-    // doesn't reveal whether the password was right, and staying silent
-    // about it is exactly what left a legitimately-signed-up user stuck
-    // with no way to know why login kept "failing" (see signUp's own
-    // comment on the same underlying requirement: email confirmation is
-    // required by this Supabase project, and this app never told anyone).
+    // email_not_confirmed is safe to surface distinctly — it doesn't
+    // reveal whether the password was right, and staying silent about it
+    // is exactly what left a legitimately-signed-up user stuck with no
+    // way to know why login kept "failing" (see signUp's own comment on
+    // the same underlying requirement: email confirmation is required by
+    // this Supabase project, and this app never told anyone).
     if (error.code === "email_not_confirmed") {
       return { message: "Please confirm your email before signing in — check your inbox for a confirmation link." };
     }
 
-    return { message: "Incorrect email or password." };
+    // invalid_credentials is the genuine "wrong email or password" case —
+    // handled explicitly (not as a catch-all) so it's never confused with
+    // the case below.
+    if (error.code === "invalid_credentials") {
+      return { message: "Incorrect email or password." };
+    }
+
+    // Anything else (rate limiting, a genuine backend/network failure,
+    // etc.) is a different problem — telling the user their password was
+    // wrong when it might not even have been checked yet would be
+    // actively misleading, not just imprecise. This used to be the
+    // catch-all fallback for every error code, which is exactly what made
+    // an unrelated failure look identical to a wrong password.
+    return { message: "Something went wrong signing you in. Please try again." };
   }
 
   redirect("/profile");
@@ -176,14 +187,29 @@ export async function requestPasswordReset(
 
   const { email } = validatedFields.data;
   const supabase = await createClient();
+  const redirectTo = `${SITE_URL}/auth/confirm?next=/reset-password`;
 
-  const { error } = await supabase.auth.resetPasswordForEmail(email, {
-    redirectTo: `${SITE_URL}/auth/confirm?next=/reset-password`,
-  });
+  const { error } = await supabase.auth.resetPasswordForEmail(email, { redirectTo });
 
   if (error) {
-    console.error("[auth] resetPasswordForEmail failed:", { code: error.code ?? null, status: error.status ?? null, message: error.message });
-    return { message: "Something went wrong sending that email. Please try again." };
+    logAuthError("resetPasswordForEmail", error, { email, redirectTo });
+
+    // Confirmed live against this project: over_email_send_rate_limit
+    // (429) is a real, distinct case from a mail-provider/SMTP failure
+    // (observed live as a raw 500 with no specific code — see this
+    // file's own investigation notes) — each needs its own message
+    // rather than one blanket "something went wrong," since only the
+    // rate-limit case is something the user can fix by waiting.
+    if (error.code === "over_email_send_rate_limit") {
+      return { message: "Too many reset attempts. Please wait a few minutes and try again." };
+    }
+
+    // Every other failure here (the observed 500/SMTP case, or anything
+    // else) is a real send failure, not a "try rewording your email"
+    // problem — this still can't reveal WHOSE email failed to avoid
+    // account enumeration, but it must not pretend the email is on its
+    // way when it genuinely is not.
+    return { message: "We couldn't send that email right now. Please try again in a few minutes." };
   }
 
   // GoTrue itself already returns success here regardless of whether the
@@ -229,8 +255,20 @@ export async function updatePassword(
   const { error } = await supabase.auth.updateUser({ password });
 
   if (error) {
-    console.error("[auth] updateUser (password) failed:", { code: error.code ?? null, status: error.status ?? null, message: error.message });
-    return { message: error.message };
+    logAuthError("updateUser", error, { email: user.email });
+
+    // weak_password/same_password are Supabase's own password-policy
+    // checks (on top of this form's own 8-char minimum) — genuinely safe
+    // and helpful to show verbatim-ish, unlike a raw internal error
+    // string, which is what every other code fell back to before this.
+    if (error.code === "weak_password") {
+      return { message: "That password is too weak. Try a longer or more complex one." };
+    }
+    if (error.code === "same_password") {
+      return { message: "That's your current password. Choose a different one." };
+    }
+
+    return { message: "Something went wrong updating your password. Please try again." };
   }
 
   // Signs out the recovery session rather than leaving it active — the

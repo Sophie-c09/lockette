@@ -16,6 +16,7 @@
 import { type EmailOtpType } from "@supabase/supabase-js";
 import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
+import { logAuthError } from "@/lib/auth-diagnostics";
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -35,10 +36,13 @@ export async function GET(request: Request) {
       redirect(next);
     }
 
-    console.error("[auth] verifyOtp failed:", { code: error.code ?? null, status: error.status ?? null, message: error.message });
+    logAuthError("verifyOtp", error);
   }
 
   // Missing/invalid/expired/already-used link — sent back to request a
-  // fresh one rather than at a bare error page with no next step.
+  // fresh one rather than at a bare error page with no next step. The
+  // forgot-password page reads ?error=invalid_link and shows this as an
+  // actual message rather than silently dropping it (see that page's own
+  // comment).
   redirect("/forgot-password?error=invalid_link");
 }
