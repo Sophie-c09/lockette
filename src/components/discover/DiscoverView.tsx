@@ -13,9 +13,9 @@ import { useToast } from "@/components/ToastProvider";
 import type { DiscoverSortOption, ScoredDiscoverListing } from "@/lib/discover-feed";
 
 const SORT_OPTIONS: { value: DiscoverSortOption; label: string }[] = [
-  { value: "match", label: "Best Match" },
-  { value: "price", label: "Lowest Price" },
-  { value: "points", label: "Highest Style Points" },
+  { value: "recent", label: "Most Recent" },
+  { value: "price_asc", label: "Price: Low to High" },
+  { value: "price_desc", label: "Price: High to Low" },
 ];
 
 // Continuous, scroll-based browsing feed — a grid of ListingCard (same
@@ -39,7 +39,7 @@ export function DiscoverView({
   styleSlug = null,
   styleLabel = null,
   styleDescription = null,
-  sortOption = "match",
+  sortOption = "recent",
 }: {
   initialListings: ScoredDiscoverListing[];
   initialSavedListingIds: string[];
@@ -75,8 +75,8 @@ export function DiscoverView({
   // The active sort-control selection (?sort=<option>, discover/page.tsx —
   // already validated/defaulted server-side via parseDiscoverSortOption).
   // Re-sent on every "load more" call, same as the other filter axes, so
-  // infinite scroll keeps extending the SAME priority order rather than
-  // silently reverting to Best Match once the user scrolls past page one.
+  // infinite scroll keeps extending in the SAME order rather than
+  // silently reverting to Most Recent once the user scrolls past page one.
   sortOption?: DiscoverSortOption;
 }) {
   const router = useRouter();
@@ -227,23 +227,23 @@ export function DiscoverView({
     if (slug) params.set("type", slug);
     if (searchQuery) params.set("query", searchQuery);
     if (styleSlug) params.set("style", styleSlug);
-    if (sortOption !== "match") params.set("sort", sortOption);
+    if (sortOption !== "recent") params.set("sort", sortOption);
     const qs = params.toString();
     return qs ? `/discover?${qs}` : "/discover";
   }
 
   // Same preserve-everything-else pattern as typeHref above, but swapping
-  // the sort axis instead of type — "match" (Best Match) is the default,
-  // so it's simply omitted from the URL rather than written out as
-  // ?sort=match, matching how every other filter here only appears in the
-  // querystring when it's actually non-default.
+  // the sort axis instead of type — "recent" (Most Recent) is the
+  // default, so it's simply omitted from the URL rather than written out
+  // as ?sort=recent, matching how every other filter here only appears in
+  // the querystring when it's actually non-default.
   function sortHref(option: DiscoverSortOption) {
     const params = new URLSearchParams();
     if (categorySlug) params.set("category", categorySlug);
     if (typeSlug) params.set("type", typeSlug);
     if (searchQuery) params.set("query", searchQuery);
     if (styleSlug) params.set("style", styleSlug);
-    if (option !== "match") params.set("sort", option);
+    if (option !== "recent") params.set("sort", option);
     const qs = params.toString();
     return qs ? `/discover?${qs}` : "/discover";
   }

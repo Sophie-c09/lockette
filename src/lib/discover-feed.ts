@@ -46,17 +46,25 @@ import { buildUserStyleVector, type LikedListingAttributes } from "@/lib/discove
 import { scoreGarmentStyleMatch, computeFashionQualityScore, FASHION_QUALITY_GATE } from "@/lib/discover-personalization";
 import type { Listing } from "@/lib/supabase/listings.types";
 
-// The 3 sort-control options (Best Match / Lowest Price / Highest Style
-// Points) — "match" is the default or a missing/unrecognized ?sort= value.
-export type DiscoverSortOption = "match" | "price" | "points";
-export const DEFAULT_DISCOVER_SORT: DiscoverSortOption = "match";
+// The 3 sort-control options (Most Recent / Price: Low to High / Price:
+// High to Low) — "recent" is the default or a missing/unrecognized
+// ?sort= value. This is purely display ORDER: it never changes which
+// listings qualify for Discover (the fashionability gate + matchPercent/
+// stylePoints personalization in fetchDiscoverBatch below are unaffected
+// — see this file's own header comment). The previous "match"
+// (Best Match) / "points" (Highest Style Points) options were removed —
+// matchPercent/stylePoints are still computed and still shown on each
+// card (ListingCard's own badges), just no longer a sort axis.
+export type DiscoverSortOption = "recent" | "price_asc" | "price_desc";
+export const DEFAULT_DISCOVER_SORT: DiscoverSortOption = "recent";
 
 // Narrows an arbitrary ?sort= query string to a real option, falling back
-// to the default rather than erroring on a typo'd/old bookmarked URL —
-// same "unrecognized slug falls open" convention categorySlug/typeSlug/
-// styleSlug already use below.
+// to the default rather than erroring on a typo'd/old bookmarked URL (or
+// an old link/bookmark still carrying a since-removed "match"/"points"
+// value) — same "unrecognized slug falls open" convention categorySlug/
+// typeSlug/styleSlug already use below.
 export function parseDiscoverSortOption(raw: string | null | undefined): DiscoverSortOption {
-  return raw === "price" || raw === "points" ? raw : DEFAULT_DISCOVER_SORT;
+  return raw === "price_asc" || raw === "price_desc" ? raw : DEFAULT_DISCOVER_SORT;
 }
 
 // What this file actually returns per listing now — the base row plus the
@@ -299,11 +307,8 @@ function buildSearchQueryOrFilter(searchQuery: string): string {
 }
 
 // Ascending or descending numeric compare where null/undefined always
-// sorts LAST regardless of direction — "missing match data"/"missing
-// prices should appear after listings with valid [x]" (this feature's own
-// spec), applied generically so the same helper serves all three sortable
-// fields (matchPercent, price, stylePoints) instead of three near-duplicate
-// comparators.
+// sorts LAST regardless of direction — "missing/invalid prices should
+// appear after listings with valid prices" (this feature's own spec).
 function compareNullsLast(a: number | null | undefined, b: number | null | undefined, direction: "asc" | "desc"): number {
   const aMissing = a == null;
   const bMissing = b == null;
@@ -313,52 +318,45 @@ function compareNullsLast(a: number | null | undefined, b: number | null | undef
   return direction === "asc" ? a - b : b - a;
 }
 
-interface DiscoverSortEntry {
+// "Invalid" isn't just missing — a negative or non-finite (NaN/Infinity)
+// price is treated the same as null (sorts last for both price options),
+// same reasoning as compareNullsLast's own doc comment.
+function normalizedPrice(price: number | null | undefined): number | null {
+  return price != null && Number.isFinite(price) && price >= 0 ? price : null;
+}
+
+export interface DiscoverSortEntry {
   listing: Listing;
   matchPercent: number;
   stylePoints: number;
   fashionQualityScore: number;
 }
 
-// The three sort-control options, each a full 3-key priority order (just
-// reprioritized) rather than a single-key sort — every mode still breaks
-// ties consistently instead of falling back to arbitrary/incoming order.
-//
-// "match" (Best Match, the default) is this feature's own literal spec:
-// match% desc -> price asc -> stylePoints desc. For a signed-out user or
-// one with no style profile at all, scoreGarmentStyleMatch's own
-// NEUTRAL_BASELINE/no-vector-signal behavior (see
-// discover-personalization.ts) already gives every listing the SAME
-// matchPercent (50) — meaning this exact comparator falls through to
-// price asc -> stylePoints desc on its own, with no special-cased branch
-// needed to satisfy "handle logged-out users safely: fall back to lowest
-// price first, then highest style points."
-function sortDiscoverListings(entries: DiscoverSortEntry[], sortOption: DiscoverSortOption): DiscoverSortEntry[] {
-  const keys: Array<{ get: (entry: DiscoverSortEntry) => number | null | undefined; direction: "asc" | "desc" }> =
-    sortOption === "price"
-      ? [
-          { get: (entry) => entry.listing.price, direction: "asc" },
-          { get: (entry) => entry.matchPercent, direction: "desc" },
-          { get: (entry) => entry.stylePoints, direction: "desc" },
-        ]
-      : sortOption === "points"
-        ? [
-            { get: (entry) => entry.stylePoints, direction: "desc" },
-            { get: (entry) => entry.matchPercent, direction: "desc" },
-            { get: (entry) => entry.listing.price, direction: "asc" },
-          ]
-        : [
-            { get: (entry) => entry.matchPercent, direction: "desc" },
-            { get: (entry) => entry.listing.price, direction: "asc" },
-            { get: (entry) => entry.stylePoints, direction: "desc" },
-          ];
-
+// The three sort-control options — Most Recent (created_at desc, the
+// default), Price: Low to High, Price: High to Low. Deliberately
+// single-key (plus a stable id tiebreak for entries with the exact same
+// value) rather than the previous multi-key match%/price/stylePoints
+// priority chain: matchPercent/stylePoints are still computed and still
+// shown on every card (see this file's own header comment), just no
+// longer part of what determines DISPLAY ORDER — the fashionability gate
+// (fetchDiscoverBatch's gatePassed/gateFailed partition, computed BEFORE
+// this function ever runs) is what still keeps stronger inventory ranked
+// ahead of weaker inventory regardless of which of these three the user
+// picks.
+// Exported for direct unit testing (tests/discover-sort.test.ts) — pure,
+// no I/O, same "export the pure scoring/sorting function itself" pattern
+// match-scoring.ts's own exports already use.
+export function sortDiscoverListings(entries: DiscoverSortEntry[], sortOption: DiscoverSortOption): DiscoverSortEntry[] {
   return [...entries].sort((a, b) => {
-    for (const { get, direction } of keys) {
-      const cmp = compareNullsLast(get(a), get(b), direction);
-      if (cmp !== 0) return cmp;
-    }
-    return 0;
+    const primary =
+      sortOption === "price_asc"
+        ? compareNullsLast(normalizedPrice(a.listing.price), normalizedPrice(b.listing.price), "asc")
+        : sortOption === "price_desc"
+          ? compareNullsLast(normalizedPrice(a.listing.price), normalizedPrice(b.listing.price), "desc")
+          : Date.parse(b.listing.created_at) - Date.parse(a.listing.created_at); // "recent" — newest first
+
+    if (primary !== 0) return primary;
+    return a.listing.id < b.listing.id ? -1 : a.listing.id > b.listing.id ? 1 : 0;
   });
 }
 
