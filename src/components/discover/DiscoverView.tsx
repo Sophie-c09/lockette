@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { Sparkles, Camera, X, Loader2 } from "lucide-react";
 import { ListingCard } from "@/components/listing/ListingCard";
 import { StyleFeaturesPromo } from "@/components/StyleFeaturesPromo";
@@ -9,7 +10,13 @@ import { loadMoreDiscoverListings, searchDiscoverByPhoto } from "@/app/actions/d
 import { DISCOVER_BATCH_SIZE } from "@/lib/pagination-constants";
 import { ITEM_TYPE_CATEGORIES } from "@/lib/item-type-categories";
 import { useToast } from "@/components/ToastProvider";
-import type { Listing } from "@/lib/supabase/listings.types";
+import type { DiscoverSortOption, ScoredDiscoverListing } from "@/lib/discover-feed";
+
+const SORT_OPTIONS: { value: DiscoverSortOption; label: string }[] = [
+  { value: "match", label: "Best Match" },
+  { value: "price", label: "Lowest Price" },
+  { value: "points", label: "Highest Style Points" },
+];
 
 // Continuous, scroll-based browsing feed — a grid of ListingCard (same
 // shared card Match's "More Like This"-style surfaces and Style Me's
@@ -32,8 +39,9 @@ export function DiscoverView({
   styleSlug = null,
   styleLabel = null,
   styleDescription = null,
+  sortOption = "match",
 }: {
-  initialListings: Listing[];
+  initialListings: ScoredDiscoverListing[];
   initialSavedListingIds: string[];
   initialOffset: number;
   isAdmin?: boolean;
@@ -64,11 +72,20 @@ export function DiscoverView({
   styleSlug?: string | null;
   styleLabel?: string | null;
   styleDescription?: string | null;
+  // The active sort-control selection (?sort=<option>, discover/page.tsx —
+  // already validated/defaulted server-side via parseDiscoverSortOption).
+  // Re-sent on every "load more" call, same as the other filter axes, so
+  // infinite scroll keeps extending the SAME priority order rather than
+  // silently reverting to Best Match once the user scrolls past page one.
+  sortOption?: DiscoverSortOption;
 }) {
+  const router = useRouter();
+
   // `listings` is the ONLY state driving what's on screen — it starts
   // from the already server-scored/ordered `initialListings`
-  // (fetchDiscoverBatch — onboarding preference + liked-tag scoring,
-  // untouched by this change) and only ever grows as more pages load.
+  // (fetchDiscoverBatch — matchPercent/stylePoints attached via
+  // match-scoring.ts, sorted per sortOption) and only ever grows as more
+  // pages load.
   const [listings, setListings] = useState(initialListings);
   // Accumulated across every loaded batch, not just the first — each
   // batch's own savedListingIds (fetchDiscoverBatch's return shape) may
@@ -161,11 +178,11 @@ export function DiscoverView({
     observer.observe(sentinel);
     return () => observer.disconnect();
 
-    // categorySlug/typeSlug/searchQuery/styleSlug are stable for this
-    // component's lifetime — DiscoverView is remounted (via a `key`
-    // combining all four — see discover/page.tsx) whenever any active
-    // filter actually changes, rather than this effect re-running
-    // mid-session.
+    // categorySlug/typeSlug/searchQuery/styleSlug/sortOption are stable
+    // for this component's lifetime — DiscoverView is remounted (via a
+    // `key` combining all five — see discover/page.tsx) whenever any
+    // active filter or the sort selection actually changes, rather than
+    // this effect re-running mid-session.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -175,7 +192,7 @@ export function DiscoverView({
 
     try {
       while (hasMoreRef.current) {
-        const result = await loadMoreDiscoverListings(offsetRef.current, categorySlug, typeSlug, searchQuery, styleSlug);
+        const result = await loadMoreDiscoverListings(offsetRef.current, categorySlug, typeSlug, searchQuery, styleSlug, sortOption);
         if (result.error) {
           hasMoreRef.current = false;
           break;
@@ -200,15 +217,33 @@ export function DiscoverView({
     }
   }
 
-  // Preserves the current category/search/style filters while toggling
-  // the item-type filter on/off — clicking the already-active pill clears
-  // just that axis (slug=null), clicking any other pill switches to it.
+  // Preserves the current category/search/style/sort filters while
+  // toggling the item-type filter on/off — clicking the already-active
+  // pill clears just that axis (slug=null), clicking any other pill
+  // switches to it.
   function typeHref(slug: string | null) {
     const params = new URLSearchParams();
     if (categorySlug) params.set("category", categorySlug);
     if (slug) params.set("type", slug);
     if (searchQuery) params.set("query", searchQuery);
     if (styleSlug) params.set("style", styleSlug);
+    if (sortOption !== "match") params.set("sort", sortOption);
+    const qs = params.toString();
+    return qs ? `/discover?${qs}` : "/discover";
+  }
+
+  // Same preserve-everything-else pattern as typeHref above, but swapping
+  // the sort axis instead of type — "match" (Best Match) is the default,
+  // so it's simply omitted from the URL rather than written out as
+  // ?sort=match, matching how every other filter here only appears in the
+  // querystring when it's actually non-default.
+  function sortHref(option: DiscoverSortOption) {
+    const params = new URLSearchParams();
+    if (categorySlug) params.set("category", categorySlug);
+    if (typeSlug) params.set("type", typeSlug);
+    if (searchQuery) params.set("query", searchQuery);
+    if (styleSlug) params.set("style", styleSlug);
+    if (option !== "match") params.set("sort", option);
     const qs = params.toString();
     return qs ? `/discover?${qs}` : "/discover";
   }
@@ -259,6 +294,26 @@ export function DiscoverView({
               );
             })}
           </div>
+
+          {!photoSearchActive && (
+            <div className="mt-5 flex items-center justify-center gap-2">
+              <label htmlFor="discover-sort" className="text-sm text-ink-soft">
+                Sort by
+              </label>
+              <select
+                id="discover-sort"
+                value={sortOption}
+                onChange={(event) => router.push(sortHref(event.target.value as DiscoverSortOption))}
+                className="rounded-pill border border-border bg-surface px-3 py-1.5 text-sm font-medium text-ink focus:border-oxblood focus:outline-none"
+              >
+                {SORT_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div className="mt-5 flex flex-col items-center gap-2">
             {photoSearchActive ? (
@@ -311,6 +366,8 @@ export function DiscoverView({
                   isAdmin={isAdmin}
                   showSaveButton
                   initialSaved={savedListingIds.has(listing.id)}
+                  matchScore={listing.matchPercent}
+                  stylePoints={listing.stylePoints}
                 />
               ))}
             </div>

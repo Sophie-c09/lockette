@@ -2,15 +2,25 @@
 // page (formerly split across /discover and /feed, see that removed
 // page's redirect stub) — shared by the initial server-rendered page load
 // and the "load more" Server Action DiscoverView calls once the user
-// scrolls near the bottom (see src/app/actions/discover-feed.ts). Scoring
-// blends two independent signals: onboarding Style DNA preferences
-// (scoreAndSortListings, listing-scoring.ts) and liked-item tag/keyword
-// affinity (scoreAndSortByLikedTags, feed-scoring.ts — /feed's own scoring
-// before the merge), combined near the bottom of fetchDiscoverBatch.
+// scrolls near the bottom (see src/app/actions/discover-feed.ts).
+//
+// Ranking/scoring (priority-sort rework): reuses match-scoring.ts's
+// scoreListingMatch/getTopTags EXACTLY as /match already does — not a
+// second scoring system. Each listing gets a matchPercent (0-100, the same
+// "style-match %" /match shows as its own badge) and stylePoints (0-50,
+// that same breakdown's styleScore sub-component — the Style DNA
+// tag-overlap points, already computed as part of the same call, just not
+// previously surfaced). The old blended onboarding+liked-tag score
+// (listing-scoring.ts's scoreAndSortListings / feed-scoring.ts's
+// scoreAndSortByLikedTags) plus the random shuffleWithBias reshuffle are
+// gone from this file — sorting is now the fully deterministic
+// match% -> price -> stylePoints priority order sortDiscoverListings
+// implements below. Neither listing-scoring.ts nor feed-scoring.ts is
+// deleted (listing-scoring.ts's own scoreListingMatch is still used by
+// garment-matching.ts) — this file just no longer calls them.
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
-import { scoreAndSortListings, type ScoredListing } from "@/lib/listing-scoring";
-import { getLikedTags, getLikedKeywords, scoreAndSortByLikedTags } from "@/lib/feed-scoring";
+import { scoreListingMatch, getTopTags } from "@/lib/match-scoring";
 import { buildAvailabilityFilter, releaseExpiredReservations } from "@/lib/reservations";
 import {
   getHomepageCategoryBySlug,
@@ -18,8 +28,36 @@ import {
   type HomepageCategory,
 } from "@/lib/aesthetic-categories";
 import { getItemTypeCategoryBySlug, type ItemTypeCategory } from "@/lib/item-type-categories";
-import type { DislikedStyles } from "@/lib/disliked-styles";
+import { getHardExcludedStyleKeys, type DislikedStyles } from "@/lib/disliked-styles";
 import type { Listing } from "@/lib/supabase/listings.types";
+
+// The 3 sort-control options (Best Match / Lowest Price / Highest Style
+// Points) — "match" is the default or a missing/unrecognized ?sort= value.
+export type DiscoverSortOption = "match" | "price" | "points";
+export const DEFAULT_DISCOVER_SORT: DiscoverSortOption = "match";
+
+// Narrows an arbitrary ?sort= query string to a real option, falling back
+// to the default rather than erroring on a typo'd/old bookmarked URL —
+// same "unrecognized slug falls open" convention categorySlug/typeSlug/
+// styleSlug already use below.
+export function parseDiscoverSortOption(raw: string | null | undefined): DiscoverSortOption {
+  return raw === "price" || raw === "points" ? raw : DEFAULT_DISCOVER_SORT;
+}
+
+// What this file actually returns per listing now — the base row plus the
+// two display-only scores attached below (matchPercent/stylePoints), same
+// "base type + attached score fields" shape match-feed.ts's own
+// ScoredMatchListing already uses. Nullable (not just optional) because
+// the photo-search path (searchDiscoverByPhoto, src/app/actions/
+// discover-feed.ts) returns real listings that were never run through
+// this file's own scoring at all — vector-similarity search results,
+// scored/ranked entirely differently — so it explicitly sets both to null
+// rather than omitting them, and ListingCard already renders its
+// matchScore/stylePoints props as absent for null.
+export type ScoredDiscoverListing = Listing & {
+  matchPercent: number | null;
+  stylePoints: number | null;
+};
 
 export { DISCOVER_BATCH_SIZE } from "@/lib/pagination-constants";
 
@@ -110,7 +148,7 @@ function logQueryError(context: string, error: { message: string; code?: string;
 export interface DiscoverBatchResult {
   // Already excludes anything in savedListingIds or disliked_items — see
   // fetchDiscoverBatch.
-  listings: Listing[];
+  listings: ScoredDiscoverListing[];
   // Still returned separately (not just used to filter `listings` above)
   // because DiscoverView also needs it to pre-fill each SaveButton's heart
   // icon as already-filled for a listing liked on a previous visit.
@@ -126,16 +164,15 @@ export interface DiscoverBatchResult {
  * Fetches one page of real listings for /discover (includes `images`, the
  * full photo gallery array, so ListingCard can show a photo-count
  * indicator — see LISTING_COLUMNS above), excludes anything the user has
- * already liked (saved_items.listing_id),
- * and applies the existing preference-based scoreAndSortListings to
- * what's left, then lightly reshuffles that order (shuffleWithBias) so the
- * page doesn't render in the exact same sequence on every refresh — good
- * matches still cluster near the top on average, they just aren't glued to
- * one fixed order. Each page is scored/sorted/shuffled independently, so
- * ordering is "newest pages first, best-matching (with light shuffle)
- * within each page" — the same tradeoff every paginated ranked feed makes,
- * since a global re-rank across an ever-growing list isn't possible
- * without re-fetching everything.
+ * already liked (saved_items.listing_id), attaches matchPercent/stylePoints
+ * to what's left (scoreListingMatch, reused from match-scoring.ts — see
+ * this file's own header comment), then sorts deterministically per
+ * sortOption (sortDiscoverListings below — no shuffle anymore: priority
+ * order needs to be exact and reproducible, not "clustered on average").
+ * Each page is scored/sorted independently, so ordering is "newest pages
+ * first, then priority-sorted within each page" — the same tradeoff every
+ * paginated ranked feed makes, since a global re-rank across an
+ * ever-growing list isn't possible without re-fetching everything.
  *
  * categorySlug (from the homepage's category cards / ?category= query
  * param) is resolved against HOMEPAGE_CATEGORIES and applied as a
@@ -221,28 +258,67 @@ function buildSearchQueryOrFilter(searchQuery: string): string {
   ].join(",");
 }
 
-// Applied AFTER scoreAndSortListings, not instead of it — the strict
-// score-descending order it produces would otherwise show the exact same
-// sequence on every refresh (same preferences, same page of listings).
-// Blending in a random component (weighted 30/70 against the real score)
-// still keeps genuinely better matches clustered near the top on average,
-// while giving the page a "freshly shuffled" feel each time it loads. Pure
-// per-request randomness — nothing is seeded/persisted, so this never
-// needs to be undone or accounted for anywhere else.
+// Ascending or descending numeric compare where null/undefined always
+// sorts LAST regardless of direction — "missing match data"/"missing
+// prices should appear after listings with valid [x]" (this feature's own
+// spec), applied generically so the same helper serves all three sortable
+// fields (matchPercent, price, stylePoints) instead of three near-duplicate
+// comparators.
+function compareNullsLast(a: number | null | undefined, b: number | null | undefined, direction: "asc" | "desc"): number {
+  const aMissing = a == null;
+  const bMissing = b == null;
+  if (aMissing && bMissing) return 0;
+  if (aMissing) return 1;
+  if (bMissing) return -1;
+  return direction === "asc" ? a - b : b - a;
+}
+
+interface DiscoverSortEntry {
+  listing: Listing;
+  matchPercent: number;
+  stylePoints: number;
+}
+
+// The three sort-control options, each a full 3-key priority order (just
+// reprioritized) rather than a single-key sort — every mode still breaks
+// ties consistently instead of falling back to arbitrary/incoming order.
 //
-// entry.score is normalized to 0-1 before blending (score / 100) — it's a
-// 0-100 percentage (see scoreListingMatch's own doc comment in
-// listing-scoring.ts), and blending that directly against Math.random()'s
-// 0-1 range would make the random term (max 0.3) utterly negligible next
-// to the score term (up to 70) for any realistic score gap: verified live
-// that the unscaled version returns the identical order on every single
-// call given real 0-100 scores, which would have silently defeated this
-// entire feature's actual goal.
-function shuffleWithBias<T>(scoredListings: ScoredListing<T>[]): ScoredListing<T>[] {
-  return scoredListings
-    .map((entry) => ({ entry, sort: Math.random() * 0.3 + (entry.score / 100) * 0.7 }))
-    .sort((a, b) => b.sort - a.sort)
-    .map(({ entry }) => entry);
+// "match" (Best Match, the default) is this feature's own literal spec:
+// match% desc -> price asc -> stylePoints desc. For a signed-out user or
+// one with no style profile at all, scoreListingMatch's own
+// NEUTRAL_BASELINE/all-zero-input behavior (see match-scoring.ts) already
+// gives every listing the SAME matchPercent (50) and stylePoints (0) —
+// meaning this exact comparator falls through to price asc -> stylePoints
+// desc on its own, with no special-cased branch needed to satisfy "handle
+// logged-out users safely: fall back to lowest price first, then highest
+// style points."
+function sortDiscoverListings(entries: DiscoverSortEntry[], sortOption: DiscoverSortOption): DiscoverSortEntry[] {
+  const keys: Array<{ get: (entry: DiscoverSortEntry) => number | null | undefined; direction: "asc" | "desc" }> =
+    sortOption === "price"
+      ? [
+          { get: (entry) => entry.listing.price, direction: "asc" },
+          { get: (entry) => entry.matchPercent, direction: "desc" },
+          { get: (entry) => entry.stylePoints, direction: "desc" },
+        ]
+      : sortOption === "points"
+        ? [
+            { get: (entry) => entry.stylePoints, direction: "desc" },
+            { get: (entry) => entry.matchPercent, direction: "desc" },
+            { get: (entry) => entry.listing.price, direction: "asc" },
+          ]
+        : [
+            { get: (entry) => entry.matchPercent, direction: "desc" },
+            { get: (entry) => entry.listing.price, direction: "asc" },
+            { get: (entry) => entry.stylePoints, direction: "desc" },
+          ];
+
+  return [...entries].sort((a, b) => {
+    for (const { get, direction } of keys) {
+      const cmp = compareNullsLast(get(a), get(b), direction);
+      if (cmp !== 0) return cmp;
+    }
+    return 0;
+  });
 }
 
 export async function fetchDiscoverBatch(
@@ -252,6 +328,7 @@ export async function fetchDiscoverBatch(
   typeSlug?: string | null,
   searchQuery?: string | null,
   styleSlug?: string | null,
+  sortOption: DiscoverSortOption = DEFAULT_DISCOVER_SORT,
 ): Promise<DiscoverBatchResult> {
   const supabase = await createClient();
   const {
@@ -267,17 +344,28 @@ export async function fetchDiscoverBatch(
   let savedListingIds: string[] = [];
   let dislikedListingIds: string[] = [];
   let dislikedStyles: DislikedStyles = {};
-  // Liked-item tag/keyword affinity — the signal /feed used to score by
-  // exclusively, before it was folded into this single unified page (see
-  // this function's own doc comment). Blended alongside the onboarding
-  // Style DNA preference match below rather than replacing it, so a
-  // listing that matches either signal still surfaces well.
-  let likedTags: string[] = [];
-  let likedKeywords = new Set<string>();
+  // Same style_profiles columns match-feed.ts reads for /match's own
+  // scoreListingMatch call — reused here so Discover's matchPercent means
+  // exactly the same thing /match's badge already does, not a subtly
+  // different calc from a partial input set. All default to []/null
+  // (never left undefined), same "logged-out/no-profile is just an
+  // empty-input case, not a special path" reasoning as match-feed.ts.
+  let favoriteBrands: string[] = [];
+  let favoriteCategories: string[] = [];
+  let favoriteColors: string[] = [];
+  let sizePreference: string | null = null;
+  // Liked-item tag affinity feeding scoreListingMatch's own topLikedTags
+  // input (match-scoring.ts's getTopTags) — the exact same derivation
+  // match-feed.ts uses for /match, not a separate liked-tag system.
+  let likedTagLists: string[][] = [];
   if (user) {
     const [{ data: styleProfile }, { data: savedRows, error: savedItemsError }, { data: dislikedRows, error: dislikedItemsError }] =
       await Promise.all([
-        supabase.from("style_profiles").select("style_tags, disliked_styles").eq("user_id", user.id).maybeSingle(),
+        supabase
+          .from("style_profiles")
+          .select("style_tags, favorite_brands, favorite_categories, favorite_colors, size_preference, disliked_styles")
+          .eq("user_id", user.id)
+          .maybeSingle(),
         supabase
           .from("saved_items")
           .select("listing_id")
@@ -294,6 +382,10 @@ export async function fetchDiscoverBatch(
     }
 
     preferences = styleProfile?.style_tags ?? [];
+    favoriteBrands = styleProfile?.favorite_brands ?? [];
+    favoriteCategories = styleProfile?.favorite_categories ?? [];
+    favoriteColors = styleProfile?.favorite_colors ?? [];
+    sizePreference = styleProfile?.size_preference ?? null;
     dislikedStyles = styleProfile?.disliked_styles ?? {};
     savedListingIds = (savedRows ?? [])
       .map((row) => row.listing_id)
@@ -305,13 +397,10 @@ export async function fetchDiscoverBatch(
     if (savedListingIds.length > 0) {
       const { data: likedListings } = await supabase
         .from("listings")
-        .select("title, description, aesthetic_tags")
+        .select("aesthetic_tags")
         .in("id", savedListingIds);
 
-      likedTags = getLikedTags((likedListings ?? []).map((row) => row.aesthetic_tags ?? []));
-      likedKeywords = getLikedKeywords(
-        (likedListings ?? []).map((row) => ({ title: row.title, description: row.description })),
-      );
+      likedTagLists = (likedListings ?? []).map((row) => row.aesthetic_tags ?? []);
     }
   }
 
@@ -437,29 +526,41 @@ export async function fetchDiscoverBatch(
     (listing) => !savedListingIdSet.has(listing.id) && !dislikedListingIdSet.has(listing.id),
   );
 
-  // Two independent signals blended into one ranking, same "take
-  // whichever fits best" reasoning /match's own combined scoring already
-  // uses: onboarding Style DNA preferences (scoreAndSortListings) and
-  // actual liked-item tag/keyword affinity (scoreAndSortByLikedTags, the
-  // scoring /feed used exclusively before the two pages were unified).
-  // Both apply the same dislikedStyles hard-exclusion independently, so
-  // they always agree on which listings survive at all — only the score
-  // itself needs merging, by listing.id, taking the stronger of the two
-  // signals rather than averaging them down.
-  const onboardingScored = scoreAndSortListings(unseenListings, preferences, dislikedStyles);
-  const likedScored = scoreAndSortByLikedTags(unseenListings, likedTags, likedKeywords, dislikedStyles);
-  const likedScoreByListingId = new Map(likedScored.map(({ listing, score }) => [listing.id, score]));
+  // matchPercent/stylePoints attached via the exact same scoreListingMatch
+  // /match uses (match-scoring.ts) — same hardExcludedStyles/getTopTags
+  // derivation match-feed.ts uses for its own topLikedTags input, so a
+  // heavily-disliked style can't win a "top liked tag" ranking slot here
+  // either (see getHardExcludedStyleKeys' own comment). dislikedStyles
+  // itself is still only ever a scoring penalty inside scoreListingMatch —
+  // never an exclusion; the only exclusion in this whole pipeline remains
+  // the already-liked/already-disliked filter just above.
+  const now = Date.now();
+  const hardExcludedStyles = getHardExcludedStyleKeys(dislikedStyles, now);
+  const topLikedTags = getTopTags(likedTagLists, 3, hardExcludedStyles);
 
-  const combined: ScoredListing<Listing>[] = onboardingScored.map(({ listing, score: onboardingScore }) => {
-    const likedScore = likedScoreByListingId.get(listing.id);
-    const score = likedScore != null ? Math.max(onboardingScore, likedScore) : onboardingScore;
-    return { listing, score };
+  const scored: DiscoverSortEntry[] = unseenListings.map((listing) => {
+    const breakdown = scoreListingMatch({
+      listingTags: listing.aesthetic_tags,
+      listingBrand: listing.brand,
+      listingCategory: listing.category ?? null,
+      listingColor: listing.color ?? null,
+      listingSize: listing.size,
+      stylePreferences: preferences,
+      favoriteBrands,
+      favoriteCategories,
+      favoriteColors,
+      sizePreference,
+      topLikedTags,
+      dislikedStyles,
+      now,
+    });
+    return { listing, matchPercent: breakdown.total, stylePoints: breakdown.styleScore };
   });
 
-  const shuffled = shuffleWithBias(combined);
+  const sorted = sortDiscoverListings(scored, sortOption);
 
   return {
-    listings: shuffled.map(({ listing }) => listing),
+    listings: sorted.map(({ listing, matchPercent, stylePoints }) => ({ ...listing, matchPercent, stylePoints })),
     savedListingIds,
     rawCount: listings.length,
     error: null,

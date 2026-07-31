@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { fetchDiscoverBatch, DISCOVER_BATCH_SIZE } from "@/lib/discover-feed";
+import { fetchDiscoverBatch, DISCOVER_BATCH_SIZE, parseDiscoverSortOption } from "@/lib/discover-feed";
 import { getHomepageCategoryBySlug, getAestheticCategoryBySlug } from "@/lib/aesthetic-categories";
 import { getItemTypeCategoryBySlug } from "@/lib/item-type-categories";
 import { DiscoverView } from "@/components/discover/DiscoverView";
@@ -13,9 +13,10 @@ export const metadata: Metadata = {
 export default async function DiscoverPage({
   searchParams,
 }: {
-  searchParams: Promise<{ category?: string; type?: string; query?: string; style?: string }>;
+  searchParams: Promise<{ category?: string; type?: string; query?: string; style?: string; sort?: string }>;
 }) {
-  const { category: categorySlug, type: typeSlug, query: searchQuery, style: styleSlug } = await searchParams;
+  const { category: categorySlug, type: typeSlug, query: searchQuery, style: styleSlug, sort: sortParam } = await searchParams;
+  const activeSort = parseDiscoverSortOption(sortParam);
 
   const supabase = await createClient();
   const {
@@ -30,6 +31,7 @@ export default async function DiscoverPage({
     typeSlug,
     searchQuery,
     styleSlug,
+    activeSort,
   );
 
   if (error) {
@@ -61,7 +63,7 @@ export default async function DiscoverPage({
       // — without this, React could reuse the existing DiscoverView
       // instance across the navigation and leak the previous filter's
       // pagination offset/loaded listings into the new one.
-      key={`${activeCategory?.slug ?? "all"}:${activeItemType?.slug ?? "all"}:${activeSearchQuery ?? "all"}:${activeStyle?.slug ?? "all"}`}
+      key={`${activeCategory?.slug ?? "all"}:${activeItemType?.slug ?? "all"}:${activeSearchQuery ?? "all"}:${activeStyle?.slug ?? "all"}:${activeSort}`}
       initialListings={listings}
       initialSavedListingIds={savedListingIds}
       initialOffset={DISCOVER_BATCH_SIZE}
@@ -74,6 +76,7 @@ export default async function DiscoverPage({
       styleSlug={activeStyle?.slug ?? null}
       styleLabel={activeStyle?.label ?? null}
       styleDescription={activeStyle?.description ?? null}
+      sortOption={activeSort}
     />
   );
 }

@@ -15,7 +15,7 @@ export default function SignUpPage() {
           href="/"
           className="font-display text-lg font-semibold text-ink"
         >
-          Mav<span className="text-oxblood">elle</span>
+          Lock<span className="text-oxblood">ette</span>
         </Link>
         <h1 className="mt-4 font-display text-2xl font-semibold text-ink">
           Create your style profile

@@ -29,6 +29,7 @@ export function ListingCard({
   initialSaved = false,
   showSaveButton = false,
   matchScore = null,
+  stylePoints = null,
 }: {
   listing: Listing;
   // Admins see Remove/Hide options on EVERY card — this is an
@@ -38,6 +39,13 @@ export function ListingCard({
   initialSaved?: boolean;
   showSaveButton?: boolean;
   matchScore?: number | null;
+  // Style DNA tag-overlap sub-score (0-50, match-scoring.ts's own
+  // MatchScoreBreakdown.styleScore) — a smaller, secondary number next to
+  // matchScore's prominent badge, not a second match percentage. Only
+  // Discover passes this today; every other existing caller (Match's
+  // "Find Similar" results, Style Me's reveal bundle) leaves it null, so
+  // this renders nothing for them, same as matchScore already does.
+  stylePoints?: number | null;
 }) {
   const router = useRouter();
   const { showToast } = useToast();
@@ -125,7 +133,7 @@ export function ListingCard({
 
         {matchScore != null && (
           <Badge variant={matchBadgeVariant(matchScore)} className="absolute left-2 top-2 shadow-soft">
-            {matchScore}% match
+            {matchScore}% Match
           </Badge>
         )}
 
@@ -186,6 +194,10 @@ export function ListingCard({
             </span>
           )}
         </div>
+
+        {stylePoints != null && (
+          <p className="text-xs font-medium text-ink-soft">+{stylePoints} Style Points</p>
+        )}
 
         {(listing.brand || listing.category || listing.size) && (
           <p className="text-xs text-ink-soft">

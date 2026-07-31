@@ -1,7 +1,12 @@
 "use server";
 
 import { randomUUID } from "crypto";
-import { fetchDiscoverBatch, DISCOVER_BATCH_SIZE, type DiscoverBatchResult } from "@/lib/discover-feed";
+import {
+  fetchDiscoverBatch,
+  DISCOVER_BATCH_SIZE,
+  type DiscoverBatchResult,
+  type DiscoverSortOption,
+} from "@/lib/discover-feed";
 import { createClient } from "@/lib/supabase/server";
 import { isAllowedListingPhotoType, LISTING_PHOTO_MIME_EXTENSIONS, MAX_LISTING_PHOTO_BYTES } from "@/lib/listing-photo";
 import {
@@ -24,8 +29,9 @@ export async function loadMoreDiscoverListings(
   typeSlug?: string | null,
   searchQuery?: string | null,
   styleSlug?: string | null,
+  sortOption?: DiscoverSortOption,
 ): Promise<DiscoverBatchResult> {
-  return fetchDiscoverBatch(offset, DISCOVER_BATCH_SIZE, categorySlug, typeSlug, searchQuery, styleSlug);
+  return fetchDiscoverBatch(offset, DISCOVER_BATCH_SIZE, categorySlug, typeSlug, searchQuery, styleSlug, sortOption);
 }
 
 export type DiscoverPhotoSearchResult = DiscoverBatchResult & {
@@ -135,7 +141,10 @@ export async function searchDiscoverByPhoto(
     }
 
     return {
-      listings: result.listings,
+      // Photo search ranks by vector similarity, not scoreListingMatch —
+      // explicit null (not just omitted) so ListingCard knows to render
+      // without a match/style-points badge rather than a fabricated value.
+      listings: result.listings.map((listing) => ({ ...listing, matchPercent: null, stylePoints: null })),
       savedListingIds,
       rawCount: result.listings.length,
       usedFallback: result.usedFallback,
