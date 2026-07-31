@@ -1,27 +1,47 @@
 // Large-scale continuous ingestion — "build and maintain a 50,000+ listing
 // inventory over time" (src/lib/scraper-config.ts's TARGET_INVENTORY_SIZE).
-// A separate route from /api/admin-scraper/run/route.ts on purpose: that
-// route (and runContinuousAdminScraper) is unchanged and still backs the
-// existing Style-Aware Scraper / Continuous Import admin UI cards. This
-// one runs runLargeScaleAdminScraper (src/lib/admin-scraper.ts) instead —
-// same after()-based "return the job id immediately, keep working in the
-// background" shape, same maxDuration caveat (see that other route's own
-// header comment: after() only runs for the platform's configured max
-// duration; on a persistent Node.js server outside a serverless Function
-// there is no additional cap, which is what actually lets a run long
-// enough to matter for a 50,000-listing target complete at all here).
 //
-// One request body shape, two behaviors:
-//   - { targetInventorySize?, batchSize?, maxPrice?, allowedSources?,
-//       brandMode?, categoryFilter?, mode? } — starts a NEW job.
-//   - { resumeJobId } — resumes a PAUSED job: reads that job's own
-//     checkpoint (seenUrls + the options it was started with) and starts
-//     a fresh background run continuing from there. This is a NEW
-//     after()-bound execution, not the original paused one un-suspended —
-//     see runLargeScaleAdminScraper's own header comment on why "resume"
-//     has to work this way given no persistent worker/queue exists.
-import { NextResponse, after } from "next/server";
-import { revalidatePath } from "next/cache";
+// PRODUCTION CRASH ROOT CAUSE (confirmed live, not guessed): this route
+// used to import runLargeScaleAdminScraper directly from
+// @/lib/admin-scraper and invoke it via after() to keep the scraper
+// running in the background past this request's own response. Two real,
+// separate problems with that:
+//
+//   1. @/lib/admin-scraper.ts transitively imports playwright (via
+//      src/lib/browser-concurrency.ts, extraction/browser-extractor.ts,
+//      marketplace-discovery.ts, inventory/scaled-discovery.ts) — a
+//      native-binary package Next's bundler was trying to statically
+//      bundle for this serverless Function. Reproduced directly against
+//      production with curl: this route (and /api/admin-scraper/run,
+//      which imports the same module) returned Vercel's generic static
+//      /500 HTML error page — `x-matched-path: /500`, not this file's
+//      own JSON at all — while routes that don't import admin-scraper.ts
+//      (/api/inventory/index, /api/stripe/webhook) responded normally.
+//      That's exactly what the frontend's old unconditional
+//      response.json() call turned into
+//      `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`.
+//      Fixed at the config level too (next.config.ts's
+//      serverExternalPackages) — but this route no longer needs that
+//      import AT ALL once point 2 below is fixed, removing the risk
+//      twice over for the one route real users actually click.
+//
+//   2. Attaching the ENTIRE long-running discovery/extraction loop to a
+//      single request via after() cannot actually finish a
+//      50,000-listing run: Vercel kills the underlying Function once
+//      maxDuration elapses regardless of after()'s own "keeps running
+//      past the response" behavior, which only extends how long THIS
+//      SAME invocation stays alive — it is not a real background-worker
+//      lifetime, and the scraper's own multi-hour target was never
+//      going to survive that.
+//
+// This route now ONLY validates the request and creates/resumes the job
+// row in Supabase, returning the job id immediately with status "queued".
+// It never imports or calls the scraper. The actual bounded, resumable
+// work happens in process-batch/route.ts (one batch per call, well
+// inside this Function's own duration limit), invoked repeatedly by the
+// admin dashboard's own polling loop (ImportListingView.tsx) while the
+// job is active and the dashboard stays open.
+import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { isCurrentUserAdmin } from "@/lib/admin";
@@ -36,21 +56,15 @@ import {
   type ScraperMode,
 } from "@/lib/scraper-config";
 import {
-  runLargeScaleAdminScraper,
-  type LargeScaleAdminScraperOptions,
-} from "@/lib/admin-scraper";
-import {
   createLargeScaleScraperJob,
   getActiveLargeScaleJob,
   claimJobForResume,
   updateLargeScaleScraperJobProgress,
   getScraperJobRow,
-  completeScraperJob,
-  failScraperJob,
 } from "@/lib/scraper-jobs";
 import type { ListingsDatabase } from "@/lib/supabase/listings.types";
 
-export const maxDuration = 300;
+export const maxDuration = 30;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
@@ -72,22 +86,28 @@ async function currentListingsCount(): Promise<number> {
   return count ?? 0;
 }
 
+// Sanitized shape requested for this feature: never the raw internal
+// error, just a stable code + a short, safe details string. The full
+// error (including stack) is always logged server-side first — see every
+// catch block below.
+function sanitizedErrorResponse(details: string, status: number) {
+  return NextResponse.json(
+    { error: "Failed to start inventory growth", code: "INVENTORY_GROWTH_START_FAILED", details },
+    { status },
+  );
+}
+
 export async function POST(request: Request) {
-  // Diagnostic — "frontend shows failed to fetch when starting Inventory
-  // Growth" investigation. Printed before anything else in the handler,
-  // including auth, so a request that fails before ever reaching a
-  // response still leaves a trace of having arrived at all.
-  console.log("[route] request received");
+  const routeName = "admin-scraper/large-scale";
 
   // Everything below is wrapped so this handler ALWAYS returns a Response,
   // even if something throws synchronously (e.g. createAdminClient()
-  // throwing when SUPABASE_SERVICE_ROLE_KEY isn't loaded — see its own
-  // comment) rather than returning an {error} result. Before this, an
-  // uncaught throw anywhere in this function propagated straight out of
-  // POST() with no try/catch at all beyond the narrow request.json() one
-  // — exactly the gap that can make a request look like it never got a
-  // response, rather than a clean error the frontend's own fetch() call
-  // can read and display.
+  // throwing when SUPABASE_SERVICE_ROLE_KEY isn't loaded) rather than
+  // letting an uncaught exception propagate out of POST() with no
+  // response ever sent — which is what a browser's fetch() surfaces as a
+  // network-level failure or a framework error page, not a readable JSON
+  // error the frontend's own safe parser (src/lib/api-response.ts) can
+  // show.
   try {
     const supabase = await createClient();
     const {
@@ -95,115 +115,52 @@ export async function POST(request: Request) {
     } = await supabase.auth.getUser();
 
     if (!user || !(await isCurrentUserAdmin(supabase, user.id))) {
-      console.log("[route] response sent");
-      return NextResponse.json({ success: false, error: "Not authorized." }, { status: 401 });
+      console.warn(`[${routeName}] Unauthorized start/resume attempt`, { userId: user?.id ?? null });
+      return NextResponse.json({ success: false, error: "Not authorized.", code: "UNAUTHORIZED" }, { status: 401 });
     }
 
     let body: unknown;
     try {
       body = await request.json();
-    } catch {
-      console.log("[route] response sent");
-      return NextResponse.json({ success: false, error: "Invalid request body." }, { status: 400 });
+    } catch (error) {
+      console.error(`[${routeName}] Invalid request body`, { userId: user.id, error });
+      return NextResponse.json({ success: false, error: "Invalid request body.", code: "INVALID_BODY" }, { status: 400 });
     }
 
     const input = isRecord(body) ? body : {};
 
     // --- Resume path -----------------------------------------------------
     if (typeof input.resumeJobId === "string") {
+      console.log(`[${routeName}] Resume requested`, { userId: user.id, jobId: input.resumeJobId });
+
       const existing = await getScraperJobRow(input.resumeJobId);
       if (!existing) {
-        console.log("[route] response sent");
-        return NextResponse.json({ success: false, error: "Job not found." }, { status: 404 });
+        return NextResponse.json({ success: false, error: "Job not found.", code: "JOB_NOT_FOUND" }, { status: 404 });
       }
 
-      // Atomic claim (resume-lifecycle fix) — this update, not the read
-      // above, is what actually decides whether this request gets to
-      // resume the job. It's the only thing standing between a genuine
-      // resume and a double-click starting two background executions for
-      // the same job: only the request whose UPDATE actually matches a
-      // still-'paused' row (claimed: true) proceeds past this point: see
-      // claimJobForResume's own header comment for why the read above can't
-      // be trusted for that decision on its own (TOCTOU).
+      // Atomic claim — this update, not the read above, is what actually
+      // decides whether this request gets to resume the job (TOCTOU-safe
+      // against a double-click starting two overlapping resumes).
       const { claimed, job } = await claimJobForResume(input.resumeJobId);
       if (!claimed || !job) {
-        // Re-read rather than trusting `existing.status` here — under a
-        // race (two near-simultaneous resume clicks) `existing` can be
-        // stale by the time the claim above ran, which would otherwise
-        // report the job as still 'paused' in the very error message
-        // explaining that it's no longer paused.
         const current = await getScraperJobRow(input.resumeJobId);
-        console.log("[route] response sent");
         return NextResponse.json(
           {
             success: false,
             error: `Job is '${current?.status ?? existing.status}', not paused — nothing to resume.`,
+            code: "JOB_NOT_PAUSED",
           },
           { status: 400 },
         );
       }
 
-      const checkpoint = job.checkpoint ?? {};
-      const resumedOptions = (checkpoint.options as LargeScaleAdminScraperOptions | undefined) ?? {
-        maxPrice: SCRAPER_CONFIG.maxPrice,
-        minStyleScore: SCRAPER_CONFIG.minStyleScore,
-        minImageScore: SCRAPER_CONFIG.minImageScore,
-        allowedSources: SCRAPER_CONFIG.allowedSources,
-        brandMode: null,
-        categoryFilter: null,
-      };
-
-      const options: LargeScaleAdminScraperOptions = {
-        ...resumedOptions,
-        seenUrls: checkpoint.seenUrls ?? [],
-      };
-
-      await updateLargeScaleScraperJobProgress(job.id, {
-        insertedCount: job.inserted_count,
-        validCount: job.valid_count ?? 0,
-        duplicateCount: job.duplicate_count ?? 0,
-        rejectedCount: job.rejected_count ?? 0,
-        insertFailedCount: job.insert_failed_count ?? 0,
-        extractedSuccessfullyCount: job.extracted_successfully_count ?? 0,
-        extractionFailuresByReason: job.extraction_failures_by_reason ?? {},
-        scrapedCount: job.scraped_count ?? 0,
-        currentBatch: job.current_round ?? 0,
-        queriesCompleted: job.queries_completed ?? 0,
-        pagesSearched: job.pages_searched ?? 0,
-        uniqueUrlsDiscovered: job.unique_urls_discovered ?? 0,
-      });
-
-      // Fire-and-forget by design — runLargeScaleInBackground is a plain
-      // (non-async) function whose only job is to call after() synchronously
-      // and return; it never returns a Promise for this route to (wrongly)
-      // await, so it cannot delay the response below. See after()'s own
-      // Next.js contract: it must be invoked during the request's own
-      // synchronous/awaited execution (which this is), and it runs its
-      // callback only once the response has actually been sent.
-      runLargeScaleInBackground(job.id, options);
-
-      console.log("[route] response sent");
-      return NextResponse.json({ success: true, jobId: job.id });
+      console.log(`[${routeName}] Resume claimed — job left queued for process-batch`, { userId: user.id, jobId: job.id });
+      // No scraper invocation here — see this file's own header comment.
+      // The admin dashboard's polling loop calls .../process-batch next.
+      return NextResponse.json({ success: true, jobId: job.id, status: "queued" });
     }
 
     // --- Start path --------------------------------------------------------
-    // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-    console.log("[diag] 1. API route received Start request", { body: input });
-
-    // Concurrency guard — refuse to start a second large-scale job while one
-    // is already active (see getActiveLargeScaleJob's own header comment for
-    // why this checks 'pending' as well as 'running'). Paused/completed/
-    // failed jobs are correctly NOT matched, so those can still start fresh
-    // or be resumed via the Resume path above.
-    const activeJob = await getActiveLargeScaleJob();
-    if (activeJob) {
-      console.log("[route] response sent");
-      return NextResponse.json(
-        { success: false, error: "Inventory Growth is already running", activeJobId: activeJob.id },
-        { status: 409 },
-      );
-    }
-
     const targetInventorySize =
       typeof input.targetInventorySize === "number" && input.targetInventorySize > 0
         ? Math.floor(input.targetInventorySize)
@@ -213,22 +170,48 @@ export async function POST(request: Request) {
     const mode: ScraperMode = input.mode === "fast" ? "fast" : DEFAULT_SCRAPER_MODE;
     // OVERNIGHT_MODE (requirement 5) — "runs continuously... does not stop
     // after fixed batches." Every real stop condition (target reached,
-    // paused, too many consecutive failures) is unaffected; this only picks
-    // a much higher maxBatches ceiling. See scraper-config.ts's own comment
-    // on OVERNIGHT_MAX_BATCHES for why it's a higher backstop, not "no
-    // limit."
+    // paused, too many consecutive failures) is unaffected; this only
+    // picks a much higher maxBatches ceiling, now enforced across every
+    // process-batch call for this job rather than within one request.
     const isOvernight = input.overnightMode === true;
     const maxBatches = isOvernight ? OVERNIGHT_MAX_BATCHES : MAX_BATCHES;
-    // OVERNIGHT_AGGRESSIVE — independent of overnightMode (orthogonal
-    // settings, see LargeScaleAdminScraperOptions' own comment): "how long
-    // to keep going" vs. "how each batch acquires listings."
     const isAggressive = input.aggressiveMode === true;
     const maxDiscoveryPagesPerQuery =
       typeof input.maxDiscoveryPagesPerQuery === "number" && input.maxDiscoveryPagesPerQuery > 0
         ? Math.floor(input.maxDiscoveryPagesPerQuery)
         : undefined;
 
-    const options: LargeScaleAdminScraperOptions = {
+    // Required diagnostics (route name, user id — never credentials —
+    // target count, batch size, and every selected mode) logged before
+    // any DB work, so a later failure in this same request still leaves
+    // a trace of exactly what was requested.
+    console.log(`[${routeName}] Start requested`, {
+      userId: user.id,
+      targetInventorySize,
+      batchSize,
+      mode,
+      overnightMode: isOvernight,
+      aggressiveMode: isAggressive,
+    });
+
+    // Concurrency guard — refuse to start a second large-scale job while
+    // one is already active. Paused/completed/failed jobs are correctly
+    // NOT matched, so those can still start fresh or be resumed above.
+    const activeJob = await getActiveLargeScaleJob();
+    if (activeJob) {
+      return NextResponse.json(
+        { success: false, error: "Inventory Growth is already running", code: "ALREADY_RUNNING", activeJobId: activeJob.id },
+        { status: 409 },
+      );
+    }
+
+    // Plain object, not the LargeScaleAdminScraperOptions type — this
+    // route deliberately never imports @/lib/admin-scraper.ts (see this
+    // file's own header comment). checkpointOptions is typed as
+    // Record<string, unknown> in updateLargeScaleScraperJobProgress
+    // regardless, and process-batch/route.ts (which DOES import that
+    // type) reads this same shape back out of the job's checkpoint.
+    const options: Record<string, unknown> = {
       maxPrice: typeof input.maxPrice === "number" ? input.maxPrice : SCRAPER_CONFIG.maxPrice,
       minStyleScore: SCRAPER_CONFIG.minStyleScore,
       minImageScore: SCRAPER_CONFIG.minImageScore,
@@ -251,110 +234,37 @@ export async function POST(request: Request) {
     );
 
     const { job, error: createError } = await createLargeScaleScraperJob(targetInventorySize, estimatedTotalBatches, mode);
-    // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-    console.log("[diag] 2. createLargeScaleScraperJob completed", { jobId: job?.id, createError });
     if (!job) {
-      console.log("[route] response sent");
-      return NextResponse.json(
-        { success: false, error: createError ?? "Failed to start large-scale ingestion." },
-        { status: 500 },
-      );
+      console.error(`[${routeName}] createLargeScaleScraperJob failed`, { userId: user.id, createError });
+      return sanitizedErrorResponse(createError ?? "Failed to create the scraper job.", 500);
     }
 
-    // Fire-and-forget — see the resume path's own comment on why this
-    // cannot delay the response below.
-    runLargeScaleInBackground(job.id, options);
+    // Persists the resolved options into the job's own checkpoint (seenUrls
+    // explicitly [], not omitted — updateLargeScaleScraperJobProgress only
+    // writes the checkpoint column at all when seenUrls is truthy, and an
+    // omitted key here would otherwise silently drop checkpointOptions too)
+    // so process-batch/route.ts — which never sees this request's body —
+    // can rebuild the exact same options on its very first call.
+    await updateLargeScaleScraperJobProgress(job.id, {
+      insertedCount: 0,
+      validCount: 0,
+      duplicateCount: 0,
+      rejectedCount: 0,
+      currentBatch: 0,
+      seenUrls: [],
+      checkpointOptions: options,
+    });
 
-    console.log("[route] response sent");
-    return NextResponse.json({ success: true, jobId: job.id });
+    console.log(`[${routeName}] Job created and queued`, { userId: user.id, jobId: job.id });
+    return NextResponse.json({ success: true, jobId: job.id, status: "queued" });
   } catch (error) {
-    // Safety net for exactly the failure mode reported: without this, an
-    // exception thrown anywhere above (not just a query returning
-    // {error}, but e.g. createAdminClient() throwing synchronously)
-    // propagated out of POST() with no response ever sent — which is what
-    // a browser's fetch() surfaces as "Failed to fetch," not as a
-    // readable error. This guarantees a JSON response even then.
-    console.error("[admin-scraper-large-scale] Uncaught error in POST handler:", error);
-    console.log("[route] response sent");
-    return NextResponse.json(
-      { success: false, error: error instanceof Error ? error.message : "Unexpected server error." },
-      { status: 500 },
-    );
+    // Full server-side log — route name, user id (if we got that far),
+    // and the complete stack. The client only ever sees the sanitized
+    // shape below.
+    console.error(`[${routeName}] Uncaught error in POST handler`, {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+    });
+    return sanitizedErrorResponse(error instanceof Error ? error.message : "Unexpected server error.", 500);
   }
-}
-
-function runLargeScaleInBackground(jobId: string, options: LargeScaleAdminScraperOptions) {
-  after(async () => {
-    // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-    console.log(`[diag] 3. after() background task began for job ${jobId}`);
-    try {
-      // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-      console.log(`[diag] 4a. about to call runLargeScaleAdminScraper() for job ${jobId}`);
-      const result = await runLargeScaleAdminScraper(options, {
-        onProgress: (progress) => {
-          // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-          console.log(`[diag] 8. onProgress fired -> attempting updateLargeScaleScraperJobProgress for job ${jobId}`, progress);
-          return updateLargeScaleScraperJobProgress(jobId, {
-            insertedCount: progress.insertedCount,
-            validCount: progress.validCount,
-            duplicateCount: progress.duplicateCount,
-            rejectedCount: progress.rejectedCount,
-            insertFailedCount: progress.insertFailedCount,
-            extractedSuccessfullyCount: progress.extractedSuccessfullyCount,
-            extractionFailuresByReason: progress.extractionFailuresByReason,
-            scrapedCount: progress.scrapedCount,
-            currentBatch: progress.currentBatch,
-            failedBatchCount: progress.failedBatchCount,
-            checkpointOptions: options as unknown as Record<string, unknown>,
-            queriesCompleted: progress.queriesCompleted,
-            pagesSearched: progress.pagesSearched,
-            uniqueUrlsDiscovered: progress.uniqueUrlsDiscovered,
-          });
-        },
-        isPaused: async () => {
-          const job = await getScraperJobRow(jobId);
-          return job?.status === "paused";
-        },
-      });
-
-      // Final checkpoint write — captures every URL tried across the
-      // whole run, so a later resume (if this stopped for a reason other
-      // than reaching the target) starts from the fullest seenUrls set.
-      // updateLargeScaleScraperJobProgress never touches `status` (see its
-      // own header comment), so this can't stomp the "paused" status
-      // pauseScraperJobRow already set even when stopReason is "paused".
-      await updateLargeScaleScraperJobProgress(jobId, {
-        insertedCount: result.totalImported,
-        validCount: result.totalValid,
-        duplicateCount: result.totalDuplicates,
-        rejectedCount: result.totalRejected,
-        insertFailedCount: result.totalInsertFailed,
-        extractedSuccessfullyCount: result.totalExtractedSuccessfully,
-        extractionFailuresByReason: result.extractionFailuresByReason,
-        scrapedCount: result.totalScraped,
-        currentBatch: result.batchesRun,
-        seenUrls: result.seenUrls,
-        checkpointOptions: options as unknown as Record<string, unknown>,
-        queriesCompleted: result.totalQueriesCompleted,
-        pagesSearched: result.totalPagesSearched,
-        uniqueUrlsDiscovered: result.totalUniqueUrlsDiscovered,
-      });
-
-      if (result.stopReason === "paused") {
-        // Status is already 'paused' (pauseScraperJob set it directly) —
-        // completeScraperJob/failScraperJob would incorrectly overwrite it.
-        console.log(`[admin-scraper-large-scale] Job ${jobId} stopped cleanly for pause.`);
-      } else if (result.stopReason === "consecutive_failures") {
-        await failScraperJob(jobId, "Too many consecutive batches failed in a row — see server logs for details.");
-      } else {
-        await completeScraperJob(jobId, result.totalImported);
-      }
-
-      revalidatePath("/admin/listings");
-      revalidatePath("/admin/import");
-    } catch (error) {
-      console.error("[admin-scraper-large-scale] Background run failed:", error);
-      await failScraperJob(jobId, error instanceof Error ? error.message : "The large-scale scraper failed unexpectedly.");
-    }
-  });
 }

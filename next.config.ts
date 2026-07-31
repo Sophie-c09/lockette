@@ -7,6 +7,21 @@ const nextConfig: NextConfig = {
   turbopack: {
     root: path.join(__dirname),
   },
+  // Inventory Growth production crash fix — confirmed live that EVERY API
+  // route importing @/lib/admin-scraper.ts (directly or transitively)
+  // returned Vercel's generic static /500 HTML error page instead of that
+  // route's own JSON, while routes that don't import it (e.g.
+  // /api/inventory/index, /api/stripe/webhook) responded normally. That
+  // module chain pulls in playwright (src/lib/browser-concurrency.ts,
+  // src/lib/extraction/browser-extractor.ts, src/lib/marketplace-discovery.ts,
+  // src/lib/inventory/scaled-discovery.ts) — a native-binary package Next's
+  // bundler was trying to statically bundle for the serverless Function,
+  // which is exactly the class of failure serverExternalPackages exists to
+  // prevent: it tells Next to leave this package alone and `require` it
+  // normally at runtime instead of bundling it, matching Next's own
+  // documented guidance for native/binary Node dependencies (Playwright,
+  // sharp, etc.) in Route Handlers.
+  serverExternalPackages: ["playwright"],
   // Default Server Action body limit is 1MB — too small for Recreate This
   // Outfit's photo upload (RecreateOutfitForm.tsx posts the image File
   // directly to classifyOutfitPhotoForRecreation, a Server Action), which

@@ -12,6 +12,7 @@ import { SCRAPER_CONFIG, TARGET_INVENTORY_SIZE, BATCH_SIZE, type ScraperMode } f
 import { getScraperJobStatus, pauseScraperJob } from "@/app/actions/admin-scraper";
 import { getInventoryIntelligenceStats, type InventoryIntelligenceStats } from "@/app/actions/inventory-dashboard";
 import type { ScraperJobRow } from "@/lib/scraper-jobs";
+import { parseApiResponse } from "@/lib/api-response";
 
 type Phase = "idle" | "importing" | "done";
 
@@ -530,12 +531,48 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   const [largeScaleResuming, setLargeScaleResuming] = useState(false);
   const largeScalePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const largeScalePollFailuresRef = useRef(0);
+  // Guards against overlapping process-batch calls — a batch can take up
+  // to that route's own maxDuration (well longer than JOB_POLL_INTERVAL_MS),
+  // so without this, every poll tick while one is still in flight would
+  // fire a redundant second call for the same job.
+  const largeScaleBatchInFlightRef = useRef(false);
   const LARGE_SCALE_JOB_STORAGE_KEY = "reworn-admin-large-scale-job-id";
 
   function stopLargeScalePolling() {
     if (largeScalePollRef.current) {
       clearInterval(largeScalePollRef.current);
       largeScalePollRef.current = null;
+    }
+  }
+
+  // Architecture fix — Inventory Growth no longer runs the whole scraper
+  // inside the Start request (see the API route's own header comment for
+  // why: that used to crash production outright, and could never survive
+  // a multi-hour run on Vercel regardless). This is the "keep going" half:
+  // as long as the dashboard stays open and the job is queued/running,
+  // each poll tick (pollLargeScaleJob below) also asks the server to run
+  // ONE more bounded batch, entirely independent of the job-status poll
+  // itself — a failed/slow batch call never blocks or breaks polling.
+  async function triggerLargeScaleProcessBatch(jobId: string) {
+    if (largeScaleBatchInFlightRef.current) return;
+    largeScaleBatchInFlightRef.current = true;
+
+    try {
+      const response = await fetch("/api/admin-scraper/large-scale/process-batch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId }),
+      });
+      await parseApiResponse(response);
+    } catch (err) {
+      // Not surfaced as largeScaleError — a single failed batch call
+      // shouldn't interrupt the dashboard; the job's own polled status
+      // already reflects a real terminal failure (failScraperJob sets
+      // status: 'failed' server-side), which the status poll below
+      // handles on its own.
+      console.error("[large-scale] process-batch call failed:", err);
+    } finally {
+      largeScaleBatchInFlightRef.current = false;
     }
   }
 
@@ -571,6 +608,11 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       setLargeScalePhase("paused");
     } else {
       setLargeScalePhase("running");
+      // 'pending' or 'running' — keep the job actually moving. Fire-and-
+      // forget: this must never block the status poll's own cadence, and
+      // the in-flight guard above keeps a slow batch from overlapping
+      // with the next poll tick.
+      void triggerLargeScaleProcessBatch(jobId);
     }
 
     try {
@@ -621,10 +663,13 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
           aggressiveMode: largeScaleAggressiveMode,
         }),
       });
-      const data = await response.json();
+      // Never response.json() directly — see src/lib/api-response.ts's own
+      // header comment for the exact production incident (a framework-
+      // level 500 HTML page, not this route's JSON) this replaced.
+      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response);
 
-      if (!response.ok || !data.jobId) {
-        throw new Error(data.error ?? "Failed to start large-scale ingestion.");
+      if (!data.jobId) {
+        throw new Error("Failed to start large-scale ingestion.");
       }
 
       window.localStorage.setItem(LARGE_SCALE_JOB_STORAGE_KEY, data.jobId);
@@ -671,10 +716,10 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ resumeJobId: largeScaleJob.id }),
       });
-      const data = await response.json();
+      const data = await parseApiResponse<{ jobId?: string; status?: string }>(response);
 
-      if (!response.ok || !data.jobId) {
-        throw new Error(data.error ?? "Failed to resume large-scale ingestion.");
+      if (!data.jobId) {
+        throw new Error("Failed to resume large-scale ingestion.");
       }
 
       setLargeScalePhase("running");
