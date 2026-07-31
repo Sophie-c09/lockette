@@ -2,7 +2,6 @@
 
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { Sparkles, Camera, X, Loader2, ChevronDown } from "lucide-react";
 import { ListingCard } from "@/components/listing/ListingCard";
 import { StyleFeaturesPromo } from "@/components/StyleFeaturesPromo";
@@ -10,13 +9,28 @@ import { loadMoreDiscoverListings, searchDiscoverByPhoto } from "@/app/actions/d
 import { DISCOVER_BATCH_SIZE } from "@/lib/pagination-constants";
 import { ITEM_TYPE_CATEGORIES } from "@/lib/item-type-categories";
 import { useToast } from "@/components/ToastProvider";
-import type { DiscoverSortOption, ScoredDiscoverListing } from "@/lib/discover-feed";
+import type { ScoredDiscoverListing } from "@/lib/discover-feed";
+// applyDiscoverSort/DiscoverSortOption come from discover-sort.ts, NOT
+// discover-feed.ts — this component is "use client", and discover-feed.ts
+// imports @/lib/supabase/server (a server-only module), so importing a
+// VALUE (not just a type) from it here would break the client bundle.
+// Switching the sort dropdown re-sorts the already-loaded `listings`
+// state directly with this same shared logic, instead of navigating to a
+// new URL — see this feature's own "do not trigger a full reload when
+// switching back to Default" requirement, and discover-sort.ts's own
+// header comment.
+import { applyDiscoverSort, type DiscoverSortOption, type DiscoverSortKeys } from "@/lib/discover-sort";
 
 const SORT_OPTIONS: { value: DiscoverSortOption; label: string }[] = [
+  { value: "", label: "Default" },
   { value: "recent", label: "Most Recent" },
   { value: "price_asc", label: "Price: Low to High" },
   { value: "price_desc", label: "Price: High to Low" },
 ];
+
+function listingSortKeys(listing: ScoredDiscoverListing): DiscoverSortKeys {
+  return { id: listing.id, price: listing.price, createdAt: listing.created_at, matchPercent: listing.matchPercent };
+}
 
 // Continuous, scroll-based browsing feed — a grid of ListingCard (same
 // shared card Match's "More Like This"-style surfaces and Style Me's
@@ -39,7 +53,7 @@ export function DiscoverView({
   styleSlug = null,
   styleLabel = null,
   styleDescription = null,
-  sortOption = "recent",
+  sortOption: initialSortOption = "",
 }: {
   initialListings: ScoredDiscoverListing[];
   initialSavedListingIds: string[];
@@ -72,14 +86,34 @@ export function DiscoverView({
   styleSlug?: string | null;
   styleLabel?: string | null;
   styleDescription?: string | null;
-  // The active sort-control selection (?sort=<option>, discover/page.tsx —
+  // The INITIAL sort-control selection (?sort=<option>, discover/page.tsx —
   // already validated/defaulted server-side via parseDiscoverSortOption).
-  // Re-sent on every "load more" call, same as the other filter axes, so
-  // infinite scroll keeps extending in the SAME order rather than
-  // silently reverting to Most Recent once the user scrolls past page one.
+  // Only used to seed this component's own `sortOption` state below —
+  // switching the dropdown afterward is handled entirely client-side
+  // (see that state's own comment), never by re-sending this prop.
   sortOption?: DiscoverSortOption;
 }) {
-  const router = useRouter();
+  // Client-side sort selection — deliberately its OWN state, not derived
+  // from the `sortOption` prop on every render: switching the dropdown
+  // must re-sort the already-loaded `listings` instantly, with no server
+  // round-trip and no DiscoverView remount (this feature's own "do not
+  // trigger a full reload when switching back to Default" requirement).
+  // Re-initializes from a FRESH `initialSortOption` only when the
+  // category/type/search/style filters actually change and this
+  // component gets a genuinely new `key` (see discover/page.tsx) — a real
+  // navigation, which legitimately does need a fresh server fetch.
+  const [sortOption, setSortOption] = useState<DiscoverSortOption>(initialSortOption);
+  // Read inside loadNextBatch/the IntersectionObserver effect below,
+  // which — like offsetRef/hasMoreRef/loadingRef — must never see a stale
+  // closed-over value: the effect that wires up the observer only runs
+  // once, so a plain closure over `sortOption` would keep using whatever
+  // it was when the effect first ran, even after the user changes the
+  // dropdown. Synced via its own effect (not written directly during
+  // render) — refs must never be mutated during render.
+  const sortOptionRef = useRef(sortOption);
+  useEffect(() => {
+    sortOptionRef.current = sortOption;
+  }, [sortOption]);
 
   // `listings` is the ONLY state driving what's on screen — it starts
   // from the already server-scored/ordered `initialListings`
@@ -178,11 +212,15 @@ export function DiscoverView({
     observer.observe(sentinel);
     return () => observer.disconnect();
 
-    // categorySlug/typeSlug/searchQuery/styleSlug/sortOption are stable
-    // for this component's lifetime — DiscoverView is remounted (via a
-    // `key` combining all five — see discover/page.tsx) whenever any
-    // active filter or the sort selection actually changes, rather than
-    // this effect re-running mid-session.
+    // categorySlug/typeSlug/searchQuery/styleSlug are stable for this
+    // component's lifetime — DiscoverView is remounted (via a `key`
+    // combining all four plus the sort that was active at that navigation
+    // — see discover/page.tsx) whenever any of them actually changes,
+    // rather than this effect re-running mid-session. sortOption is
+    // genuinely NOT stable (the dropdown changes it client-side without a
+    // remount — see handleSortChange), which is exactly why loadNextBatch
+    // reads sortOptionRef.current instead of closing over the sortOption
+    // variable directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -192,7 +230,14 @@ export function DiscoverView({
 
     try {
       while (hasMoreRef.current) {
-        const result = await loadMoreDiscoverListings(offsetRef.current, categorySlug, typeSlug, searchQuery, styleSlug, sortOption);
+        const result = await loadMoreDiscoverListings(
+          offsetRef.current,
+          categorySlug,
+          typeSlug,
+          searchQuery,
+          styleSlug,
+          sortOptionRef.current,
+        );
         if (result.error) {
           hasMoreRef.current = false;
           break;
@@ -202,7 +247,13 @@ export function DiscoverView({
         if (result.rawCount < DISCOVER_BATCH_SIZE) hasMoreRef.current = false;
 
         if (result.listings.length > 0) {
-          setListings((current) => [...current, ...result.listings]);
+          // Each page is fetched (and sorted) independently server-side,
+          // so a naive append wouldn't be correctly ordered as a WHOLE
+          // set once combined (e.g. price_asc within page 1 followed by
+          // price_asc within page 2 isn't price_asc across all 120) — this
+          // re-applies the current sort across the full accumulated list,
+          // same shared logic the dropdown's own onChange uses below.
+          setListings((current) => applyDiscoverSort([...current, ...result.listings], sortOptionRef.current, listingSortKeys));
           setSavedListingIds((current) => new Set([...current, ...result.savedListingIds]));
           break;
         }
@@ -227,25 +278,46 @@ export function DiscoverView({
     if (slug) params.set("type", slug);
     if (searchQuery) params.set("query", searchQuery);
     if (styleSlug) params.set("style", styleSlug);
-    if (sortOption !== "recent") params.set("sort", sortOption);
+    if (sortOption !== "") params.set("sort", sortOption);
     const qs = params.toString();
     return qs ? `/discover?${qs}` : "/discover";
   }
 
   // Same preserve-everything-else pattern as typeHref above, but swapping
-  // the sort axis instead of type — "recent" (Most Recent) is the
-  // default, so it's simply omitted from the URL rather than written out
-  // as ?sort=recent, matching how every other filter here only appears in
-  // the querystring when it's actually non-default.
+  // the sort axis instead of type — "" (Default) is the default, so it's
+  // simply omitted from the URL rather than written out as ?sort=,
+  // matching how every other filter here only appears in the querystring
+  // when it's actually non-default. Used only to keep the address bar
+  // (bookmarking/sharing) in sync — see this function's own caller below,
+  // which updates the URL via history.replaceState rather than a real
+  // navigation, so switching sort never remounts this component.
   function sortHref(option: DiscoverSortOption) {
     const params = new URLSearchParams();
     if (categorySlug) params.set("category", categorySlug);
     if (typeSlug) params.set("type", typeSlug);
     if (searchQuery) params.set("query", searchQuery);
     if (styleSlug) params.set("style", styleSlug);
-    if (option !== "recent") params.set("sort", option);
+    if (option !== "") params.set("sort", option);
     const qs = params.toString();
     return qs ? `/discover?${qs}` : "/discover";
+  }
+
+  // Re-sorts the already-loaded `listings` instantly (client-side only —
+  // this feature's own "do not trigger a full reload when switching back
+  // to Default" requirement) and keeps the address bar in sync for
+  // bookmarking/sharing via history.replaceState — deliberately NOT
+  // router.push/replace, since either would re-run discover/page.tsx's
+  // Server Component and, because its `key` includes the active sort,
+  // remount this whole component (losing every page loaded past the
+  // first). Selecting "" (Default) restores the personalized ranking
+  // exactly, since applyDiscoverSort always recomputes it fresh from
+  // matchPercent rather than remembering any prior display order.
+  function handleSortChange(next: DiscoverSortOption) {
+    setSortOption(next);
+    setListings((current) => applyDiscoverSort(current, next, listingSortKeys));
+    if (typeof window !== "undefined") {
+      window.history.replaceState(null, "", sortHref(next));
+    }
   }
 
   const showingLabel = [categoryLabel, typeLabel, searchQuery ? `"${searchQuery}"` : null]
@@ -344,7 +416,7 @@ export function DiscoverView({
                   id="discover-sort"
                   aria-label="Sort listings"
                   value={sortOption}
-                  onChange={(event) => router.push(sortHref(event.target.value as DiscoverSortOption))}
+                  onChange={(event) => handleSortChange(event.target.value as DiscoverSortOption)}
                   className="appearance-none rounded-pill border border-teal/25 bg-highlight-cream/40 py-1.5 pl-3 pr-7 text-xs font-medium text-ink focus:border-teal focus:outline-none"
                 >
                   {SORT_OPTIONS.map((option) => (

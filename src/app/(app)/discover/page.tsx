@@ -62,7 +62,13 @@ export default async function DiscoverPage({
       // same-route navigation (e.g. a pill click or "clear filters" link)
       // — without this, React could reuse the existing DiscoverView
       // instance across the navigation and leak the previous filter's
-      // pagination offset/loaded listings into the new one.
+      // pagination offset/loaded listings into the new one. activeSort is
+      // included so a real navigation carrying a new ?sort= (a pasted
+      // link, or a category pill click that preserved the sort selected
+      // client-side) still seeds a correct initial sortOption — the sort
+      // DROPDOWN itself no longer navigates at all (DiscoverView re-sorts
+      // client-side; see its own sortOption state comment), so this key
+      // changing on sort alone doesn't happen from ordinary dropdown use.
       key={`${activeCategory?.slug ?? "all"}:${activeItemType?.slug ?? "all"}:${activeSearchQuery ?? "all"}:${activeStyle?.slug ?? "all"}:${activeSort}`}
       initialListings={listings}
       initialSavedListingIds={savedListingIds}
