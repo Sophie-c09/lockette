@@ -19,8 +19,19 @@ import { mapWithConcurrency } from "@/lib/concurrency";
 import type { PriceMode, SelectedCategory, SelectedBrand } from "@/lib/marketplace-discovery";
 import type { ListingInsert, ListingsDatabase } from "@/lib/supabase/listings.types";
 import type { ExtractedListing } from "@/lib/extraction/normalize-listing";
+// categorizeListing/CategoryBucket/CategoryCounts live in their own
+// dependency-free src/lib/category-bucket.ts (Discover production-crash
+// fix — see that file's own header comment for why: this module
+// transitively imports Playwright via listing-extraction.ts above, which
+// is fine for THIS file's own admin/bulk-import callers but broke
+// Discover the moment two of its scoring modules needed this one pure
+// function). Imported here for this file's own use below, and re-exported
+// just after so every existing caller of these three names from
+// "@/lib/bulk-import" keeps working unchanged.
+import { categorizeListing, type CategoryBucket, type CategoryCounts } from "@/lib/category-bucket";
 
 export type { PriceMode, SelectedCategory, SelectedBrand } from "@/lib/marketplace-discovery";
+export { categorizeListing, type CategoryBucket, type CategoryCounts };
 
 type ListingRowToInsert = ListingInsert & {
   shipping_cost: number;
@@ -30,85 +41,6 @@ type ListingRowToInsert = ListingInsert & {
   quality_reason: string;
   quality_breakdown: QualityScoreBreakdown;
 };
-
-// ---------------------------------------------------------------------------
-// Category diversity control — prevents a run from being dominated by one
-// category (e.g. the "80% jackets" problem this whole rebalance is fixing).
-// Buckets are coarse and keyword-matched, same spirit as
-// src/lib/listing-quality.ts's own category matching: good enough to bias
-// a ranking decision, not meant to be an authoritative classification.
-// ---------------------------------------------------------------------------
-
-// "bags" split out as its own bucket (was previously lumped into
-// "accessories" alongside jewelry/belts/scarves) so the reverse-image-
-// search matching pipeline (src/lib/garment-matching.ts) can actually
-// search for a detected bag/purse specifically, instead of it competing
-// against every other accessory type in one broad bucket — see
-// src/lib/garment-detection.ts's own comment on why that distinction
-// matters for matching quality.
-export type CategoryBucket = "tops" | "dresses" | "bottoms" | "outerwear" | "accessories" | "bags" | "shoes" | "other";
-
-export type CategoryCounts = Partial<Record<CategoryBucket, number>>;
-
-// Checked in order — more specific/definitive keywords first so e.g. a
-// "sweater dress" lands in dresses rather than tops.
-const CATEGORY_BUCKET_KEYWORDS: [string, CategoryBucket][] = [
-  ["dress", "dresses"],
-  ["skirt", "bottoms"],
-  ["jean", "bottoms"],
-  ["denim", "bottoms"],
-  ["trouser", "bottoms"],
-  ["legging", "bottoms"],
-  ["pant", "bottoms"],
-  ["short", "bottoms"],
-  ["jacket", "outerwear"],
-  ["coat", "outerwear"],
-  ["hoodie", "outerwear"],
-  ["cardigan", "outerwear"],
-  ["blazer", "outerwear"],
-  ["windbreaker", "outerwear"],
-  ["shoe", "shoes"],
-  ["sneaker", "shoes"],
-  ["boot", "shoes"],
-  ["sandal", "shoes"],
-  ["heel", "shoes"],
-  ["bag", "bags"],
-  ["purse", "bags"],
-  ["backpack", "bags"],
-  ["tote", "bags"],
-  ["clutch", "bags"],
-  ["jewelry", "accessories"],
-  ["necklace", "accessories"],
-  ["earring", "accessories"],
-  ["bracelet", "accessories"],
-  ["belt", "accessories"],
-  ["scarf", "accessories"],
-  ["sunglasses", "accessories"],
-  // Deliberately NOT "hat" — verified live against this app's own
-  // inventory that it's a substring of the real, common brand name "Baby
-  // Phat" ("Phat".includes("hat")), which was silently miscategorizing
-  // every Baby Phat top/tee as an accessory. This keyword-substring
-  // matcher has no word-boundary check, so a short, common word like
-  // "hat" is too easy to collide with an unrelated brand/word.
-  ["camisole", "tops"],
-  ["blouse", "tops"],
-  ["sweater", "tops"],
-  ["cami", "tops"],
-  ["crop", "tops"],
-  ["tank", "tops"],
-  ["t-shirt", "tops"],
-  ["tee", "tops"],
-  ["shirt", "tops"],
-  ["top", "tops"],
-];
-
-export function categorizeListing(listing: ExtractedListing): CategoryBucket {
-  const haystack = `${listing.category ?? ""} ${listing.title ?? ""}`.toLowerCase();
-  for (const [keyword, bucket] of CATEGORY_BUCKET_KEYWORDS) {
-    if (haystack.includes(keyword)) return bucket;
-  }
-  return "other";
-}
 
 // "For every 100 imported listings aim for: Tops 30%, Dresses 15%,
 // Bottoms 20%, Outerwear 10%, Accessories 7%, Bags 3%, Shoes 10%, Other 5%."

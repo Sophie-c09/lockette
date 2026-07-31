@@ -390,10 +390,33 @@ export async function fetchDiscoverBatch(
   styleSlug?: string | null,
   sortOption: DiscoverSortOption = DEFAULT_DISCOVER_SORT,
 ): Promise<DiscoverBatchResult> {
+  // TEMPORARY diagnostic (Discover production-crash investigation,
+  // commit 459b7de's regression) — `stage` is updated right before each
+  // major phase below so an unexpected exception's log line says WHERE
+  // in the loader it happened, not just that it happened. Remove once
+  // the fix is confirmed stable in production.
+  let stage = "auth";
+  let userIdForLogging: string | null = null;
+
+  try {
+    return await fetchDiscoverBatchInner();
+  } catch (error) {
+    console.error("[DISCOVER_LOAD_FAILED]", {
+      userId: userIdForLogging,
+      stage,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
+      supabaseCode: typeof error === "object" && error && "code" in error ? (error as { code?: unknown }).code : undefined,
+    });
+    return { listings: [], savedListingIds: [], rawCount: 0, error: error instanceof Error ? error.message : "Failed to load Discover." };
+  }
+
+  async function fetchDiscoverBatchInner(): Promise<DiscoverBatchResult> {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
+  userIdForLogging = user?.id ?? null;
 
   // Best-effort — clears out stale reservations so they don't keep
   // hiding listings past their 15-minute window. No cron/background job
@@ -430,6 +453,7 @@ export async function fetchDiscoverBatch(
   });
 
   if (user) {
+    stage = "fetch_profile_likes_feedback";
     const [
       { data: styleProfile },
       { data: savedRows, error: savedItemsError },
@@ -494,6 +518,7 @@ export async function fetchDiscoverBatch(
       (row): row is { listing_id: string; created_at: string } => Boolean(row.listing_id),
     );
 
+    stage = "fetch_liked_feedback_attributes";
     const attributeIds = [...new Set([...savedEntries.map((r) => r.listing_id), ...feedbackEntries.map((r) => r.listing_id)])];
     const attributesById = new Map<string, LikedListingAttributes>();
     if (attributeIds.length > 0) {
@@ -513,6 +538,7 @@ export async function fetchDiscoverBatch(
 
     const hardExcludedStyles = getHardExcludedStyleKeys(dislikedStyles, Date.now());
 
+    stage = "build_style_vector";
     userStyleVector = buildUserStyleVector({
       now: Date.now(),
       styleProfile: { styleTags: preferences, favoriteBrands, favoriteCategories, favoriteColors },
@@ -557,6 +583,7 @@ export async function fetchDiscoverBatch(
   const rangeStart = useRankedWindow ? 0 : offset;
   const rangeEnd = useRankedWindow ? RANKED_WINDOW - 1 : offset + limit - 1;
 
+  stage = "fetch_candidate_window";
   let query = supabase
     .from("listings")
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime-computed select string, see listingColumns' own comment above
@@ -609,6 +636,7 @@ export async function fetchDiscoverBatch(
       error,
     );
 
+    stage = "fetch_candidate_window_fallback";
     let statusOnlyQuery = supabase
       .from("listings")
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime-computed select string, see listingColumns' own comment above
@@ -667,6 +695,7 @@ export async function fetchDiscoverBatch(
   // exclusion in this whole pipeline remains the already-liked/
   // already-disliked filter just above.
   const now = Date.now();
+  stage = "score_candidates";
   const scored: DiscoverSortEntry[] = unseenListings.map((listing) => {
     const breakdown = scoreGarmentStyleMatch(userStyleVector, {
       id: listing.id,
@@ -704,6 +733,7 @@ export async function fetchDiscoverBatch(
   // than a hard filter — a page/window with too little qualifying
   // inventory shows its best available options instead of coming back
   // empty or short.
+  stage = "gate_and_sort";
   const gatePassed = scored.filter((entry) => entry.fashionQualityScore >= FASHION_QUALITY_GATE);
   const gateFailed = scored.filter((entry) => entry.fashionQualityScore < FASHION_QUALITY_GATE);
   const rankedPool = [...sortDiscoverListings(gatePassed, sortOption), ...sortDiscoverListings(gateFailed, sortOption)];
@@ -729,4 +759,5 @@ export async function fetchDiscoverBatch(
     rawCount,
     error: null,
   };
+  } // end fetchDiscoverBatchInner
 }

@@ -16,9 +16,8 @@
 // No I/O here — pure functions only, same "data fetching lives in
 // discover-feed.ts, scoring/vector-building is pure and testable"
 // convention already used by match-scoring.ts/feed-scoring.ts.
-import { categorizeListing, type CategoryBucket } from "@/lib/bulk-import";
+import { categorizeListing, type CategoryBucket } from "@/lib/category-bucket";
 import { ITEM_TYPE_CATEGORIES } from "@/lib/item-type-categories";
-import type { ExtractedListing } from "@/lib/extraction/normalize-listing";
 import type { VisualListingAnalysis } from "@/lib/ai/visual-listing-analysis";
 
 export type WeightedTerms = Map<string, number>;
@@ -136,7 +135,7 @@ function extractGarmentNouns(title: string, category: string | null): string[] {
 }
 
 function bucketOf(listing: Pick<LikedListingAttributes, "title" | "category">): CategoryBucket {
-  return categorizeListing({ title: listing.title, category: listing.category } as ExtractedListing);
+  return categorizeListing({ title: listing.title, category: listing.category });
 }
 
 interface MutableVectorMaps {

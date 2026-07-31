@@ -14,9 +14,8 @@
 // per-user vector instead of a flat top-3-tags list.
 import type { UserStyleVector, WeightedTerms } from "@/lib/discover-style-vector";
 import { normalizeTerm } from "@/lib/discover-style-vector";
-import { categorizeListing } from "@/lib/bulk-import";
+import { categorizeListing } from "@/lib/category-bucket";
 import { ITEM_TYPE_CATEGORIES } from "@/lib/item-type-categories";
-import type { ExtractedListing } from "@/lib/extraction/normalize-listing";
 import type { VisualListingAnalysis } from "@/lib/ai/visual-listing-analysis";
 
 // ---------------------------------------------------------------------------
@@ -150,7 +149,7 @@ export function scoreGarmentStyleMatch(vector: UserStyleVector, listing: Garment
     };
   }
 
-  const bucket = categorizeListing({ title: listing.title, category: listing.category } as ExtractedListing);
+  const bucket = categorizeListing({ title: listing.title, category: listing.category });
   const garmentNouns = garmentNounsOf(listing);
   const categoryCandidateTerms = bucket !== "other" ? [bucket, ...(listing.category ? [listing.category] : [])] : listing.category ? [listing.category] : [];
 
