@@ -991,10 +991,13 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
           brandMode: styleBrands.length > 0 ? styleBrands : null,
         }),
       });
-      const data = await response.json();
+      // Never response.json() directly — see src/lib/api-response.ts's own
+      // header comment for the exact production incident (a framework-
+      // level 500 HTML page, not this route's JSON) this replaced.
+      const data = await parseApiResponse<{ jobId?: string }>(response);
 
-      if (!response.ok || !data.jobId) {
-        throw new Error(data.error ?? "Failed to start the scraper.");
+      if (!data.jobId) {
+        throw new Error("Failed to start the scraper.");
       }
 
       window.localStorage.setItem(STYLE_JOB_STORAGE_KEY, data.jobId);
@@ -1033,10 +1036,21 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({}),
       });
-      const data = await response.json();
+      // Never response.json() directly — see src/lib/api-response.ts's own
+      // header comment for the exact production incident (a framework-
+      // level 500 HTML page, not this route's JSON) this replaced. This is
+      // the fix for "Continuous Import failed: Unexpected token '<',
+      // \"<!DOCTYPE \"... is not valid JSON" — the route itself is also
+      // fixed (see its own header comment) to never let an uncaught
+      // exception produce that HTML page in the first place, but this
+      // client-side guard means ANY non-JSON response (a proxy error, a
+      // platform-level timeout page, anything neither side anticipated)
+      // still surfaces a real, readable error instead of a raw parse
+      // exception.
+      const data = await parseApiResponse<{ jobId?: string }>(response);
 
-      if (!response.ok || !data.jobId) {
-        throw new Error(data.error ?? "Failed to start continuous import.");
+      if (!data.jobId) {
+        throw new Error("Failed to start continuous import.");
       }
 
       window.localStorage.setItem(CONTINUOUS_JOB_STORAGE_KEY, data.jobId);
