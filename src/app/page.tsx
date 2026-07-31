@@ -5,6 +5,7 @@ import { LinkButton } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Card } from "@/components/ui/Card";
 import { AESTHETIC_CATEGORIES } from "@/lib/aesthetic-categories";
+import { createClient } from "@/lib/supabase/server";
 
 // Copy deliberately makes no mention of messaging/chatting/negotiating
 // with sellers — Lockette buys the item on the shopper's behalf rather than
@@ -193,7 +194,58 @@ function HolsterTopArt() {
   );
 }
 
-export default function Home() {
+export type BottomCtaState =
+  | { show: false }
+  | { show: true; href: string; label: string };
+
+// Bottom-of-homepage CTA visibility — pure decision logic, kept separate
+// from the Server Component below so it's directly unit-testable without
+// needing to render a React tree or mock Supabase's query builder.
+// Mirrors the exact same completion signal src/app/(app)/style-profile/
+// page.tsx and src/app/(app)/profile/page.tsx already use
+// (style_profiles.onboarding_completed_at — a timestamp, null until
+// src/app/actions/onboarding.ts's submitOnboarding sets it) rather than
+// inventing a second "is this profile done" flag.
+export function resolveBottomCtaState(
+  user: { id: string } | null,
+  onboardingCompletedAt: string | null | undefined,
+): BottomCtaState {
+  if (!user) {
+    return { show: true, href: "/signup", label: "Create your profile" };
+  }
+
+  if (onboardingCompletedAt) {
+    return { show: false };
+  }
+
+  // Signed in but hasn't finished onboarding yet — same /onboarding
+  // destination style-profile/page.tsx's own redirect already sends an
+  // incomplete profile to.
+  return { show: true, href: "/onboarding", label: "Finish your profile" };
+}
+
+export default async function Home() {
+  // Server-side, not client-side local state (requirement 2) — the same
+  // createClient()/getUser() pattern every other page in this app uses,
+  // so the decision is already correct in the first server-rendered HTML
+  // and never has to flash/flip after hydration (requirement 8).
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  let onboardingCompletedAt: string | null = null;
+  if (user) {
+    const { data: styleProfile } = await supabase
+      .from("style_profiles")
+      .select("onboarding_completed_at")
+      .eq("user_id", user.id)
+      .maybeSingle();
+    onboardingCompletedAt = styleProfile?.onboarding_completed_at ?? null;
+  }
+
+  const bottomCta = resolveBottomCtaState(user, onboardingCompletedAt);
+
   return (
     <>
       <section className="px-6 pb-12 pt-16 sm:pt-20">
@@ -383,26 +435,28 @@ export default function Home() {
         </div>
       </section>
 
-      <section className="px-6 pb-16">
-        <div className="mx-auto max-w-4xl rounded-card bg-ink-strong px-8 py-10 text-center sm:px-16">
-          <h2 className="font-display text-3xl font-semibold text-white sm:text-4xl">
-            Your closet&apos;s next favorite piece is already thrifted.
-          </h2>
-          <p className="mx-auto mt-4 max-w-lg text-white/70">
-            Build your style profile in minutes and start swiping through
-            secondhand finds curated just for you.
-          </p>
-          <div className="mt-8">
-            <LinkButton
-              href="/signup"
-              variant="accent-pink"
-              className="px-7 py-3.5 text-base"
-            >
-              Create your profile
-            </LinkButton>
+      {bottomCta.show && (
+        <section className="px-6 pb-16">
+          <div className="mx-auto max-w-4xl rounded-card bg-ink-strong px-8 py-10 text-center sm:px-16">
+            <h2 className="font-display text-3xl font-semibold text-white sm:text-4xl">
+              Your closet&apos;s next favorite piece is already thrifted.
+            </h2>
+            <p className="mx-auto mt-4 max-w-lg text-white/70">
+              Build your style profile in minutes and start swiping through
+              secondhand finds curated just for you.
+            </p>
+            <div className="mt-8">
+              <LinkButton
+                href={bottomCta.href}
+                variant="accent-pink"
+                className="px-7 py-3.5 text-base"
+              >
+                {bottomCta.label}
+              </LinkButton>
+            </div>
           </div>
-        </div>
-      </section>
+        </section>
+      )}
     </>
   );
 }
