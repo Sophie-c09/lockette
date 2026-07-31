@@ -3,24 +3,46 @@
 import { useState, type KeyboardEvent, type MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 import { MoreVertical } from "lucide-react";
-import { Card } from "@/components/ui/Card";
-import { Badge, tagVariantForIndex, type TagVariant } from "@/components/ui/Badge";
+import { Badge, tagVariantForIndex } from "@/components/ui/Badge";
 import { SaveButton } from "@/components/SaveButton";
 import { ImageCarousel } from "@/components/ImageCarousel";
 import { removeListing, markListingLowQuality } from "@/lib/adminListingRemoval";
 import { useToast } from "@/components/ToastProvider";
 import type { Listing } from "@/lib/supabase/listings.types";
 
-function matchBadgeVariant(score: number): TagVariant {
-  if (score >= 75) return "pink";
-  if (score >= 40) return "teal";
-  return "yellow";
+// Bespoke match-score badge — deliberately NOT the shared Badge/TagVariant
+// system just below (that's for aesthetic tags, cycling pink/teal/yellow;
+// still untouched). Match-score has its own display rule from the
+// Discover redesign brief: translucent brand teal for a genuinely good
+// match, soft neutral cream for a so-so one, and no badge at all for a
+// bare 0% — never emphasized/bright regardless of score. Purely a display
+// bucketing of the ALREADY-computed matchScore prop; scoring itself
+// (match-scoring.ts) is completely untouched.
+function MatchBadge({ score }: { score: number }) {
+  if (score <= 0) return null;
+
+  const isHighMatch = score >= 70;
+
+  return (
+    <span
+      className={`inline-flex items-center rounded-pill px-2.5 py-1 text-[11px] font-semibold backdrop-blur-sm ${
+        isHighMatch ? "bg-teal/20 text-teal-deep" : "bg-highlight-cream/70 text-ink-soft"
+      }`}
+    >
+      {score}% match
+    </span>
+  );
 }
 
 // Shared by Discover (DiscoverView.tsx, the single unified browsing page
-// — /feed was merged into it, see discover-feed.ts's own comment) and
-// Match's "More Like This"-style surfaces. Uses a div + onClick/onKeyDown
-// + "ignore clicks inside a button" pattern (rather than a bare `<Link>`)
+// — /feed was merged into it, see discover-feed.ts's own comment), Match's
+// "More Like This"-style surfaces (MatchResultCard.tsx), and Style Me's
+// reveal bundle (StyleMeRevealView.tsx) — a visual restyle here (Discover
+// redesign brief: minimal chrome, image-first, softer overlay controls)
+// intentionally applies to all three rather than forking a second
+// Discover-only card, per that brief's own "do not create duplicate
+// listing-card logic" instruction. Uses a div + onClick/onKeyDown +
+// "ignore clicks inside a button" pattern (rather than a bare `<Link>`)
 // so the admin-only "..." menu's nested `<button>` composes safely with
 // SaveButton and real navigation alike.
 export function ListingCard({
@@ -117,8 +139,18 @@ export function ListingCard({
         : [];
 
   return (
-    <Card
-      className="flex cursor-pointer flex-col overflow-hidden p-0"
+    // Plain div, not the shared <Card> (src/components/ui/Card.tsx) — that
+    // component is used by ~20 other, unrelated surfaces (auth panels,
+    // admin dashboards, etc.) with its own always-on border/shadow, and a
+    // Tailwind utility appended later in a class list doesn't reliably
+    // override an earlier one with the same property. Rebuilding the
+    // handful of classes Card actually contributed here (rounded-card,
+    // bg-surface, the hover lift) keeps every other Card usage in the app
+    // completely unaffected while letting this specific card go flatter/
+    // lighter per the redesign brief (no border, no always-on shadow —
+    // only a soft one on hover).
+    <div
+      className="group flex cursor-pointer flex-col overflow-hidden rounded-card bg-surface transition-transform duration-200 ease-out hover:-translate-y-0.5 hover:shadow-soft"
       role="link"
       tabIndex={0}
       onClick={handleClick}
@@ -132,9 +164,9 @@ export function ListingCard({
         )}
 
         {matchScore != null && (
-          <Badge variant={matchBadgeVariant(matchScore)} className="absolute left-2 top-2 shadow-soft">
-            {matchScore}% Match
-          </Badge>
+          <div className={showSaveButton ? "absolute left-2 top-11" : "absolute left-2 top-2"}>
+            <MatchBadge score={matchScore} />
+          </div>
         )}
 
         {listing.platform && (
@@ -153,15 +185,15 @@ export function ListingCard({
               }}
               aria-label="Listing options"
               aria-expanded={menuOpen}
-              className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-white/90 text-ink shadow-soft hover:bg-white"
+              className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full bg-surface/70 text-ink-soft backdrop-blur-sm transition-colors hover:bg-surface/90 hover:text-ink"
             >
-              <MoreVertical className="h-4 w-4" strokeWidth={2} />
+              <MoreVertical className="h-3.5 w-3.5" strokeWidth={2} />
             </button>
 
             {menuOpen && (
               <div
                 onClick={(event) => event.stopPropagation()}
-                className="absolute right-0 top-9 z-10 w-44 overflow-hidden rounded-2xl border border-border bg-surface shadow-card"
+                className="absolute right-0 top-8 z-10 w-44 overflow-hidden rounded-2xl border border-border bg-surface shadow-card"
               >
                 <button
                   type="button"
@@ -183,38 +215,38 @@ export function ListingCard({
         )}
       </div>
 
-      <div className="flex flex-1 flex-col gap-2 p-4">
+      <div className="flex flex-1 flex-col gap-1 p-3">
         <div className="flex items-start justify-between gap-2">
-          <h3 className="font-display text-sm font-semibold leading-tight text-ink">
+          <h3 className="line-clamp-2 font-display text-sm font-semibold leading-tight text-ink">
             {listing.title}
           </h3>
           {listing.price != null && (
-            <span className="shrink-0 font-display text-sm font-semibold text-oxblood">
+            <span className="shrink-0 font-display text-sm font-bold text-oxblood">
               ${listing.price.toFixed(2)}
             </span>
           )}
         </div>
 
         {stylePoints != null && (
-          <p className="text-xs font-medium text-ink-soft">+{stylePoints} Style Points</p>
+          <p className="text-[11px] font-medium text-ink-soft">+{stylePoints} Style Points</p>
         )}
 
         {(listing.brand || listing.category || listing.size) && (
-          <p className="text-xs text-ink-soft">
+          <p className="text-[11px] text-muted">
             {[listing.brand, listing.category, listing.size].filter(Boolean).join(" · ")}
           </p>
         )}
 
         {listing.aesthetic_tags.length > 0 && (
-          <div className="mt-auto flex flex-wrap gap-1.5 pt-2">
+          <div className="mt-auto flex flex-wrap gap-1 pt-1">
             {listing.aesthetic_tags.map((tag, index) => (
-              <Badge key={tag} variant={tagVariantForIndex(index)} className="text-[11px]">
+              <Badge key={tag} variant={tagVariantForIndex(index)} className="px-2 py-0.5 text-[10px]">
                 {tag}
               </Badge>
             ))}
           </div>
         )}
       </div>
-    </Card>
+    </div>
   );
 }

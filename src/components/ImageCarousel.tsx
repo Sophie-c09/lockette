@@ -97,7 +97,7 @@ export function ImageCarousel({
                 type="button"
                 onClick={(event) => goTo(event, boundedIndex - 1)}
                 aria-label="Previous photo"
-                className="absolute left-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood sm:flex"
+                className="absolute left-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
               >
                 <ChevronLeft className="h-4 w-4" strokeWidth={2.5} />
               </button>
@@ -105,7 +105,7 @@ export function ImageCarousel({
                 type="button"
                 onClick={(event) => goTo(event, boundedIndex + 1)}
                 aria-label="Next photo"
-                className="absolute right-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood sm:flex"
+                className="absolute right-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
               >
                 <ChevronRight className="h-4 w-4" strokeWidth={2.5} />
               </button>

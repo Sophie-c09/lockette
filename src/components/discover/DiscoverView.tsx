@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { Sparkles, Camera, X, Loader2 } from "lucide-react";
+import { Sparkles, Camera, X, Loader2, ChevronDown } from "lucide-react";
 import { ListingCard } from "@/components/listing/ListingCard";
 import { StyleFeaturesPromo } from "@/components/StyleFeaturesPromo";
 import { loadMoreDiscoverListings, searchDiscoverByPhoto } from "@/app/actions/discover-feed";
@@ -253,112 +253,142 @@ export function DiscoverView({
     .join(" · ");
 
   return (
-    <div className="flex min-h-[calc(100vh-137px)] flex-col px-6 pt-12 pb-16">
+    <div className="flex min-h-[calc(100vh-137px)] flex-col px-6 pt-6 pb-16 sm:pt-8">
       <div className="mx-auto w-full max-w-6xl">
-        <div className="mb-8 text-center">
-          <span className="font-display text-sm uppercase tracking-[0.2em] text-oxblood">
-            Discover
+        {/* Compact editorial header — left-aligned with the grid below it
+            rather than a large centered hero block, per the redesign
+            brief. styleLabel/styleDescription (an active "shop by vibe"
+            filter — see this component's own prop comments) still take
+            priority when present, since that's real filter-state context,
+            not just decorative copy; the eyebrow/heading/support copy
+            below are only the DEFAULT (no style active) treatment. */}
+        <div className="mb-5">
+          <span className="font-display text-xs font-semibold uppercase tracking-[0.25em] text-oxblood">
+            Your Edit
           </span>
-          <h1 className="mt-2 font-display text-3xl font-semibold text-ink sm:text-4xl">
-            {styleLabel ?? "Browse real secondhand finds"}
+          <h1 className="mt-1 font-display text-2xl font-semibold text-ink sm:text-3xl">
+            {styleLabel ?? "Find your next favorite"}
           </h1>
-          {styleDescription && (
-            <p className="mt-2 text-sm text-ink-soft">{styleDescription}</p>
-          )}
+          {styleDescription ? (
+            <p className="mt-1 text-sm text-ink-soft">{styleDescription}</p>
+          ) : !styleLabel ? (
+            <p className="mt-1 text-sm text-ink-soft">
+              Secondhand pieces selected for your style
+            </p>
+          ) : null}
 
           {showingLabel && (
-            <p className="mt-3 text-sm text-ink-soft">
+            <p className="mt-2 text-sm text-ink-soft">
               Showing: <span className="font-medium text-ink">{showingLabel}</span>{" "}
               <Link href="/discover" className="text-oxblood underline underline-offset-4">
                 Clear filters
               </Link>
             </p>
           )}
-
-          <div className="mt-5 flex flex-wrap justify-center gap-2">
-            {ITEM_TYPE_CATEGORIES.map((type) => {
-              const active = type.slug === typeSlug;
-              return (
-                <Link
-                  key={type.slug}
-                  href={typeHref(active ? null : type.slug)}
-                  aria-pressed={active}
-                  className={`rounded-pill border px-4 py-1.5 text-sm font-medium transition-colors ${
-                    active
-                      ? "border-oxblood bg-oxblood text-white"
-                      : "border-border bg-surface text-ink-soft hover:border-oxblood hover:text-ink"
-                  }`}
-                >
-                  {type.label}
-                </Link>
-              );
-            })}
-          </div>
-
-          {!photoSearchActive && (
-            <div className="mt-5 flex items-center justify-center gap-2">
-              <label htmlFor="discover-sort" className="text-sm text-ink-soft">
-                Sort by
-              </label>
-              <select
-                id="discover-sort"
-                value={sortOption}
-                onChange={(event) => router.push(sortHref(event.target.value as DiscoverSortOption))}
-                className="rounded-pill border border-border bg-surface px-3 py-1.5 text-sm font-medium text-ink focus:border-oxblood focus:outline-none"
-              >
-                {SORT_OPTIONS.map((option) => (
-                  <option key={option.value} value={option.value}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
-
-          <div className="mt-5 flex flex-col items-center gap-2">
-            {photoSearchActive ? (
-              <p className="text-sm text-ink-soft">
-                Showing closest matches to your photo
-                {photoSearchUsedFallback && " (padded out with closest-category picks)"} ·{" "}
-                <button
-                  type="button"
-                  onClick={handleClearPhotoSearch}
-                  className="inline-flex items-center gap-1 text-oxblood underline underline-offset-4"
-                >
-                  <X className="h-3.5 w-3.5" strokeWidth={2} />
-                  Clear photo search
-                </button>
-              </p>
-            ) : (
-              <>
-                <input
-                  ref={photoInputRef}
-                  type="file"
-                  accept="image/jpeg,image/png,image/webp,image/gif"
-                  className="hidden"
-                  onChange={handlePhotoFileChange}
-                />
-                <button
-                  type="button"
-                  onClick={() => photoInputRef.current?.click()}
-                  disabled={photoSearchLoading}
-                  className="inline-flex items-center gap-2 rounded-pill border border-border bg-surface px-4 py-1.5 text-sm font-medium text-ink-soft transition-colors hover:border-oxblood hover:text-ink disabled:opacity-60"
-                >
-                  {photoSearchLoading ? (
-                    <Loader2 className="h-4 w-4 animate-spin" strokeWidth={2} />
-                  ) : (
-                    <Camera className="h-4 w-4" strokeWidth={1.75} />
-                  )}
-                  {photoSearchLoading ? "Searching..." : "Search by photo"}
-                </button>
-              </>
-            )}
-          </div>
         </div>
+
+        {/* Category pills — a single horizontally-scrollable row (never
+            wraps to multiple lines) so mobile stays tidy without an
+            awkward ragged-edge wrap. */}
+        <div className="mb-4 flex gap-1.5 overflow-x-auto pb-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+          {ITEM_TYPE_CATEGORIES.map((type) => {
+            const active = type.slug === typeSlug;
+            return (
+              <Link
+                key={type.slug}
+                href={typeHref(active ? null : type.slug)}
+                aria-pressed={active}
+                className={`shrink-0 whitespace-nowrap rounded-pill border px-3 py-1 text-xs font-medium transition-colors ${
+                  active
+                    ? "border-teal bg-teal text-white"
+                    : "border-teal/25 bg-highlight-cream/40 text-ink-soft hover:border-teal hover:text-ink"
+                }`}
+              >
+                {type.label}
+              </Link>
+            );
+          })}
+        </div>
+
+        {/* Control row — one compact toolbar (result context on the left,
+            sort + photo search on the right) instead of two separate,
+            centered, stacked rows. */}
+        {photoSearchActive ? (
+          <div className="mb-6 flex items-center justify-center gap-2 text-center">
+            <p className="text-sm text-ink-soft">
+              Showing closest matches to your photo
+              {photoSearchUsedFallback && " (padded out with closest-category picks)"} ·{" "}
+              <button
+                type="button"
+                onClick={handleClearPhotoSearch}
+                className="inline-flex items-center gap-1 text-oxblood underline underline-offset-4"
+              >
+                <X className="h-3.5 w-3.5" strokeWidth={2} />
+                Clear photo search
+              </button>
+            </p>
+          </div>
+        ) : (
+          <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
+            <p className="text-xs font-medium uppercase tracking-wide text-ink-soft">
+              Recommended for you
+            </p>
+
+            <div className="flex items-center gap-2">
+              {/* Native <select> underneath (keeps real keyboard/native
+                  dropdown behavior) — appearance-none + a custom chevron
+                  on top is what gives it the "understated fashion filter"
+                  look instead of a browser-default control. */}
+              <div className="relative">
+                <select
+                  id="discover-sort"
+                  aria-label="Sort listings"
+                  value={sortOption}
+                  onChange={(event) => router.push(sortHref(event.target.value as DiscoverSortOption))}
+                  className="appearance-none rounded-pill border border-teal/25 bg-highlight-cream/40 py-1.5 pl-3 pr-7 text-xs font-medium text-ink focus:border-teal focus:outline-none"
+                >
+                  {SORT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <ChevronDown
+                  className="pointer-events-none absolute right-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-ink-soft"
+                  strokeWidth={2}
+                />
+              </div>
+
+              <input
+                ref={photoInputRef}
+                type="file"
+                accept="image/jpeg,image/png,image/webp,image/gif"
+                className="hidden"
+                onChange={handlePhotoFileChange}
+              />
+              <button
+                type="button"
+                onClick={() => photoInputRef.current?.click()}
+                disabled={photoSearchLoading}
+                aria-label="Search by photo"
+                className="flex items-center gap-1.5 rounded-pill border border-teal/25 bg-highlight-cream/40 px-3 py-1.5 text-xs font-medium text-ink-soft transition-colors hover:border-teal hover:text-ink disabled:opacity-60"
+              >
+                {photoSearchLoading ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" strokeWidth={2} />
+                ) : (
+                  <Camera className="h-3.5 w-3.5" strokeWidth={1.75} />
+                )}
+                <span className="hidden sm:inline">
+                  {photoSearchLoading ? "Searching…" : "Search by photo"}
+                </span>
+              </button>
+            </div>
+          </div>
+        )}
 
         {listings.length > 0 ? (
           <>
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+            <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
               {listings.map((listing) => (
                 <ListingCard
                   key={listing.id}

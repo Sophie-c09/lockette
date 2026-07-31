@@ -47,7 +47,7 @@ export function SaveButton({
       disabled={isPending}
       aria-pressed={saved}
       aria-label={saved ? "Remove from saved" : "Save listing"}
-      className={`flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-all duration-150 ease-out hover:bg-oxblood active:scale-90 disabled:pointer-events-none ${className}`}
+      className={`flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-surface/70 text-oxblood backdrop-blur-sm transition-all duration-150 ease-out hover:bg-surface/90 active:scale-90 disabled:pointer-events-none ${className}`}
     >
       <Heart
         className={`h-4 w-4 transition-transform duration-150 ease-out ${saved ? "scale-110" : "scale-100"}`}
