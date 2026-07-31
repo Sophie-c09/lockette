@@ -13,9 +13,14 @@ export default async function ForgotPasswordPage({
   searchParams: Promise<{ error?: string }>;
 }) {
   // Set by /auth/confirm's own redirect (src/app/auth/confirm/route.ts)
-  // when verifyOtp fails — a missing/invalid/expired/already-used link.
-  // This used to be a query param nobody ever read, so a broken link
-  // silently dropped the user back here with zero explanation.
+  // on a genuine verifyOtp/exchangeCodeForSession failure, or by
+  // ResetPasswordSessionGate (src/components/auth/ResetPasswordSessionGate.tsx)
+  // when the recovery link's URL hash carries an error — e.g. otp_expired,
+  // access_denied, session_failed. Matched on "any truthy value" rather
+  // than one exact literal, since the real Supabase error code is now
+  // passed through directly (see both of those files) rather than a
+  // single hardcoded "invalid_link" string — still shown as one generic,
+  // friendly message regardless of which specific code came through.
   const { error } = await searchParams;
 
   return (
@@ -34,7 +39,7 @@ export default async function ForgotPasswordPage({
           Enter your email and we&apos;ll send you a link to reset it.
         </p>
       </div>
-      {error === "invalid_link" && (
+      {error && (
         <p className="mb-5 rounded-2xl bg-oxblood/10 px-4 py-3 text-center text-sm text-oxblood">
           That reset link has expired or already been used. Request a new one below.
         </p>
