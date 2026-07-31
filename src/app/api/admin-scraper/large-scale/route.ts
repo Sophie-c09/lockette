@@ -61,6 +61,7 @@ import {
   claimJobForResume,
   updateLargeScaleScraperJobProgress,
   getScraperJobRow,
+  failScraperJob,
 } from "@/lib/scraper-jobs";
 import type { ListingsDatabase } from "@/lib/supabase/listings.types";
 
@@ -99,6 +100,14 @@ function sanitizedErrorResponse(details: string, status: number) {
 
 export async function POST(request: Request) {
   const routeName = "admin-scraper/large-scale";
+
+  // Set the moment createLargeScaleScraperJob returns a row — requirement
+  // 7: if anything AFTER that point throws (the checkpoint write, or
+  // anything else added here later), the job must be left 'failed' with
+  // last_error populated, not stuck at 'pending' with no error recorded
+  // at all (which recoverStaleLargeScaleJob would otherwise, eventually,
+  // silently reinterpret as a pause nobody requested).
+  let createdJobId: string | null = null;
 
   // Everything below is wrapped so this handler ALWAYS returns a Response,
   // even if something throws synchronously (e.g. createAdminClient()
@@ -238,6 +247,7 @@ export async function POST(request: Request) {
       console.error(`[${routeName}] createLargeScaleScraperJob failed`, { userId: user.id, createError });
       return sanitizedErrorResponse(createError ?? "Failed to create the scraper job.", 500);
     }
+    createdJobId = job.id;
 
     // Persists the resolved options into the job's own checkpoint (seenUrls
     // explicitly [], not omitted — updateLargeScaleScraperJobProgress only
@@ -261,10 +271,22 @@ export async function POST(request: Request) {
     // Full server-side log — route name, user id (if we got that far),
     // and the complete stack. The client only ever sees the sanitized
     // shape below.
+    const message = error instanceof Error ? error.message : "Unexpected server error.";
     console.error(`[${routeName}] Uncaught error in POST handler`, {
-      message: error instanceof Error ? error.message : String(error),
+      message,
       stack: error instanceof Error ? error.stack : undefined,
     });
-    return sanitizedErrorResponse(error instanceof Error ? error.message : "Unexpected server error.", 500);
+
+    // Requirement 7 — a job row already exists at this point only if the
+    // exception happened AFTER createLargeScaleScraperJob returned (e.g.
+    // the checkpoint write below it throwing for some reason not already
+    // handled internally) — that row must not be left at 'pending'
+    // forever with no error recorded; mark it 'failed' with the real
+    // error before responding.
+    if (createdJobId) {
+      await failScraperJob(createdJobId, message);
+    }
+
+    return sanitizedErrorResponse(message, 500);
   }
 }

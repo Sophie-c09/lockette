@@ -122,12 +122,31 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, jobId, status: "failed", batchRan: false });
     }
 
-    const result = await runLargeScaleAdminScraper(options, {
-      isPaused: async () => {
-        const current = await getScraperJobRow(jobId);
-        return current?.status === "paused";
-      },
-    });
+    // Requirement 7 — a resource failure (missing browser, memory guard,
+    // a Supabase error) or any other uncaught exception INSIDE this batch
+    // attempt must become a real 'failed' status with last_error
+    // populated, not be left to sit at 'running' with a frozen heartbeat
+    // until recoverStaleLargeScaleJob silently reinterprets that, up to
+    // STALE_JOB_RECOVERY_THRESHOLD_MS later, as a pause nobody requested.
+    let result: Awaited<ReturnType<typeof runLargeScaleAdminScraper>>;
+    try {
+      result = await runLargeScaleAdminScraper(options, {
+        isPaused: async () => {
+          const current = await getScraperJobRow(jobId);
+          return current?.status === "paused";
+        },
+      });
+    } catch (batchError) {
+      const message = batchError instanceof Error ? batchError.message : "Unexpected error running this batch.";
+      console.error(`[${routeName}] Batch attempt threw — marking job failed`, {
+        userId: user.id,
+        jobId,
+        message,
+        stack: batchError instanceof Error ? batchError.stack : undefined,
+      });
+      await failScraperJob(jobId, message);
+      return NextResponse.json({ success: true, jobId, status: "failed", batchRan: false });
+    }
 
     // Cumulative totals — this call's own result only covers the ONE
     // batch it just ran, not the job's whole history, so every count is

@@ -25,9 +25,19 @@ import { getRecentNotifications, getUnreadNotificationCount } from "@/lib/notifi
 // on every other page, still using that shared variable at its own
 // weight) is completely unaffected by this one being loaded at a heavier
 // weight/italic here.
+//
+// Weight 700 (one step down from the original 900/font-black) — the CSS
+// font-weight utility below only matters if a @font-face at that same
+// weight is actually registered, so this had to move to "700" too, not
+// just the Tailwind class: leaving weight at 900 here while switching the
+// class to font-bold would have rendered identically to before (the
+// browser matches to whichever @font-face is registered, ignoring a
+// requested weight with no matching face). Still a real, non-synthetic
+// bold cut, just one notch lighter than the original — not back to the
+// thin appearance the brief explicitly ruled out.
 const wordmarkItalic = Fraunces({
   subsets: ["latin"],
-  weight: ["900"],
+  weight: ["700"],
   style: ["italic"],
 });
 
@@ -58,17 +68,18 @@ export async function Nav() {
           href="/"
           className={`shrink-0 whitespace-nowrap ${
             isHomepage
-              ? // font-black (900) — Fraunces genuinely ships a 900
-                // weight (unlike Instrument Serif/DM Serif Display,
-                // both capped at 400 from Google — see the font
-                // object's own comment), so this is a real heavy cut,
-                // not synthetic/faux bolding. tracking-normal (not
-                // -tight) gives its italic strokes room rather than
-                // crowding them; leading-none keeps its vertical
-                // footprint the same as before despite italic's
+              ? // font-bold (700) — one step lighter than the original
+                // font-black/900 (see the font object's own comment on
+                // why weight had to change there too). Fraunces genuinely
+                // ships a 700 weight (unlike Instrument Serif/DM Serif
+                // Display, both capped at 400 from Google), so this is
+                // still a real bold cut, not synthetic/faux bolding.
+                // tracking-normal (not -tight) gives its italic strokes
+                // room rather than crowding them; leading-none keeps its
+                // vertical footprint the same as before despite italic's
                 // slightly taller natural line-height, so nav
                 // height/position are unaffected.
-                `${wordmarkItalic.className} italic font-black tracking-normal leading-none`
+                `${wordmarkItalic.className} italic font-bold tracking-normal leading-none`
               : // Every other route — untouched, same as before this file
                 // ever had a homepage-only branch.
                 "font-display font-bold tracking-tight"

@@ -36,6 +36,49 @@ function isMissingColumnError(error: { code?: string; message: string }): boolea
   return error.code === "PGRST204" || /column .* does not exist/i.test(error.message);
 }
 
+// Required, exact-shape log around every Inventory Growth status
+// transition (see this file's own callers of this helper) — the
+// "job silently starts Paused" investigation had no way to tell, from
+// logs alone, WHEN a job's status actually changed, WHY, or whether a
+// pause was ever really requested versus inferred (stale-heartbeat
+// recovery, a startup exception, etc). `from` is best-effort: some call
+// sites (pauseScraperJobRow) read the row first specifically to report
+// it accurately; others (createLargeScaleScraperJob) have no prior state
+// at all and pass `null`.
+function logJobStatusTransition(params: {
+  jobId: string;
+  from: string | null;
+  to: string;
+  reason: string;
+  pauseRequested: boolean;
+}): void {
+  console.info("[INVENTORY_GROWTH][STATUS]", {
+    jobId: params.jobId,
+    from: params.from,
+    to: params.to,
+    reason: params.reason,
+    pauseRequested: params.pauseRequested,
+    timestamp: new Date().toISOString(),
+  });
+}
+
+// How long a large-scale job gets, from its own created_at, before the
+// stale-heartbeat recovery check (recoverStaleLargeScaleJob, below) is
+// even allowed to consider it — a job legitimately has NO heartbeat yet
+// for the brief window between being created and its first successful
+// progress write (or, on a database missing updated_at/last_heartbeat
+// entirely, forever). Without this grace period, recoverStaleLargeScaleJob
+// falls back to `created_at` as `lastSignal`, and any read of a job that
+// races ahead of its own first heartbeat write reads an "age" that's only
+// as small as the DB round-trip took — that's still correctly under
+// STALE_JOB_RECOVERY_THRESHOLD_MS, so this isn't why a job at age zero
+// would ever be treated as stale — but it's cheap, real insurance against
+// exactly that class of race (clock skew between app/DB servers, a slow
+// first write, a future field this function starts trusting), and it's
+// what makes requirement 3/5's "must not treat a job in its startup phase
+// as paused" true independent of the exact timing of the first heartbeat.
+const STARTUP_GRACE_PERIOD_MS = 2 * 60 * 1000; // 2 minutes
+
 export async function createScraperJob(requestedCount: number): Promise<{ job: ScraperJobRow | null; error?: string }> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const { data, error } = await supabase
@@ -173,6 +216,7 @@ export async function completeScraperJob(jobId: string, insertedCount: number): 
     console.error("[scraper-jobs] Failed to mark job completed:", jobId, error);
   } else {
     console.log(`[scraper-jobs] Job ${jobId} completed (inserted ${insertedCount})`);
+    logJobStatusTransition({ jobId, from: "running", to: "completed", reason: "target_reached", pauseRequested: false });
   }
 }
 
@@ -209,6 +253,15 @@ export async function completeScraperJob(jobId: string, insertedCount: number): 
 export async function recoverStaleLargeScaleJob(job: ScraperJobRow): Promise<ScraperJobRow> {
   if (job.status !== "running" && job.status !== "pending") return job;
 
+  // Startup grace period (see STARTUP_GRACE_PERIOD_MS's own comment) —
+  // checked against created_at UNCONDITIONALLY, before even looking at
+  // last_heartbeat/updated_at: a job in its first couple of minutes of
+  // life is in its startup phase almost by definition, and must never be
+  // recovered to 'paused' no matter what its heartbeat fields say (or
+  // don't say yet).
+  const ageSinceCreatedMs = Date.now() - new Date(job.created_at).getTime();
+  if (ageSinceCreatedMs <= STARTUP_GRACE_PERIOD_MS) return job;
+
   const lastSignal = job.last_heartbeat ?? job.updated_at ?? job.created_at;
   const ageMs = Date.now() - new Date(lastSignal).getTime();
   if (ageMs <= STALE_JOB_RECOVERY_THRESHOLD_MS) return job;
@@ -231,6 +284,16 @@ export async function recoverStaleLargeScaleJob(job: ScraperJobRow): Promise<Scr
   if (error) {
     console.error("[scraper-jobs] Failed to recover stale job:", job.id, error);
     return job;
+  }
+
+  if (data) {
+    logJobStatusTransition({
+      jobId: job.id,
+      from: job.status,
+      to: "paused",
+      reason: "stale_heartbeat_recovery",
+      pauseRequested: false,
+    });
   }
 
   return data ?? job;
@@ -293,6 +356,7 @@ export async function createLargeScaleScraperJob(
   mode: string,
 ): Promise<{ job: ScraperJobRow | null; error?: string }> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
+  const nowIso = new Date().toISOString();
 
   // Three tiers, each a STRICT superset of the one below it, so a column
   // missing from one tier can never take down a column that's actually
@@ -300,8 +364,32 @@ export async function createLargeScaleScraperJob(
   // table already had) together with total_batches/mode (which it didn't),
   // so the whole insert failed and the fallback dropped target_count too
   // even though nothing was wrong with that column.
-  const corePayload = { requested_count: targetCount, status: "pending" as const };
-  const trackedPayload = { ...corePayload, target_count: targetCount, current_round: 0 };
+  //
+  // completed_at/error_message are explicitly cleared here (requirement 1:
+  // "Starting Inventory Growth must always create... into a runnable
+  // state") even though this is a brand-new row that could never have had
+  // either set — cheap insurance against a future change that starts this
+  // job from an existing row instead. last_heartbeat/updated_at are set to
+  // NOW at creation time, in the SAME tier as target_count/current_round
+  // (the exact group of columns this file's own header comment confirms
+  // arrived together on the live table) — this is what closes the window
+  // where recoverStaleLargeScaleJob could otherwise see a job with no
+  // heartbeat at all yet and fall back to created_at alone; a fresh job
+  // now always has a real, current heartbeat the instant it exists,
+  // independent of when/whether the follow-up checkpoint write lands.
+  const corePayload = {
+    requested_count: targetCount,
+    status: "pending" as const,
+    completed_at: null,
+    error_message: null,
+  };
+  const trackedPayload = {
+    ...corePayload,
+    target_count: targetCount,
+    current_round: 0,
+    last_heartbeat: nowIso,
+    updated_at: nowIso,
+  };
   const fullPayload = { ...trackedPayload, total_batches: totalBatches, mode };
 
   let { data, error } = await supabase.from("scraper_jobs").insert(fullPayload).select().single();
@@ -335,6 +423,7 @@ export async function createLargeScaleScraperJob(
     `[scraper-jobs] Large-scale job created: ${data.id} (target ${targetCount}, ~${totalBatches} batches, ` +
       `${mode} mode) — wrote: ${wrote}`,
   );
+  logJobStatusTransition({ jobId: data.id, from: null, to: data.status, reason: "start", pauseRequested: false });
   return { job: data };
 }
 
@@ -528,11 +617,13 @@ export async function getScraperJobRow(jobId: string): Promise<ScraperJobRow | n
  */
 export async function pauseScraperJobRow(jobId: string): Promise<{ error?: string }> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
-  const { error } = await supabase
+  const { data, error } = await supabase
     .from("scraper_jobs")
     .update({ status: "paused" })
     .eq("id", jobId)
-    .in("status", ["pending", "queued", "running"]);
+    .in("status", ["pending", "queued", "running"])
+    .select("status")
+    .maybeSingle();
 
   if (error) {
     console.error("[scraper-jobs] Failed to pause job:", jobId, error);
@@ -540,6 +631,9 @@ export async function pauseScraperJobRow(jobId: string): Promise<{ error?: strin
   }
 
   console.log(`[scraper-jobs] Job ${jobId} paused`);
+  if (data) {
+    logJobStatusTransition({ jobId, from: "running", to: "paused", reason: "user_pause_request", pauseRequested: true });
+  }
   return {};
 }
 
@@ -566,18 +660,47 @@ export async function pauseScraperJobRow(jobId: string): Promise<{ error?: strin
  */
 export async function claimJobForResume(jobId: string): Promise<{ claimed: boolean; job: ScraperJobRow | null }> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
+  const nowIso = new Date().toISOString();
 
-  const { data, error } = await supabase
+  // Requirement 2/3 — resuming must not silently leave the row's OWN
+  // heartbeat/error state behind: a job that was paused a while ago (that
+  // is, after all, usually WHY there's something to resume) can easily
+  // carry a last_heartbeat/updated_at far older than
+  // STALE_JOB_RECOVERY_THRESHOLD_MS. Left untouched, the very next
+  // getScraperJobStatus poll after this resume calls
+  // recoverStaleLargeScaleJob against that same old timestamp and flips
+  // the job straight back to 'paused' before a single batch runs — which
+  // is indistinguishable, from the admin's side, from "I clicked Resume
+  // and it immediately paused itself." Resetting both here, in the SAME
+  // atomic claim as the status flip, is what makes a resumed job's
+  // "startup state" actually committed before anything reads it.
+  const richPayload = { status: "running" as const, last_heartbeat: nowIso, updated_at: nowIso, error_message: null };
+
+  let { data, error } = await supabase
     .from("scraper_jobs")
-    .update({ status: "running" })
+    .update(richPayload)
     .eq("id", jobId)
     .eq("status", "paused")
     .select()
     .maybeSingle();
 
+  if (error && isMissingColumnError(error)) {
+    ({ data, error } = await supabase
+      .from("scraper_jobs")
+      .update({ status: "running" as const })
+      .eq("id", jobId)
+      .eq("status", "paused")
+      .select()
+      .maybeSingle());
+  }
+
   if (error) {
     console.error("[scraper-jobs] Failed to claim job for resume:", jobId, error);
     return { claimed: false, job: null };
+  }
+
+  if (data) {
+    logJobStatusTransition({ jobId, from: "paused", to: "running", reason: "resume", pauseRequested: false });
   }
 
   return { claimed: Boolean(data), job: data };
@@ -607,5 +730,14 @@ export async function failScraperJob(jobId: string, errorMessage: string): Promi
     console.error("[scraper-jobs] Failed to mark job failed:", jobId, error);
   } else {
     console.log(`[scraper-jobs] Job ${jobId} failed: ${errorMessage}`);
+    // Requirement 7 — resource/startup failures (missing browser, memory
+    // guard, a Supabase error, an uncaught exception) MUST surface as a
+    // real 'failed' status with last_error populated, never be left to
+    // silently decay into 'paused' 20 minutes later via
+    // recoverStaleLargeScaleJob's stale-heartbeat check. Every caller of
+    // this function (process-batch/route.ts's catch block, the large-scale
+    // start route's own catch block, the batch-retry-ceiling check) is
+    // exactly one of those cases.
+    logJobStatusTransition({ jobId, from: "running", to: "failed", reason: errorMessage, pauseRequested: false });
   }
 }

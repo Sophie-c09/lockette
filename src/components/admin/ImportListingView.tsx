@@ -536,6 +536,19 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   // so without this, every poll tick while one is still in flight would
   // fire a redundant second call for the same job.
   const largeScaleBatchInFlightRef = useRef(false);
+  // Requirement 4 — "the frontend must select the correct currently active
+  // job." clearInterval only stops FUTURE ticks; it can't cancel a
+  // getScraperJobStatus call already in flight (e.g. the mount-effect's
+  // resume-on-load poll for whatever job id was last in localStorage). If
+  // that old, in-flight poll's promise resolves AFTER a fresh Start/Resume
+  // has already begun tracking a different job, its setLargeScaleJob/
+  // setLargeScalePhase calls would silently overwrite the new job's real
+  // state with a stale (possibly already-paused) job's — exactly what
+  // would make a brand-new run look like it "immediately paused itself."
+  // This ref is the single source of truth for "which job id do we
+  // actually care about right now"; every poll tick checks it before
+  // touching any state.
+  const largeScaleActiveJobIdRef = useRef<string | null>(null);
   const LARGE_SCALE_JOB_STORAGE_KEY = "reworn-admin-large-scale-job-id";
 
   function stopLargeScalePolling() {
@@ -579,11 +592,18 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   async function pollLargeScaleJob(jobId: string) {
     const { job, error } = await getScraperJobStatus(jobId);
 
+    // See largeScaleActiveJobIdRef's own comment — this call may have been
+    // in flight for an old job (or overtaken by a newer poll for the SAME
+    // job) by the time it resolves; only the poll for whatever job is
+    // CURRENTLY tracked is allowed to update state.
+    if (largeScaleActiveJobIdRef.current !== jobId) return;
+
     if (error || !job) {
       largeScalePollFailuresRef.current += 1;
       if (largeScalePollFailuresRef.current < MAX_CONSECUTIVE_POLL_FAILURES) return;
 
       stopLargeScalePolling();
+      largeScaleActiveJobIdRef.current = null;
       setLargeScaleError(
         error === "Not authorized."
           ? "Lost track of this job because your admin session expired while it ran in the background — " +
@@ -601,6 +621,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
     if (job.status === "completed" || job.status === "failed") {
       stopLargeScalePolling();
+      largeScaleActiveJobIdRef.current = null;
       setLargeScalePhase("done");
       window.localStorage.removeItem(LARGE_SCALE_JOB_STORAGE_KEY);
       refreshStats();
@@ -627,6 +648,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
   function startLargeScalePolling(jobId: string) {
     stopLargeScalePolling();
+    largeScaleActiveJobIdRef.current = jobId;
     largeScalePollFailuresRef.current = 0;
     pollLargeScaleJob(jobId);
     largeScalePollRef.current = setInterval(() => pollLargeScaleJob(jobId), JOB_POLL_INTERVAL_MS);
@@ -650,6 +672,14 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
     setLargeScaleError(null);
     setLargeScaleJob(null);
     window.localStorage.removeItem(LARGE_SCALE_JOB_STORAGE_KEY);
+    // Stop watching whatever job (if any) was previously tracked BEFORE
+    // this request even goes out — closes the window where an old
+    // in-flight poll (e.g. the mount-effect's resume-on-load poll for a
+    // stale localStorage id) could resolve after this Start call and
+    // stomp its state over the new job's, per largeScaleActiveJobIdRef's
+    // own comment.
+    stopLargeScalePolling();
+    largeScaleActiveJobIdRef.current = null;
 
     try {
       const response = await fetch("/api/admin-scraper/large-scale", {
@@ -733,6 +763,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
   function handleLargeScaleStartOver() {
     stopLargeScalePolling();
+    largeScaleActiveJobIdRef.current = null;
     setLargeScalePhase("idle");
     setLargeScaleJob(null);
     setLargeScaleError(null);
@@ -1742,7 +1773,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
           {largeScalePhase === "starting" && (
             <Button type="button" disabled className="w-fit">
               <Loader2 className="h-4 w-4 animate-spin" />
-              Starting...
+              Starting inventory growth…
             </Button>
           )}
 
