@@ -4,23 +4,36 @@
 // and the "load more" Server Action DiscoverView calls once the user
 // scrolls near the bottom (see src/app/actions/discover-feed.ts).
 //
-// Ranking/scoring (priority-sort rework): reuses match-scoring.ts's
-// scoreListingMatch/getTopTags EXACTLY as /match already does — not a
-// second scoring system. Each listing gets a matchPercent (0-100, the same
-// "style-match %" /match shows as its own badge) and stylePoints (0-50,
-// that same breakdown's styleScore sub-component — the Style DNA
-// tag-overlap points, already computed as part of the same call, just not
-// previously surfaced). The old blended onboarding+liked-tag score
-// (listing-scoring.ts's scoreAndSortListings / feed-scoring.ts's
-// scoreAndSortByLikedTags) plus the random shuffleWithBias reshuffle are
-// gone from this file — sorting is now the fully deterministic
-// match% -> price -> stylePoints priority order sortDiscoverListings
-// implements below. Neither listing-scoring.ts nor feed-scoring.ts is
-// deleted (listing-scoring.ts's own scoreListingMatch is still used by
-// garment-matching.ts) — this file just no longer calls them.
+// Personalization pipeline (garment-level rework — fixes Discover
+// surfacing unfashionable/mismatched inventory): match-scoring.ts's
+// scoreListingMatch/getTopTags (still used by /match, untouched) only ever
+// compared aesthetic_tags — broad vibe words like "coquette" or "y2k" — so
+// a floral maxi skirt and a fitted lace top could score identically for a
+// user who only actually likes the top, as long as both happened to share
+// one tag. This file now builds a deterministic per-user style vector
+// from Likes/onboarding/positive-interaction history
+// (src/lib/discover-style-vector.ts, weighted 45/25/15/10/5 per that
+// module's own spec) and scores each candidate's GARMENT-LEVEL
+// resemblance to it (src/lib/discover-personalization.ts's
+// scoreGarmentStyleMatch, weighted 30/20/15/10/10/5/5/5) before a
+// fashionability quality gate (FASHION_QUALITY_GATE) deprioritizes
+// visibly weak inventory. matchPercent (0-100) and stylePoints (the
+// aesthetic-match sub-component) keep the same field names/shape the UI
+// already renders (ListingCard.tsx) — nothing about the page itself
+// changed, only what feeds those two numbers.
+//
+// Also fixes a second, compounding bug: the OLD pipeline fetched exactly
+// one recency-ordered page (`.range(offset, offset+limit-1)`) and only
+// ever reordered THAT page — a genuinely great match sitting one page
+// further back (older) could never surface on page 1, no matter how well
+// it scored, because personalization never saw it. This file now scores
+// across a wider recency-ordered CANDIDATE POOL (RANKED_WINDOW below) and
+// paginates the RANKED result instead, so personalization actually gets a
+// meaningful pool to choose from rather than whatever happened to be
+// newest. See RANKED_WINDOW's own comment for the scale tradeoff this
+// makes for very deep pagination.
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
-import { scoreListingMatch, getTopTags } from "@/lib/match-scoring";
 import { buildAvailabilityFilter, releaseExpiredReservations } from "@/lib/reservations";
 import {
   getHomepageCategoryBySlug,
@@ -28,7 +41,9 @@ import {
   type HomepageCategory,
 } from "@/lib/aesthetic-categories";
 import { getItemTypeCategoryBySlug, type ItemTypeCategory } from "@/lib/item-type-categories";
-import { getHardExcludedStyleKeys, type DislikedStyles } from "@/lib/disliked-styles";
+import { getHardExcludedStyleKeys, assessListingAgainstDislikedStyles, type DislikedStyles } from "@/lib/disliked-styles";
+import { buildUserStyleVector, type LikedListingAttributes } from "@/lib/discover-style-vector";
+import { scoreGarmentStyleMatch, computeFashionQualityScore, FASHION_QUALITY_GATE } from "@/lib/discover-personalization";
 import type { Listing } from "@/lib/supabase/listings.types";
 
 // The 3 sort-control options (Best Match / Lowest Price / Highest Style
@@ -121,6 +136,31 @@ async function checkIntelligenceColumnsAvailable(
     );
   }
   return intelligenceColumnsAvailable;
+}
+
+// Fashionability gate (src/lib/discover-personalization.ts) prefers
+// quality_score (src/lib/listing-quality.ts's pre-import AI read) when
+// inventory_quality_score isn't available — probed independently, same
+// lazy/cached pattern as intelligenceColumnsAvailable above, rather than
+// bundled into that same probe: quality_score is an older, separately
+// migrated column (supabase/schema.sql, well before the Part 8 visual_
+// analysis/inventory_quality_score columns), so a database that has one
+// doesn't necessarily have the other — probing them independently means
+// a database with quality_score but not yet Part 8 still gets to use it.
+let qualityScoreColumnAvailable: boolean | null = null;
+
+async function checkQualityScoreColumnAvailable(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching checkIntelligenceColumnsAvailable's own convention above
+  supabase: SupabaseClient<any>,
+): Promise<boolean> {
+  if (qualityScoreColumnAvailable != null) return qualityScoreColumnAvailable;
+
+  const { error } = await supabase.from("listings").select("quality_score").limit(1);
+  qualityScoreColumnAvailable = !error;
+  if (error) {
+    console.log("[discover-feed] quality_score column not found yet — fashionability gate falls back to inventory_quality_score/deterministic estimate.");
+  }
+  return qualityScoreColumnAvailable;
 }
 
 // Same "is this a not-yet-migrated column" detection as
@@ -277,6 +317,7 @@ interface DiscoverSortEntry {
   listing: Listing;
   matchPercent: number;
   stylePoints: number;
+  fashionQualityScore: number;
 }
 
 // The three sort-control options, each a full 3-key priority order (just
@@ -285,13 +326,13 @@ interface DiscoverSortEntry {
 //
 // "match" (Best Match, the default) is this feature's own literal spec:
 // match% desc -> price asc -> stylePoints desc. For a signed-out user or
-// one with no style profile at all, scoreListingMatch's own
-// NEUTRAL_BASELINE/all-zero-input behavior (see match-scoring.ts) already
-// gives every listing the SAME matchPercent (50) and stylePoints (0) —
-// meaning this exact comparator falls through to price asc -> stylePoints
-// desc on its own, with no special-cased branch needed to satisfy "handle
-// logged-out users safely: fall back to lowest price first, then highest
-// style points."
+// one with no style profile at all, scoreGarmentStyleMatch's own
+// NEUTRAL_BASELINE/no-vector-signal behavior (see
+// discover-personalization.ts) already gives every listing the SAME
+// matchPercent (50) — meaning this exact comparator falls through to
+// price asc -> stylePoints desc on its own, with no special-cased branch
+// needed to satisfy "handle logged-out users safely: fall back to lowest
+// price first, then highest style points."
 function sortDiscoverListings(entries: DiscoverSortEntry[], sortOption: DiscoverSortOption): DiscoverSortEntry[] {
   const keys: Array<{ get: (entry: DiscoverSortEntry) => number | null | undefined; direction: "asc" | "desc" }> =
     sortOption === "price"
@@ -321,6 +362,25 @@ function sortDiscoverListings(entries: DiscoverSortEntry[], sortOption: Discover
   });
 }
 
+// How large a recency-ordered candidate pool to fetch/rank/quality-gate
+// on every request, instead of only the one page actually requested — see
+// this file's own header comment on why "score just one recency-ordered
+// page" left personalization unable to ever surface a great match sitting
+// one page further back. 5 pages' worth: enough for personalization to
+// have a real pool to choose from across the screens an actual user
+// scrolls through, without re-fetching/re-scoring an unbounded prefix on
+// every "load more" call as this app's inventory grows toward its
+// 50,000-listing target. Beyond this window, fetchDiscoverBatch falls
+// back to the OLD per-page-only behavior (see useRankedWindow below) —
+// a real, deliberate scale tradeoff for very deep infinite scroll, not an
+// oversight: a proper fix at full scale would need a precomputed/
+// materialized per-user ranking or a pgvector similarity query (this
+// codebase already has style_profiles.style_embedding/
+// listings.visual_embedding for exactly that — see src/lib/style-embedding.ts
+// — just not wired to Discover, and doing so would need that embedding
+// kept fresh on every Like, not only at onboarding save time).
+const RANKED_WINDOW = 5 * 60; // keep in sync with DISCOVER_BATCH_SIZE's real value (60) if that ever changes
+
 export async function fetchDiscoverBatch(
   offset: number,
   limit: number,
@@ -340,39 +400,70 @@ export async function fetchDiscoverBatch(
   // in this app, so this is the opportunistic substitute.
   await releaseExpiredReservations();
 
+  // Computed up front (not after the `if (user)` block below, as before)
+  // — the liked/feedback listing-attribute lookup just below needs to
+  // know whether visual_analysis is selectable too.
+  const hasIntelligenceColumns = await checkIntelligenceColumnsAvailable(supabase);
+  const hasQualityScoreColumn = await checkQualityScoreColumnAvailable(supabase);
+  const listingColumns = hasIntelligenceColumns ? `${LISTING_COLUMNS}, ${INTELLIGENCE_COLUMNS}` : LISTING_COLUMNS;
+  const attributeColumns = `id, title, category, brand, color, price, aesthetic_tags${hasIntelligenceColumns ? ", visual_analysis" : ""}`;
+
   let preferences: string[] = [];
   let savedListingIds: string[] = [];
   let dislikedListingIds: string[] = [];
   let dislikedStyles: DislikedStyles = {};
-  // Same style_profiles columns match-feed.ts reads for /match's own
-  // scoreListingMatch call — reused here so Discover's matchPercent means
-  // exactly the same thing /match's badge already does, not a subtly
-  // different calc from a partial input set. All default to []/null
-  // (never left undefined), same "logged-out/no-profile is just an
-  // empty-input case, not a special path" reasoning as match-feed.ts.
   let favoriteBrands: string[] = [];
   let favoriteCategories: string[] = [];
   let favoriteColors: string[] = [];
-  let sizePreference: string | null = null;
-  // Liked-item tag affinity feeding scoreListingMatch's own topLikedTags
-  // input (match-scoring.ts's getTopTags) — the exact same derivation
-  // match-feed.ts uses for /match, not a separate liked-tag system.
-  let likedTagLists: string[][] = [];
+  // Discover's own deterministic per-user style vector (Likes/onboarding/
+  // positive-interaction history — see this file's own header comment
+  // and discover-style-vector.ts). hasSignal: false is the correct
+  // default for a signed-out user — scoreGarmentStyleMatch's neutral
+  // baseline handles that case exactly like match-scoring.ts already
+  // does for /match.
+  let userStyleVector = buildUserStyleVector({
+    now: Date.now(),
+    styleProfile: null,
+    likedListings: [],
+    feedbackListings: [],
+    hardExcludedAestheticKeys: new Set(),
+  });
+
   if (user) {
-    const [{ data: styleProfile }, { data: savedRows, error: savedItemsError }, { data: dislikedRows, error: dislikedItemsError }] =
-      await Promise.all([
-        supabase
-          .from("style_profiles")
-          .select("style_tags, favorite_brands, favorite_categories, favorite_colors, size_preference, disliked_styles")
-          .eq("user_id", user.id)
-          .maybeSingle(),
-        supabase
-          .from("saved_items")
-          .select("listing_id")
-          .eq("user_id", user.id)
-          .not("listing_id", "is", null),
-        supabase.from("disliked_items").select("listing_id").eq("user_id", user.id),
-      ]);
+    const [
+      { data: styleProfile },
+      { data: savedRows, error: savedItemsError },
+      { data: dislikedRows, error: dislikedItemsError },
+      { data: feedbackRows, error: feedbackError },
+    ] = await Promise.all([
+      supabase
+        .from("style_profiles")
+        .select("style_tags, favorite_brands, favorite_categories, favorite_colors, size_preference, disliked_styles")
+        .eq("user_id", user.id)
+        .maybeSingle(),
+      supabase
+        .from("saved_items")
+        .select("listing_id, created_at")
+        .eq("user_id", user.id)
+        .not("listing_id", "is", null),
+      supabase.from("disliked_items").select("listing_id").eq("user_id", user.id),
+      // Positive-interaction history (15% of the style vector, see
+      // discover-style-vector.ts's own header comment) — the append-only
+      // behavioral log (src/lib/style-feedback.ts), distinct from
+      // saved_items' CURRENT state: still includes items later unsaved,
+      // and captures real purchases. "like" is never actually logged
+      // anywhere in this codebase today (only save/skip/purchase are —
+      // see style-feedback.ts's callers), so it's omitted from this
+      // filter rather than silently matching nothing.
+      supabase
+        .from("user_style_feedback")
+        .select("listing_id, created_at")
+        .eq("user_id", user.id)
+        .in("action", ["save", "purchase"])
+        .not("listing_id", "is", null)
+        .order("created_at", { ascending: false })
+        .limit(150),
+    ]);
 
     if (savedItemsError) {
       console.error("[discover-feed] Failed to fetch saved_items:", savedItemsError);
@@ -380,12 +471,14 @@ export async function fetchDiscoverBatch(
     if (dislikedItemsError) {
       console.error("[discover-feed] Failed to fetch disliked_items:", dislikedItemsError);
     }
+    if (feedbackError) {
+      console.error("[discover-feed] Failed to fetch user_style_feedback:", feedbackError);
+    }
 
     preferences = styleProfile?.style_tags ?? [];
     favoriteBrands = styleProfile?.favorite_brands ?? [];
     favoriteCategories = styleProfile?.favorite_categories ?? [];
     favoriteColors = styleProfile?.favorite_colors ?? [];
-    sizePreference = styleProfile?.size_preference ?? null;
     dislikedStyles = styleProfile?.disliked_styles ?? {};
     savedListingIds = (savedRows ?? [])
       .map((row) => row.listing_id)
@@ -394,14 +487,45 @@ export async function fetchDiscoverBatch(
       .map((row) => row.listing_id)
       .filter((id): id is string => Boolean(id));
 
-    if (savedListingIds.length > 0) {
-      const { data: likedListings } = await supabase
-        .from("listings")
-        .select("aesthetic_tags")
-        .in("id", savedListingIds);
+    const savedEntries = (savedRows ?? []).filter(
+      (row): row is { listing_id: string; created_at: string } => Boolean(row.listing_id),
+    );
+    const feedbackEntries = (feedbackRows ?? []).filter(
+      (row): row is { listing_id: string; created_at: string } => Boolean(row.listing_id),
+    );
 
-      likedTagLists = (likedListings ?? []).map((row) => row.aesthetic_tags ?? []);
+    const attributeIds = [...new Set([...savedEntries.map((r) => r.listing_id), ...feedbackEntries.map((r) => r.listing_id)])];
+    const attributesById = new Map<string, LikedListingAttributes>();
+    if (attributeIds.length > 0) {
+      const { data: attributeRows, error: attributeError } = await supabase
+        .from("listings")
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime-computed select string, see listingColumns' own comment above
+        .select(attributeColumns as any)
+        .in("id", attributeIds);
+
+      if (attributeError) {
+        console.error("[discover-feed] Failed to fetch liked/feedback listing attributes:", attributeError);
+      }
+      for (const row of (attributeRows ?? []) as unknown as LikedListingAttributes[]) {
+        attributesById.set(row.id, row);
+      }
     }
+
+    const hardExcludedStyles = getHardExcludedStyleKeys(dislikedStyles, Date.now());
+
+    userStyleVector = buildUserStyleVector({
+      now: Date.now(),
+      styleProfile: { styleTags: preferences, favoriteBrands, favoriteCategories, favoriteColors },
+      likedListings: savedEntries.flatMap(({ listing_id, created_at }) => {
+        const listing = attributesById.get(listing_id);
+        return listing ? [{ listing, occurredAt: created_at }] : [];
+      }),
+      feedbackListings: feedbackEntries.flatMap(({ listing_id, created_at }) => {
+        const listing = attributesById.get(listing_id);
+        return listing ? [{ listing, occurredAt: created_at }] : [];
+      }),
+      hardExcludedAestheticKeys: hardExcludedStyles,
+    });
   }
 
   // reserved_by_order_id/reservation_expires_at may not exist on the live
@@ -409,8 +533,6 @@ export async function fetchDiscoverBatch(
   // the *entire* query, so this falls back to an unfiltered fetch (every
   // listing shows as available) rather than hiding the whole page.
   const availabilityFilter = await buildAvailabilityFilter(supabase, user?.id ?? null);
-  const hasIntelligenceColumns = await checkIntelligenceColumnsAvailable(supabase);
-  const listingColumns = hasIntelligenceColumns ? `${LISTING_COLUMNS}, ${INTELLIGENCE_COLUMNS}` : LISTING_COLUMNS;
   const category = categorySlug ? getHomepageCategoryBySlug(categorySlug) : undefined;
   const itemType = typeSlug ? getItemTypeCategoryBySlug(typeSlug) : undefined;
   const trimmedSearchQuery = searchQuery?.trim() || null;
@@ -425,6 +547,16 @@ export async function fetchDiscoverBatch(
   // LISTING_COLUMNS's own comment). Preference-based ranking is layered
   // on top of this raw, newest-first page entirely in memory, further
   // down this function.
+  // See RANKED_WINDOW's own comment — within the window, always fetch
+  // from the top (0) so personalization has the whole window to rank,
+  // then this function slices out [offset, offset+limit) from the RANKED
+  // result below. Beyond the window, this reverts to fetching exactly
+  // the requested page (the old behavior) since ranking an ever-growing
+  // prefix on every call doesn't scale.
+  const useRankedWindow = offset + limit <= RANKED_WINDOW;
+  const rangeStart = useRankedWindow ? 0 : offset;
+  const rangeEnd = useRankedWindow ? RANKED_WINDOW - 1 : offset + limit - 1;
+
   let query = supabase
     .from("listings")
     // eslint-disable-next-line @typescript-eslint/no-explicit-any -- runtime-computed select string, see listingColumns' own comment above
@@ -433,7 +565,7 @@ export async function fetchDiscoverBatch(
     .eq("status", "active")
     .order("created_at", { ascending: false })
     .order("id", { ascending: true })
-    .range(offset, offset + limit - 1);
+    .range(rangeStart, rangeEnd);
 
   if (category) {
     query = query.overlaps("aesthetic_tags", [category.tag]);
@@ -484,7 +616,7 @@ export async function fetchDiscoverBatch(
       .eq("status", "active")
       .order("created_at", { ascending: false })
       .order("id", { ascending: true })
-      .range(offset, offset + limit - 1);
+      .range(rangeStart, rangeEnd);
 
     if (category) {
       statusOnlyQuery = statusOnlyQuery.overlaps("aesthetic_tags", [category.tag]);
@@ -526,43 +658,75 @@ export async function fetchDiscoverBatch(
     (listing) => !savedListingIdSet.has(listing.id) && !dislikedListingIdSet.has(listing.id),
   );
 
-  // matchPercent/stylePoints attached via the exact same scoreListingMatch
-  // /match uses (match-scoring.ts) — same hardExcludedStyles/getTopTags
-  // derivation match-feed.ts uses for its own topLikedTags input, so a
-  // heavily-disliked style can't win a "top liked tag" ranking slot here
-  // either (see getHardExcludedStyleKeys' own comment). dislikedStyles
-  // itself is still only ever a scoring penalty inside scoreListingMatch —
-  // never an exclusion; the only exclusion in this whole pipeline remains
-  // the already-liked/already-disliked filter just above.
+  // matchPercent/stylePoints now come from the garment-level style match
+  // against userStyleVector (discover-personalization.ts's
+  // scoreGarmentStyleMatch — see this file's own header comment for why),
+  // plus the fashionability quality gate (computeFashionQualityScore).
+  // dislikedStyles is still only ever a scoring penalty here, subtracted
+  // AFTER the garment-match total — never an exclusion; the only
+  // exclusion in this whole pipeline remains the already-liked/
+  // already-disliked filter just above.
   const now = Date.now();
-  const hardExcludedStyles = getHardExcludedStyleKeys(dislikedStyles, now);
-  const topLikedTags = getTopTags(likedTagLists, 3, hardExcludedStyles);
-
   const scored: DiscoverSortEntry[] = unseenListings.map((listing) => {
-    const breakdown = scoreListingMatch({
-      listingTags: listing.aesthetic_tags,
-      listingBrand: listing.brand,
-      listingCategory: listing.category ?? null,
-      listingColor: listing.color ?? null,
-      listingSize: listing.size,
-      stylePreferences: preferences,
-      favoriteBrands,
-      favoriteCategories,
-      favoriteColors,
-      sizePreference,
-      topLikedTags,
-      dislikedStyles,
-      now,
+    const breakdown = scoreGarmentStyleMatch(userStyleVector, {
+      id: listing.id,
+      title: listing.title,
+      category: listing.category ?? null,
+      brand: listing.brand,
+      color: listing.color ?? null,
+      price: listing.price,
+      aestheticTags: listing.aesthetic_tags,
+      visualAnalysis: listing.visual_analysis ?? null,
     });
-    return { listing, matchPercent: breakdown.total, stylePoints: breakdown.styleScore };
+    const dislikePenalty = assessListingAgainstDislikedStyles(listing.aesthetic_tags, dislikedStyles, now).penalty;
+    const matchPercent = Math.max(0, Math.min(100, Math.round(breakdown.total - dislikePenalty)));
+
+    const fashionQuality = computeFashionQualityScore({
+      images: listing.images,
+      imageUrl: listing.image_url,
+      title: listing.title,
+      aestheticTags: listing.aesthetic_tags,
+      brand: listing.brand,
+      category: listing.category ?? null,
+      price: listing.price,
+      qualityScore: hasQualityScoreColumn ? (listing.quality_score ?? null) : null,
+      inventoryQualityScore: hasIntelligenceColumns ? (listing.inventory_quality_score ?? null) : null,
+    });
+
+    return { listing, matchPercent, stylePoints: breakdown.aestheticScore, fashionQualityScore: fashionQuality.score };
   });
 
-  const sorted = sortDiscoverListings(scored, sortOption);
+  // Fashionability gate — personal relevance alone isn't sufficient
+  // (this feature's own "CORE PRODUCT RULE" + "FASHIONABILITY GATE"
+  // spec): candidates at/above FASHION_QUALITY_GATE always rank ahead of
+  // everything below it, regardless of sortOption, with a graceful
+  // backfill (the below-gate group, still sorted the same way) rather
+  // than a hard filter — a page/window with too little qualifying
+  // inventory shows its best available options instead of coming back
+  // empty or short.
+  const gatePassed = scored.filter((entry) => entry.fashionQualityScore >= FASHION_QUALITY_GATE);
+  const gateFailed = scored.filter((entry) => entry.fashionQualityScore < FASHION_QUALITY_GATE);
+  const rankedPool = [...sortDiscoverListings(gatePassed, sortOption), ...sortDiscoverListings(gateFailed, sortOption)];
+
+  // Within the ranked window, `rankedPool` covers the WHOLE window (0 to
+  // RANKED_WINDOW), so the requested page is sliced out of it here — see
+  // RANKED_WINDOW's own comment. Beyond the window, the fetch above
+  // already pulled exactly the requested page (rangeStart === offset), so
+  // rankedPool already IS that page and needs no further slicing.
+  const pageEntries = useRankedWindow ? rankedPool.slice(offset, offset + limit) : rankedPool;
+
+  // rawCount stays about the RAW fetched rows for the CURRENT page, not
+  // the filtered/gated count (see this function's own comment above
+  // unseenListings) — within the ranked window, that's however many raw
+  // window rows exist at/after `offset`, capped at `limit`; beyond the
+  // window, `listings.length` already IS this exact page's raw count, as
+  // it always was.
+  const rawCount = useRankedWindow ? Math.min(limit, Math.max(0, listings.length - offset)) : listings.length;
 
   return {
-    listings: sorted.map(({ listing, matchPercent, stylePoints }) => ({ ...listing, matchPercent, stylePoints })),
+    listings: pageEntries.map(({ listing, matchPercent, stylePoints }) => ({ ...listing, matchPercent, stylePoints })),
     savedListingIds,
-    rawCount: listings.length,
+    rawCount,
     error: null,
   };
 }
