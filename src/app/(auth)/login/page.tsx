@@ -7,7 +7,17 @@ export const metadata: Metadata = {
   title: "Sign in — Lockette",
 };
 
-export default function LoginPage() {
+export default async function LoginPage({
+  searchParams,
+}: {
+  searchParams: Promise<{ reset?: string }>;
+}) {
+  // Set by updatePassword's own redirect (src/app/actions/auth.ts) after a
+  // successful password reset — a plain query param rather than
+  // LoginForm's own action-state message, since that state only ever
+  // comes from a submission of THIS form, not from arriving via redirect.
+  const { reset } = await searchParams;
+
   return (
     <Card className="p-8 sm:p-10">
       <div className="mb-8 text-center">
@@ -24,6 +34,11 @@ export default function LoginPage() {
           Sign in to keep discovering your next favorite find.
         </p>
       </div>
+      {reset === "success" && (
+        <p className="mb-5 rounded-2xl bg-darkgreen/10 px-4 py-3 text-center text-sm text-darkgreen">
+          Password updated — sign in with your new password.
+        </p>
+      )}
       <LoginForm />
     </Card>
   );

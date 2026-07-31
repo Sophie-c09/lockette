@@ -2,13 +2,13 @@
 
 import { useActionState } from "react";
 import Link from "next/link";
-import { signIn, type AuthFormState } from "@/app/actions/auth";
+import { requestPasswordReset, type AuthFormState } from "@/app/actions/auth";
 import { Button } from "@/components/ui/Button";
 
 const initialState: AuthFormState = undefined;
 
-export function LoginForm() {
-  const [state, formAction, pending] = useActionState(signIn, initialState);
+export function ForgotPasswordForm() {
+  const [state, formAction, pending] = useActionState(requestPasswordReset, initialState);
 
   return (
     <form action={formAction} className="flex flex-col gap-5">
@@ -34,33 +34,6 @@ export function LoginForm() {
         ))}
       </div>
 
-      <div>
-        <div className="mb-1.5 flex items-center justify-between">
-          <label htmlFor="password" className="block text-sm font-medium text-ink">
-            Password
-          </label>
-          <Link
-            href="/forgot-password"
-            className="text-xs font-medium text-oxblood hover:underline"
-          >
-            Forgot password?
-          </Link>
-        </div>
-        <input
-          id="password"
-          name="password"
-          type="password"
-          autoComplete="current-password"
-          placeholder="••••••••"
-          className="w-full rounded-2xl border border-border bg-surface px-4 py-3 text-sm text-ink placeholder:text-ink-soft/60 focus:border-oxblood focus:outline-none"
-        />
-        {state?.errors?.password?.map((error) => (
-          <p key={error} className="mt-1.5 text-xs text-oxblood">
-            {error}
-          </p>
-        ))}
-      </div>
-
       {state?.message && (
         <p className="rounded-2xl bg-oxblood/10 px-4 py-3 text-sm text-oxblood">
           {state.message}
@@ -68,16 +41,16 @@ export function LoginForm() {
       )}
 
       <Button type="submit" disabled={pending} className="mt-2 w-full">
-        {pending ? "Signing in…" : "Sign in"}
+        {pending ? "Sending…" : "Send reset link"}
       </Button>
 
       <p className="text-center text-sm text-ink-soft">
-        New to Lockette?{" "}
+        Remembered your password?{" "}
         <Link
-          href="/signup"
+          href="/login"
           className="font-medium text-oxblood hover:underline"
         >
-          Create an account
+          Sign in
         </Link>
       </p>
     </form>
