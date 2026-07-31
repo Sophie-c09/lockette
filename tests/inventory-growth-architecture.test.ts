@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { SINGLE_BATCH_CALL_TIMEOUT_MS, SINGLE_BATCH_CALL_MAX_ATTEMPTS, PER_BATCH_MAX_RUNTIME_MS, MAX_BATCH_RETRIES } from "@/lib/scraper-config";
 
 // Regression guard for the architecture half of the Inventory Growth
 // production-crash fix: the Start/Resume route must never import (or
@@ -63,4 +64,47 @@ test("process-batch runs at most one batch per call (bounded, not open-ended)", 
 
 test("process-batch never uses after() either — it awaits its one bounded batch synchronously", () => {
   assert.doesNotMatch(processBatchSource, IMPORTS_AFTER_FROM_NEXT_SERVER);
+});
+
+// Regression guard for the "stuck at 0/50,000 with no visible error" fix:
+// process-batch is a real Vercel Function bounded by its own `maxDuration`
+// export — the in-process watchdog it hands to runLargeScaleAdminScraper
+// is only useful if it can actually fire BEFORE Vercel's platform-level
+// kill does. This failed silently before (PER_BATCH_MAX_RUNTIME_MS, 10
+// minutes, x MAX_BATCH_RETRIES, 3 attempts, inside a 60s-capped request)
+// — asserted here as a real numeric comparison, not just a source-text
+// match, so a future edit that widens SINGLE_BATCH_CALL_TIMEOUT_MS (or
+// narrows maxDuration) past safe again fails this test immediately.
+test("process-batch's own maxDuration comfortably exceeds SINGLE_BATCH_CALL_TIMEOUT_MS x SINGLE_BATCH_CALL_MAX_ATTEMPTS, so the in-process watchdog can always fire before Vercel's platform-level kill would", () => {
+  const maxDurationMatch = processBatchSource.match(/export const maxDuration\s*=\s*(\d+)/);
+  assert.ok(maxDurationMatch, "expected to find `export const maxDuration = <number>` in process-batch/route.ts");
+  const maxDurationMs = Number(maxDurationMatch![1]) * 1000;
+
+  const worstCaseMs = SINGLE_BATCH_CALL_TIMEOUT_MS * SINGLE_BATCH_CALL_MAX_ATTEMPTS;
+  assert.ok(
+    worstCaseMs < maxDurationMs,
+    `expected SINGLE_BATCH_CALL_TIMEOUT_MS (${SINGLE_BATCH_CALL_TIMEOUT_MS}) x SINGLE_BATCH_CALL_MAX_ATTEMPTS (${SINGLE_BATCH_CALL_MAX_ATTEMPTS}) = ${worstCaseMs}ms to stay under maxDuration (${maxDurationMs}ms), with real margin for request/response overhead`,
+  );
+  // Leaves at least 10s of margin for auth, DB reads/writes, and response
+  // marshaling — not just "technically less than maxDuration."
+  assert.ok(maxDurationMs - worstCaseMs >= 10_000, "expected at least 10s of margin beyond the worst-case watchdog budget");
+});
+
+test("a single process-batch call makes exactly ONE scraper attempt — the admin dashboard's own poll loop (every couple of seconds) is this run's real retry mechanism, not an inner retry loop competing for the same 60s", () => {
+  assert.equal(SINGLE_BATCH_CALL_MAX_ATTEMPTS, 1);
+});
+
+// The plain defaults are for a hypothetical standalone (not
+// request-duration-bounded) caller — confirms process-batch's own
+// override is genuinely smaller, not just a differently-named alias for
+// the same values.
+test("the single-call override is genuinely smaller than the standalone defaults, not just a rename", () => {
+  assert.ok(SINGLE_BATCH_CALL_TIMEOUT_MS < PER_BATCH_MAX_RUNTIME_MS);
+  assert.ok(SINGLE_BATCH_CALL_MAX_ATTEMPTS < MAX_BATCH_RETRIES);
+});
+
+test("process-batch actually passes the single-call overrides and an interim onProgress hook to runLargeScaleAdminScraper", () => {
+  assert.match(processBatchSource, /perBatchTimeoutMs:\s*SINGLE_BATCH_CALL_TIMEOUT_MS/);
+  assert.match(processBatchSource, /maxAttemptsPerBatch:\s*SINGLE_BATCH_CALL_MAX_ATTEMPTS/);
+  assert.match(processBatchSource, /onProgress:\s*async/);
 });

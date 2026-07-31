@@ -32,6 +32,13 @@ const SHORTFALL_MESSAGE =
 // is actively watching warrants a tighter interval.
 const JOB_POLL_INTERVAL_MS = 2000;
 
+// Client-side last resort for triggerLargeScaleProcessBatch's fetch() call
+// — see that function's own comment. Set above process-batch's own 60s
+// maxDuration (with margin for real network latency) so this only ever
+// fires for a genuinely hung connection, never racing an ordinary slow
+// response.
+const LARGE_SCALE_PROCESS_BATCH_TIMEOUT_MS = 75_000;
+
 // If a "running" job's own heartbeat hasn't moved in this long, treat it
 // as stalled rather than showing an indefinite spinner — this exact
 // scenario (a job stuck at status='running' forever with no way to tell
@@ -566,15 +573,32 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   // each poll tick (pollLargeScaleJob below) also asks the server to run
   // ONE more bounded batch, entirely independent of the job-status poll
   // itself — a failed/slow batch call never blocks or breaks polling.
+  // "Stuck at 0/50,000 with no visible error" root cause (server side):
+  // process-batch's own maxDuration/watchdog mismatch meant Vercel could
+  // silently kill that request with no response ever coming back — see
+  // that route's own comment. Belt-and-suspenders on the client too:
+  // fetch() has NO default timeout, so a genuinely hung connection (a
+  // dropped/never-acknowledged TCP session, not just a slow server)
+  // would leave largeScaleBatchInFlightRef stuck true forever, silently
+  // blocking every future poll tick's attempt to trigger a batch — this
+  // is what actually made that failure mode PERMANENT rather than
+  // "delayed until the next successful call." LARGE_SCALE_PROCESS_BATCH_TIMEOUT_MS
+  // is set comfortably ABOVE process-batch's own 60s maxDuration so this
+  // never races the server's own, now-much-more-likely-to-succeed
+  // response — it only ever fires as a true last resort.
   async function triggerLargeScaleProcessBatch(jobId: string) {
     if (largeScaleBatchInFlightRef.current) return;
     largeScaleBatchInFlightRef.current = true;
+
+    const abortController = new AbortController();
+    const timeoutId = setTimeout(() => abortController.abort(), LARGE_SCALE_PROCESS_BATCH_TIMEOUT_MS);
 
     try {
       const response = await fetch("/api/admin-scraper/large-scale/process-batch", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jobId }),
+        signal: abortController.signal,
       });
       await parseApiResponse(response);
     } catch (err) {
@@ -585,6 +609,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       // handles on its own.
       console.error("[large-scale] process-batch call failed:", err);
     } finally {
+      clearTimeout(timeoutId);
       largeScaleBatchInFlightRef.current = false;
     }
   }

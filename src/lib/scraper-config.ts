@@ -171,3 +171,35 @@ export const PER_BATCH_MAX_RUNTIME_MS = 10 * 60 * 1000; // 10 minutes
 // whole in-process execution has gone dark for longer than even a
 // timed-out attempt plus its retries would explain.
 export const STALE_JOB_RECOVERY_THRESHOLD_MS = 20 * 60 * 1000; // 20 minutes
+
+// ---------------------------------------------------------------------------
+// Single-serverless-call budget — "stuck at 0/50,000 with no visible error"
+// root cause: /api/admin-scraper/large-scale/process-batch/route.ts runs
+// exactly ONE runLargeScaleAdminScraper call per request, inside a real
+// Vercel Function bounded by its own `export const maxDuration = 60`. The
+// constants above (PER_BATCH_MAX_RUNTIME_MS = 10 minutes, MAX_BATCH_RETRIES
+// = 3 attempts + a cooldown between each) describe a full, potentially
+// many-minutes-long STANDALONE run — cramming "up to 3 attempts, each
+// individually allowed up to 10 minutes" into one 60-second request meant
+// the in-process watchdog could never actually fire before Vercel's own
+// platform-level kill did. That kill has no error handler, no log line, no
+// DB write — the function is simply terminated — which is exactly why a
+// stuck run showed 0 across every metric indefinitely with nothing visible
+// anywhere: every single attempt was silently killed mid-flight, before
+// even the first query/page could be recorded, over and over.
+//
+// The fix isn't a smaller version of the same shape (three retries still
+// can't fit in 60s no matter how short each one's own slice gets, once
+// per-request overhead and the final DB write are accounted for) — it's
+// recognizing that process-batch already HAS an outer retry mechanism: the
+// admin dashboard's poll loop calls this route again every
+// JOB_POLL_INTERVAL_MS (2s) for as long as the job stays 'pending'/
+// 'running'. A failed/timed-out attempt doesn't need an INNER retry loop
+// too; the next poll tick already provides one. So this caller gets a
+// single attempt, watchdogged well inside its own maxDuration.
+export const SINGLE_BATCH_CALL_MAX_ATTEMPTS = 1;
+// 45s, not 60s — leaves real margin for this route's own fixed overhead
+// (admin auth check, the job-row read, the final progress write, response
+// marshaling) so the watchdog reliably resolves and gets its result
+// persisted BEFORE Vercel's platform-level kill could ever preempt it.
+export const SINGLE_BATCH_CALL_TIMEOUT_MS = 45 * 1000;

@@ -2557,28 +2557,37 @@ async function getListingsInventoryCount(supabase: ReturnType<typeof createAdmin
   return count ?? 0;
 }
 
-// Reliability watchdog — races ONE batch attempt against
-// PER_BATCH_MAX_RUNTIME_MS so a hung attempt (no error, no progress, just
-// never resolving — the exact failure mode found live: batch 20/86 frozen
-// for 40+ minutes with status still 'running') gets treated as a failed
-// attempt instead of blocking this loop forever. This does NOT cancel the
-// underlying runAdminScraper() call — there's no AbortController threaded
-// through discovery/extraction to make that safe, and adding one would be
-// a real change to the scraper itself, not a reliability wrapper around
-// it. The abandoned call is simply left running in the background and its
+// Reliability watchdog — races ONE batch attempt against `timeoutMs` (the
+// caller decides this — see runLargeScaleAdminScraper's own hooks.
+// perBatchTimeoutMs — since what's SAFE depends entirely on the caller's
+// own execution budget: process-batch/route.ts is a real Vercel Function
+// bounded by its own `maxDuration`, and this watchdog is only useful if it
+// can actually fire BEFORE that platform-level kill does) so a hung
+// attempt (no error, no progress, just never resolving — the exact
+// failure mode found live: batch 20/86 frozen for 40+ minutes with status
+// still 'running') gets treated as a failed attempt instead of blocking
+// this loop forever OR, worse, getting silently killed by the platform
+// with no error, no log, no DB write at all (the "0 across every metric,
+// no visible error" root cause — see SINGLE_BATCH_CALL_TIMEOUT_MS's own
+// comment in scraper-config.ts). This does NOT cancel the underlying
+// runAdminScraper() call — there's no AbortController threaded through
+// discovery/extraction to make that safe, and adding one would be a real
+// change to the scraper itself, not a reliability wrapper around it. The
+// abandoned call is simply left running in the background and its
 // eventual result (if any) is discarded; existing retry/consecutive-
 // failure handling takes it from here exactly as if runAdminScraper had
 // itself returned stopReason: "error".
 function withBatchWatchdog(
   work: Promise<AdminScraperResult>,
   context: { batch: number; attempt: number; requested: number },
+  timeoutMs: number,
 ): Promise<AdminScraperResult> {
   let timer: ReturnType<typeof setTimeout>;
   const watchdog = new Promise<AdminScraperResult>((resolve) => {
     timer = setTimeout(() => {
       console.error(
         `[watchdog] Batch ${context.batch} attempt ${context.attempt} exceeded ` +
-          `${PER_BATCH_MAX_RUNTIME_MS}ms with no result — marking this attempt failed so retry/next-batch ` +
+          `${timeoutMs}ms with no result — marking this attempt failed so retry/next-batch ` +
           "logic can continue. The underlying scrape call is left running in the background (it cannot be " +
           "cancelled) and its eventual result, if any, is discarded.",
       );
@@ -2588,7 +2597,7 @@ function withBatchWatchdog(
       // comment on why this prevents orphaned Chromium processes from a
       // batch abandoned by this exact watchdog.
       forceCloseAllTrackedBrowsers(
-        `batch ${context.batch} attempt ${context.attempt} exceeded ${PER_BATCH_MAX_RUNTIME_MS}ms`,
+        `batch ${context.batch} attempt ${context.attempt} exceeded ${timeoutMs}ms`,
       ).catch((error) => {
         console.error("[watchdog] Forced browser cleanup itself failed:", error);
       });
@@ -2603,15 +2612,15 @@ function withBatchWatchdog(
         extractedSuccessfully: 0,
         extractionFailuresByReason: {},
         remainingNeeded: context.requested,
-        elapsedMs: PER_BATCH_MAX_RUNTIME_MS,
+        elapsedMs: timeoutMs,
         rounds: 0,
         stopReason: "error",
-        error: `Batch watchdog: exceeded ${PER_BATCH_MAX_RUNTIME_MS}ms without completing.`,
+        error: `Batch watchdog: exceeded ${timeoutMs}ms without completing.`,
         queriesCompleted: 0,
         pagesSearched: 0,
         uniqueUrlsDiscovered: 0,
       });
-    }, PER_BATCH_MAX_RUNTIME_MS);
+    }, timeoutMs);
   });
 
   return Promise.race([work.finally(() => clearTimeout(timer)), watchdog]);
@@ -2636,10 +2645,29 @@ export async function runLargeScaleAdminScraper(
     // Checked before every batch — see this section's own header comment.
     // No hook = never paused (matches every existing caller's behavior).
     isPaused?: () => Promise<boolean>;
+    // Overrides PER_BATCH_MAX_RUNTIME_MS/MAX_BATCH_RETRIES for THIS call —
+    // see SINGLE_BATCH_CALL_TIMEOUT_MS's own comment in scraper-config.ts
+    // for why a caller bounded by its own short execution budget (a real
+    // Vercel Function with a `maxDuration`) needs a much smaller watchdog
+    // and a single attempt rather than the multi-minute/multi-retry
+    // defaults below, which assume a standalone, not-request-bounded run.
+    perBatchTimeoutMs?: number;
+    maxAttemptsPerBatch?: number;
   } = {},
 ): Promise<LargeScaleAdminScraperResult> {
-  // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-  console.log("[diag] 4b. runLargeScaleAdminScraper() started", { options });
+  const perBatchTimeoutMs = hooks.perBatchTimeoutMs ?? PER_BATCH_MAX_RUNTIME_MS;
+  const maxAttemptsPerBatch = hooks.maxAttemptsPerBatch ?? MAX_BATCH_RETRIES;
+  console.info("[INVENTORY_GROWTH][RUNNER_START]", {
+    targetInventorySize: options.targetInventorySize,
+    batchSize: options.batchSize,
+    maxBatches: options.maxBatches,
+    mode: options.mode,
+    aggressiveAcquisition: options.aggressiveAcquisition,
+    perBatchTimeoutMs,
+    maxAttemptsPerBatch,
+    seenUrlsCount: options.seenUrls?.length ?? 0,
+    timestamp: new Date().toISOString(),
+  });
   // Resource-exhaustion incident fix — warns (never blocks) when the
   // machine already looks overloaded before a single browser is launched,
   // so an admin watching the logs has a chance to notice before the first
@@ -2718,8 +2746,7 @@ export async function runLargeScaleAdminScraper(
   }
 
   for (let batch = 1; batch <= maxBatches; batch++) {
-    // TEMPORARY diagnostic — "Inventory Growth never reaches batch 1" investigation.
-    console.log(`[diag] 5. batch loop iteration begins — batch ${batch}/${maxBatches}`);
+    console.info("[INVENTORY_GROWTH][BATCH_LOOP]", { batch, maxBatches, timestamp: new Date().toISOString() });
     const inventoryNow = await getListingsInventoryCount(supabase);
     if (inventoryNow >= targetInventorySize) {
       console.log(`[admin-scraper] Large-scale target reached — inventory ${inventoryNow}/${targetInventorySize}.`);
@@ -2764,9 +2791,9 @@ export async function runLargeScaleAdminScraper(
     let result: AdminScraperResult | null = null;
     let lastError: string | undefined;
 
-    for (let attempt = 1; attempt <= MAX_BATCH_RETRIES; attempt++) {
+    for (let attempt = 1; attempt <= maxAttemptsPerBatch; attempt++) {
       console.log(
-        `[admin-scraper] Large-scale batch ${batch}/${maxBatches}, attempt ${attempt}/${MAX_BATCH_RETRIES} — ` +
+        `[admin-scraper] Large-scale batch ${batch}/${maxBatches}, attempt ${attempt}/${maxAttemptsPerBatch} — ` +
           `inventory ${inventoryNow}/${targetInventorySize}, asking for ${thisBatchLimit}`,
       );
 
@@ -2831,6 +2858,7 @@ export async function runLargeScaleAdminScraper(
           }
         }),
         { batch, attempt, requested: thisBatchLimit },
+        perBatchTimeoutMs,
       );
 
       if (attemptResult.stopReason !== "error") {
@@ -2841,7 +2869,7 @@ export async function runLargeScaleAdminScraper(
       lastError = attemptResult.error;
       console.error(`[admin-scraper] Large-scale batch ${batch} attempt ${attempt} failed:`, lastError);
 
-      if (attempt < MAX_BATCH_RETRIES) {
+      if (attempt < maxAttemptsPerBatch) {
         await new Promise((resolve) => setTimeout(resolve, LARGE_SCALE_BATCH_COOLDOWN_MS));
       }
     }
@@ -2852,7 +2880,7 @@ export async function runLargeScaleAdminScraper(
       // feature's own explicit resilience requirement).
       consecutiveBatchFailures++;
       console.error(
-        `[admin-scraper] Batch ${batch} failed after ${MAX_BATCH_RETRIES} attempts — moving on. Last error: ${lastError}`,
+        `[admin-scraper] Batch ${batch} failed after ${maxAttemptsPerBatch} attempt(s) — moving on. Last error: ${lastError}`,
       );
 
       if (hooks.onProgress) {

@@ -21,19 +21,55 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
-import { runLargeScaleAdminScraper, type LargeScaleAdminScraperOptions } from "@/lib/admin-scraper";
-import { SCRAPER_CONFIG } from "@/lib/scraper-config";
+import { runLargeScaleAdminScraper, type LargeScaleAdminScraperOptions, type LargeScaleProgress } from "@/lib/admin-scraper";
+import { SCRAPER_CONFIG, SINGLE_BATCH_CALL_TIMEOUT_MS, SINGLE_BATCH_CALL_MAX_ATTEMPTS } from "@/lib/scraper-config";
 import {
   getScraperJobRow,
   updateLargeScaleScraperJobProgress,
   completeScraperJob,
   failScraperJob,
+  type ScraperJobRow,
 } from "@/lib/scraper-jobs";
 
 export const maxDuration = 60;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+// Turns one runLargeScaleAdminScraper progress snapshot (cumulative
+// WITHIN this single call only — see LargeScaleProgress's own comment)
+// into the same job.X + progress.X shape the final write below already
+// uses, against the FIXED `baseJob` row read once at the top of this
+// request — never re-fetched or re-accumulated between calls — so an
+// interim write (mid-attempt) and the final write (once the attempt
+// finishes) always agree on the same absolute totals regardless of which
+// one physically lands in Postgres last. currentBatch/seenUrls/
+// checkpointOptions are deliberately left at their PRE-this-attempt
+// values (or omitted) here: this batch hasn't actually completed yet, so
+// current_round must not advance and the checkpoint must not be rewritten
+// until it does.
+function buildInterimProgressPayload(baseJob: ScraperJobRow, progress: LargeScaleProgress) {
+  return {
+    insertedCount: baseJob.inserted_count + progress.insertedCount,
+    validCount: (baseJob.valid_count ?? 0) + progress.validCount,
+    duplicateCount: (baseJob.duplicate_count ?? 0) + progress.duplicateCount,
+    rejectedCount: (baseJob.rejected_count ?? 0) + progress.rejectedCount,
+    insertFailedCount: (baseJob.insert_failed_count ?? 0) + progress.insertFailedCount,
+    extractedSuccessfullyCount: (baseJob.extracted_successfully_count ?? 0) + progress.extractedSuccessfullyCount,
+    extractionFailuresByReason: (() => {
+      const merged = { ...(baseJob.extraction_failures_by_reason ?? {}) };
+      for (const [reason, count] of Object.entries(progress.extractionFailuresByReason)) {
+        merged[reason] = (merged[reason] ?? 0) + count;
+      }
+      return merged;
+    })(),
+    scrapedCount: (baseJob.scraped_count ?? 0) + progress.scrapedCount,
+    currentBatch: baseJob.current_round ?? 0,
+    queriesCompleted: (baseJob.queries_completed ?? 0) + progress.queriesCompleted,
+    pagesSearched: (baseJob.pages_searched ?? 0) + progress.pagesSearched,
+    uniqueUrlsDiscovered: (baseJob.unique_urls_discovered ?? 0) + progress.uniqueUrlsDiscovered,
+  };
 }
 
 function sanitizedErrorResponse(message: string, status: number) {
@@ -74,6 +110,8 @@ export async function POST(request: Request) {
     if (!jobId) {
       return NextResponse.json({ success: false, error: "jobId is required.", code: "MISSING_JOB_ID" }, { status: 400 });
     }
+
+    console.info("[INVENTORY_GROWTH][TRACE]", { jobId, stage: "request_received", timestamp: new Date().toISOString() });
 
     const job = await getScraperJobRow(jobId);
     if (!job) {
@@ -122,18 +160,56 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, jobId, status: "failed", batchRan: false });
     }
 
+    console.info("[INVENTORY_GROWTH][TRACE]", {
+      jobId,
+      stage: "invoking_runner",
+      perBatchTimeoutMs: SINGLE_BATCH_CALL_TIMEOUT_MS,
+      maxAttemptsPerBatch: SINGLE_BATCH_CALL_MAX_ATTEMPTS,
+      timestamp: new Date().toISOString(),
+    });
+
     // Requirement 7 — a resource failure (missing browser, memory guard,
     // a Supabase error) or any other uncaught exception INSIDE this batch
     // attempt must become a real 'failed' status with last_error
     // populated, not be left to sit at 'running' with a frozen heartbeat
     // until recoverStaleLargeScaleJob silently reinterprets that, up to
     // STALE_JOB_RECOVERY_THRESHOLD_MS later, as a pause nobody requested.
+    //
+    // perBatchTimeoutMs/maxAttemptsPerBatch — this route is a real Vercel
+    // Function bounded by its own `maxDuration` (60s) above; the plain
+    // defaults (PER_BATCH_MAX_RUNTIME_MS 10min x MAX_BATCH_RETRIES 3
+    // attempts) were built for a standalone run with no such ceiling, and
+    // cramming them in here meant Vercel silently killed this function
+    // before its OWN watchdog could ever fire — no error, no log, no DB
+    // write, just a job stuck at all-zero metrics forever. One
+    // short-watchdogged attempt per call is correct specifically BECAUSE
+    // the admin dashboard's poll loop already calls this route again
+    // every couple of seconds while the job is active — that's this run's
+    // real retry mechanism, not an inner loop competing for the same 60s.
     let result: Awaited<ReturnType<typeof runLargeScaleAdminScraper>>;
     try {
       result = await runLargeScaleAdminScraper(options, {
         isPaused: async () => {
           const current = await getScraperJobRow(jobId);
           return current?.status === "paused";
+        },
+        perBatchTimeoutMs: SINGLE_BATCH_CALL_TIMEOUT_MS,
+        maxAttemptsPerBatch: SINGLE_BATCH_CALL_MAX_ATTEMPTS,
+        // Interim persistence — without this, a batch attempt that gets
+        // watchdogged (or that simply hasn't finished yet) contributes
+        // NOTHING to the job row until/unless it fully completes; the
+        // dashboard would show 0 across every metric no matter how much
+        // real work actually happened, which is exactly what made a
+        // genuinely-stuck run indistinguishable from one that had simply
+        // never started. Persisted against the FIXED `job` snapshot (see
+        // buildInterimProgressPayload's own comment) so this can never
+        // double-count against the authoritative write below.
+        onProgress: async (progress) => {
+          try {
+            await updateLargeScaleScraperJobProgress(jobId, buildInterimProgressPayload(job, progress));
+          } catch (progressError) {
+            console.error(`[${routeName}] Interim progress write failed:`, progressError);
+          }
         },
       });
     } catch (batchError) {
@@ -204,6 +280,15 @@ export async function POST(request: Request) {
       stopReason: result.stopReason,
       batchesRun: result.batchesRun,
       insertedCount,
+    });
+    console.info("[INVENTORY_GROWTH][TRACE]", {
+      jobId,
+      stage: "metrics_row_updated",
+      stopReason: result.stopReason,
+      queriesCompleted,
+      pagesSearched,
+      insertedCount,
+      timestamp: new Date().toISOString(),
     });
 
     return NextResponse.json({
