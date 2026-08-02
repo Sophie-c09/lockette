@@ -32,6 +32,17 @@ export interface FlaggableListing {
   images: string[];
   price: number | null;
   category?: string | null;
+  // The following three are optional so existing/other callers that don't
+  // have them yet still compile — but every real ingestion path (single
+  // import, bulk import, admin scraper) now passes all three (see each
+  // route's own flagListing() call site).
+  productUrl?: string | null;
+  platform?: string | null;
+  // Set by the shared extraction pipeline (normalize-listing.ts) when the
+  // source page itself signals the item is sold/removed/expired — see
+  // availability-signal.ts. Distinct from the later check-listing-status
+  // cron, which re-checks listings that looked fine AT import time.
+  removalSignal?: string | null;
 }
 
 export interface FlagResult {
@@ -112,6 +123,16 @@ function isLikelyNonClothing(title: string, category: string | null | undefined)
   return NON_CLOTHING_KEYWORDS.some((keyword) => haystack.includes(keyword));
 }
 
+function isValidMarketplaceUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 /**
  * The insert-time safety net — everything here is additive to the
  * existing minimal quality gate and scoring pipeline, never a replacement
@@ -156,6 +177,23 @@ export function flagListing(listing: FlaggableListing): FlagResult {
 
   if (isLikelyNonClothing(listing.title, listing.category)) {
     reasons.push("likely non-clothing item");
+  }
+
+  // productUrl/platform/removalSignal are optional on FlaggableListing so
+  // any not-yet-updated caller still compiles, but every real ingestion
+  // path passes all three — `=== null` (not `== null`) deliberately only
+  // fires when a caller actually checked and found nothing, not when a
+  // caller simply didn't pass the field at all.
+  if (listing.productUrl !== undefined && !isValidMarketplaceUrl(listing.productUrl)) {
+    reasons.push("invalid or missing marketplace URL");
+  }
+
+  if (listing.platform === null) {
+    reasons.push("unrecognized source platform");
+  }
+
+  if (listing.removalSignal) {
+    reasons.push(`source listing appears sold/removed: ${listing.removalSignal}`);
   }
 
   if (reasons.length > 0) {

@@ -3,7 +3,7 @@
 import { useRef, useState } from "react";
 import { AdminListingCard } from "@/components/AdminListingCard";
 import { AdminPendingSwipeView } from "@/components/admin/AdminPendingSwipeView";
-import { removeListing } from "@/lib/adminListingRemoval";
+import { removeListing, restoreListing } from "@/lib/adminListingRemoval";
 import {
   approveListing,
   rejectListing,
@@ -16,6 +16,7 @@ const FILTER_OPTIONS: { value: ModerationFilter; label: string }[] = [
   { value: "all", label: "All" },
   { value: "flagged", label: "Flagged" },
   { value: "approved", label: "Approved" },
+  { value: "unavailable", label: "Unavailable" },
 ];
 
 /**
@@ -89,6 +90,7 @@ export function AdminListingsView({
   function matchesCurrentFilter(status: ModeratedListing["status"]): boolean {
     if (filter === "flagged") return status === "flagged";
     if (filter === "approved") return status === "active";
+    if (filter === "unavailable") return status === "unavailable";
     return true; // "all" already only ever holds flagged/active
   }
 
@@ -144,6 +146,27 @@ export function AdminListingsView({
 
     setItems((prev) => prev.filter((item) => item.id !== listingId));
     showMessage("Listing deleted", "success");
+  }
+
+  // P0 launch-readiness dead-listing cleanup — undoes a check-listing-status
+  // cron decision (or a past manual removal) an admin has confirmed was
+  // wrong. Same shape as handleDelete above.
+  async function handleRestore(listingId: string, title: string) {
+    setBusyId(listingId);
+    const result = await restoreListing(listingId);
+    setBusyId(null);
+
+    if (result.error) {
+      showMessage(`Couldn't restore "${title}" — ${result.error}`, "error");
+      return;
+    }
+
+    setItems((prev) =>
+      prev
+        .map((item) => (item.id === listingId ? { ...item, status: "active" as const, removal_reason: null } : item))
+        .filter((item) => item.id !== listingId || matchesCurrentFilter(item.status)),
+    );
+    showMessage("Listing restored", "success");
   }
 
   function handlePhotosSaved(listingId: string, images: string[]) {
@@ -210,6 +233,7 @@ export function AdminListingsView({
                 busy={busyId === listing.id}
                 onApprove={() => handleApprove(listing.id)}
                 onDelete={() => handleDelete(listing.id, listing.title)}
+                onRestore={() => handleRestore(listing.id, listing.title)}
                 onPhotosSaved={(images) => handlePhotosSaved(listing.id, images)}
                 onError={(text) => showMessage(text, "error")}
               />

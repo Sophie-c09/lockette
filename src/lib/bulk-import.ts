@@ -14,6 +14,7 @@ import { enrichListing } from "@/lib/listing-enrichment";
 import { generateAndSaveListingEmbedding } from "@/lib/listing-embeddings";
 import { scoreListingQuality, QUALITY_REJECTION_THRESHOLD, type QualityScoreBreakdown } from "@/lib/listing-quality";
 import { flagListing } from "@/lib/inventory/listing-flagging";
+import { checkForDuplicate, fallbackFingerprintKey } from "@/lib/inventory/duplicate-detection";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { mapWithConcurrency } from "@/lib/concurrency";
 import type { PriceMode, SelectedCategory, SelectedBrand } from "@/lib/marketplace-discovery";
@@ -573,7 +574,7 @@ export async function processBulkImportBatch(
   }
 
   const seenImageUrlsThisBatch = new Set<string>();
-  const notDuplicated: Processed[] = [];
+  const notDuplicatedByUrl: Processed[] = [];
 
   for (const item of processed) {
     const imageUrl = item.listing.image_url;
@@ -582,6 +583,56 @@ export async function processBulkImportBatch(
       continue;
     }
     if (imageUrl) seenImageUrlsThisBatch.add(imageUrl);
+    notDuplicatedByUrl.push(item);
+  }
+
+  // Duplicate check #3 — image content hash + a conservative title+brand+
+  // price+platform+category fallback fingerprint, against the live table
+  // AND against other candidates already accepted earlier in this same
+  // batch. Checks #1/#2 above only catch an EXACT product_url or image_url
+  // match — this closes a real gap: the same photo re-hosted under a
+  // different URL, or the same physical item re-listed with a fresh
+  // product_url and image_url, neither of which #1/#2 can see. Shared with
+  // admin-scraper.ts (its own richer in-chunk cascade) and
+  // import-listing/route.ts via duplicate-detection.ts's checkForDuplicate
+  // so all three ingestion paths use the same priority order and matching
+  // rules — see that file's own comment for the full 4-tier cascade and
+  // why tier 4 requires a price+platform match, not fuzzy title alone.
+  const seenFingerprintsThisBatch = new Set<string>();
+  const dedupChecks = await mapWithConcurrency(notDuplicatedByUrl, EXTRACTION_CONCURRENCY, async (item) => {
+    const result = await checkForDuplicate({
+      title: item.listing.title,
+      product_url: item.listing.product_url,
+      image_url: item.listing.image_url,
+      price: item.listing.price,
+      brand: item.listing.brand,
+      platform: item.listing.platform,
+      category: item.listing.category,
+    });
+    return { item, result };
+  });
+
+  const notDuplicated: Processed[] = [];
+  for (const { item, result } of dedupChecks) {
+    if (result.isDuplicate) {
+      duplicateCount++;
+      continue;
+    }
+
+    const fingerprint = fallbackFingerprintKey({
+      title: item.listing.title,
+      product_url: item.listing.product_url,
+      image_url: item.listing.image_url,
+      price: item.listing.price,
+      brand: item.listing.brand,
+      platform: item.listing.platform,
+      category: item.listing.category,
+    });
+    if (seenFingerprintsThisBatch.has(fingerprint)) {
+      duplicateCount++;
+      continue;
+    }
+    seenFingerprintsThisBatch.add(fingerprint);
     notDuplicated.push(item);
   }
 
@@ -692,6 +743,9 @@ export async function processBulkImportBatch(
       images: candidate.listing.images,
       price: candidate.listing.price,
       category: candidate.listing.category,
+      productUrl: candidate.listing.product_url,
+      platform: candidate.listing.platform,
+      removalSignal: candidate.listing.removal_signal,
     });
 
     if (flag.isSafe) {
@@ -700,8 +754,13 @@ export async function processBulkImportBatch(
       console.log("[IMPORT] Flagged:", flag.reasons);
     }
 
+    // removal_signal is transient (consumed by flagListing above) — no
+    // matching column on `listings`, so it's excluded from the DB row.
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to omit this transient field
+    const { removal_signal, ...listingForStorage } = candidate.listing;
+
     toInsert.push({
-      ...candidate.listing,
+      ...listingForStorage,
       shipping_cost: shippingCostForPlatform(candidate.listing.platform),
       status: flag.isSafe ? "active" : "flagged",
       flag_reason: flag.isSafe ? null : (flag.reasons ?? []).join(", "),

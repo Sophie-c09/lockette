@@ -18,6 +18,13 @@ export interface UrlQueueDatabase {
           attempt_count: number;
           created_at: string;
           processed_at: string | null;
+          // P0 launch-readiness fix — the stale-claim reclaim used to
+          // compare against `created_at` (enqueue time, not claim time),
+          // so a row claimed shortly before it would have gone "stale"
+          // anyway was immediately eligible for a second worker to
+          // reclaim. This is stamped fresh at the actual moment of claim
+          // (see claimNextUrls in url-queue.ts) — null until first claimed.
+          claimed_at: string | null;
         };
         Insert: {
           id?: string;
@@ -29,6 +36,7 @@ export interface UrlQueueDatabase {
           attempt_count?: number;
           created_at?: string;
           processed_at?: string | null;
+          claimed_at?: string | null;
         };
         Update: {
           id?: string;
@@ -40,6 +48,7 @@ export interface UrlQueueDatabase {
           attempt_count?: number;
           created_at?: string;
           processed_at?: string | null;
+          claimed_at?: string | null;
         };
         Relationships: [];
       };

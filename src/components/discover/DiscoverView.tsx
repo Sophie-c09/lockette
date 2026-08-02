@@ -192,6 +192,63 @@ export function DiscoverView({
     hasMoreRef.current = true;
   }
 
+  // Declared BEFORE the IntersectionObserver effect below that references
+  // it (a lint fix, not a behavior change — function declarations are
+  // hoisted either way, so this reordering is purely mechanical).
+  async function loadNextBatch() {
+    if (!hasMoreRef.current || loadingRef.current) return;
+    loadingRef.current = true;
+
+    try {
+      while (hasMoreRef.current) {
+        const result = await loadMoreDiscoverListings(
+          offsetRef.current,
+          categorySlug,
+          typeSlug,
+          searchQuery,
+          styleSlug,
+          sortOptionRef.current,
+        );
+        if (result.error) {
+          hasMoreRef.current = false;
+          // P0 launch-readiness fix — this used to just stop silently
+          // (hasMoreRef.current = false, no user-visible signal at all);
+          // the page looked "fully loaded" instead of having actually
+          // failed. No retry action here (the sentinel already re-fires
+          // on next scroll/resize if the observer is still attached, but
+          // hasMoreRef is now false, so a real retry would need scrolling
+          // back up and down — a toast at least tells the user WHY
+          // scrolling stopped producing more items).
+          showToast("Couldn't load more listings. Please try refreshing the page.");
+          break;
+        }
+
+        offsetRef.current += DISCOVER_BATCH_SIZE;
+        if (result.rawCount < DISCOVER_BATCH_SIZE) hasMoreRef.current = false;
+
+        if (result.listings.length > 0) {
+          // Each page is fetched (and sorted) independently server-side,
+          // so a naive append wouldn't be correctly ordered as a WHOLE
+          // set once combined (e.g. price_asc within page 1 followed by
+          // price_asc within page 2 isn't price_asc across all 120) — this
+          // re-applies the current sort across the full accumulated list,
+          // same shared logic the dropdown's own onChange uses below.
+          setListings((current) => applyDiscoverSort([...current, ...result.listings], sortOptionRef.current, listingSortKeys));
+          setSavedListingIds((current) => new Set([...current, ...result.savedListingIds]));
+          break;
+        }
+        // This batch's raw rows all got filtered out (already saved/
+        // disliked) — try the next one instead of leaving the sentinel
+        // stuck with nothing to show for it.
+      }
+    } catch {
+      hasMoreRef.current = false;
+      showToast("Couldn't load more listings. Please try refreshing the page.");
+    } finally {
+      loadingRef.current = false;
+    }
+  }
+
   // IntersectionObserver-driven "load more" — fires once the sentinel
   // near the bottom of the grid scrolls into view, instead of a manual
   // "Load More" button. Loops internally (rather than relying on a
@@ -223,50 +280,6 @@ export function DiscoverView({
     // variable directly.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  async function loadNextBatch() {
-    if (!hasMoreRef.current || loadingRef.current) return;
-    loadingRef.current = true;
-
-    try {
-      while (hasMoreRef.current) {
-        const result = await loadMoreDiscoverListings(
-          offsetRef.current,
-          categorySlug,
-          typeSlug,
-          searchQuery,
-          styleSlug,
-          sortOptionRef.current,
-        );
-        if (result.error) {
-          hasMoreRef.current = false;
-          break;
-        }
-
-        offsetRef.current += DISCOVER_BATCH_SIZE;
-        if (result.rawCount < DISCOVER_BATCH_SIZE) hasMoreRef.current = false;
-
-        if (result.listings.length > 0) {
-          // Each page is fetched (and sorted) independently server-side,
-          // so a naive append wouldn't be correctly ordered as a WHOLE
-          // set once combined (e.g. price_asc within page 1 followed by
-          // price_asc within page 2 isn't price_asc across all 120) — this
-          // re-applies the current sort across the full accumulated list,
-          // same shared logic the dropdown's own onChange uses below.
-          setListings((current) => applyDiscoverSort([...current, ...result.listings], sortOptionRef.current, listingSortKeys));
-          setSavedListingIds((current) => new Set([...current, ...result.savedListingIds]));
-          break;
-        }
-        // This batch's raw rows all got filtered out (already saved/
-        // disliked) — try the next one instead of leaving the sentinel
-        // stuck with nothing to show for it.
-      }
-    } catch {
-      hasMoreRef.current = false;
-    } finally {
-      loadingRef.current = false;
-    }
-  }
 
   // Preserves the current category/search/style/sort filters while
   // toggling the item-type filter on/off — clicking the already-active

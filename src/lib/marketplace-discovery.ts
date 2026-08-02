@@ -30,6 +30,7 @@ import {
   registerBrowserClose,
   releaseBrowserSlotOnLaunchFailure,
 } from "@/lib/browser-concurrency";
+import { resolveBrowserLaunchOptions } from "@/lib/browser-launch-options";
 
 // Re-exported so existing importers of this module (bulk-import.ts, the
 // discover/process-batch API routes) don't need to know the type/options
@@ -526,7 +527,7 @@ export async function discoverListingUrls(
     // operation can ever hang a scraper run indefinitely.
     await acquireBrowserSlot();
     slotAcquired = true;
-    browser = await chromium.launch({ headless: true, timeout: LAUNCH_TIMEOUT_MS });
+    browser = await chromium.launch(await resolveBrowserLaunchOptions({ headless: true, timeout: LAUNCH_TIMEOUT_MS }));
     registerBrowserLaunch(browser);
     const activeBrowser = browser;
 

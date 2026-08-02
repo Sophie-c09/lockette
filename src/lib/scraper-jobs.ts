@@ -706,6 +706,79 @@ export async function claimJobForResume(jobId: string): Promise<{ claimed: boole
   return { claimed: Boolean(data), job: data };
 }
 
+// P0 launch-readiness fix — process-batch/route.ts's own status check
+// (`job.status === "pending" || "running"`) does NOT prevent two
+// concurrent calls for the SAME job from both passing it and both calling
+// runLargeScaleAdminScraper at once: status stays 'running' across many
+// sequential batch calls by design, so it can't double as a per-attempt
+// mutex the way claimJobForResume's paused->running flip does above. A
+// short-lived lease closes that gap the same way scraper_url_queue's own
+// claimed_at closes the analogous per-URL race (see url-queue.ts).
+const BATCH_LEASE_DURATION_MS = 90_000; // comfortably longer than SINGLE_BATCH_CALL_TIMEOUT_MS x SINGLE_BATCH_CALL_MAX_ATTEMPTS
+
+/**
+ * Atomically claims this job for one batch attempt — succeeds only when
+ * there is no lease at all, or the existing lease has expired (the
+ * previous holder crashed/timed out before releasing it). A concurrent
+ * caller's own claim attempt, racing this one, matches zero rows (the
+ * lease this call just set no longer satisfies "no lease or expired") and
+ * gets `claimed: false` back, telling it not to run a batch at all this
+ * poll tick — the exact same "lose the race, do nothing" shape
+ * claimJobForResume already established for resume requests.
+ */
+export async function claimBatchLease(jobId: string): Promise<{ claimed: boolean; leaseId: string | null }> {
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+  const nowIso = new Date().toISOString();
+  const leaseId = crypto.randomUUID();
+  const expiresAt = new Date(Date.now() + BATCH_LEASE_DURATION_MS).toISOString();
+
+  const { data, error } = await supabase
+    .from("scraper_jobs")
+    .update({ batch_lease_id: leaseId, batch_lease_expires_at: expiresAt })
+    .eq("id", jobId)
+    .in("status", ["pending", "running"])
+    .or(`batch_lease_id.is.null,batch_lease_expires_at.lt.${nowIso}`)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isMissingColumnError(error)) {
+      // Database hasn't run the latest migration yet — fail open (treat as
+      // claimed) rather than permanently blocking every batch call; this
+      // matches every other "possibly not migrated yet" column in this
+      // file's own established posture. Overlap protection is simply
+      // unavailable until the migration runs, not a hard outage.
+      return { claimed: true, leaseId: null };
+    }
+    console.error("[scraper-jobs] Failed to claim batch lease:", jobId, error);
+    return { claimed: false, leaseId: null };
+  }
+
+  return { claimed: Boolean(data), leaseId: data ? leaseId : null };
+}
+
+/**
+ * Releases a batch lease this call itself holds — guarded by leaseId (not
+ * just jobId) so a call whose lease has ALREADY expired and been reclaimed
+ * by a new attempt can never clear the new holder's lease out from under
+ * it. Best-effort: if this fails, the lease simply expires on its own
+ * after BATCH_LEASE_DURATION_MS, same as a crashed request would.
+ */
+export async function releaseBatchLease(jobId: string, leaseId: string | null): Promise<void> {
+  if (!leaseId) return; // Migration not applied (see claimBatchLease) — nothing to release.
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+
+  const { error } = await supabase
+    .from("scraper_jobs")
+    .update({ batch_lease_id: null, batch_lease_expires_at: null })
+    .eq("id", jobId)
+    .eq("batch_lease_id", leaseId);
+
+  if (error && !isMissingColumnError(error)) {
+    console.error("[scraper-jobs] Failed to release batch lease:", jobId, error);
+  }
+}
+
 export async function failScraperJob(jobId: string, errorMessage: string): Promise<void> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();

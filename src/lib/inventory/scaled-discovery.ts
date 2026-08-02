@@ -41,6 +41,7 @@ import {
 } from "@/lib/inventory/discovery-history";
 import { recordDiscoveryAttempt, isPlatformEnabled } from "@/lib/inventory/marketplace-health";
 import { acquirePooledBrowser, releasePooledBrowser } from "@/lib/browser-concurrency";
+import { resolveBrowserLaunchOptions } from "@/lib/browser-launch-options";
 import { DISCOVERY_CONCURRENCY } from "@/lib/scraper-config";
 import os from "node:os";
 
@@ -585,7 +586,7 @@ async function crawlPlatform(
   }
 
   try {
-    browser = await acquirePooledBrowser({ headless: true, timeout: LAUNCH_TIMEOUT_MS });
+    browser = await acquirePooledBrowser(await resolveBrowserLaunchOptions({ headless: true, timeout: LAUNCH_TIMEOUT_MS }));
 
     await runPass(concurrencyOverride ?? source.concurrency);
 

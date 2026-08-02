@@ -74,6 +74,12 @@ export interface ListingsDatabase {
           // of every reason flagListing() found, null otherwise.
           flag_reason?: string | null;
           last_checked_at?: string | null;
+          // P0 launch-readiness dead-listing cleanup — see
+          // check-listing-status/route.ts and that migration's own comment.
+          last_available_at?: string | null;
+          availability_check_count?: number;
+          consecutive_unavailable_checks?: number;
+          removal_reason?: string | null;
           // AI quality score (src/lib/listing-quality.ts), 0-100 — computed
           // for every scraped listing before insert. Optional/nullable:
           // not every query selects it, and a row from before this feature
@@ -156,6 +162,12 @@ export interface ListingsDatabase {
           // of every reason flagListing() found, null otherwise.
           flag_reason?: string | null;
           last_checked_at?: string | null;
+          // P0 launch-readiness dead-listing cleanup — see
+          // check-listing-status/route.ts and that migration's own comment.
+          last_available_at?: string | null;
+          availability_check_count?: number;
+          consecutive_unavailable_checks?: number;
+          removal_reason?: string | null;
           quality_score?: number | null;
           quality_reason?: string | null;
           quality_breakdown?: QualityScoreBreakdown | null;
@@ -204,6 +216,12 @@ export interface ListingsDatabase {
           // of every reason flagListing() found, null otherwise.
           flag_reason?: string | null;
           last_checked_at?: string | null;
+          // P0 launch-readiness dead-listing cleanup — see
+          // check-listing-status/route.ts and that migration's own comment.
+          last_available_at?: string | null;
+          availability_check_count?: number;
+          consecutive_unavailable_checks?: number;
+          removal_reason?: string | null;
           quality_score?: number | null;
           quality_reason?: string | null;
           quality_breakdown?: QualityScoreBreakdown | null;

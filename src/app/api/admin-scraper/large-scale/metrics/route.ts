@@ -59,6 +59,11 @@ export async function GET(request: Request) {
     return NextResponse.json({
       extractionQueueDepth: queueStats.pending,
       extractionQueueClaimed: queueStats.claimed,
+      // P0 launch-readiness dashboard fix — queueStats.failed (terminal,
+      // exhausted-all-retries URLs — see url-queue.ts's markUrlFailed) was
+      // already computed here but never actually returned; the dashboard
+      // requirement for a "permanently failed count" had nothing to read.
+      permanentlyFailedUrlCount: queueStats.failed,
       // Reflects the real global cap now — scaled-discovery.ts's crawlPlatform
       // gates every individual page-search attempt through ONE process-wide
       // DISCOVERY_CONCURRENCY semaphore regardless of platform count, replacing

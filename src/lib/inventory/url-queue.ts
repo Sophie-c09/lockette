@@ -113,15 +113,35 @@ const STALE_CLAIM_THRESHOLD_MS = 10 * 60 * 1000;
  * reads whatever is durably queued right now, regardless of whether this
  * exact discovery pass has finished, is still running, or already
  * crashed.
+ *
+ * P0 launch-readiness fixes (two real, not hypothetical, races):
+ *
+ * 1. Staleness used to be measured against `created_at` (when the URL was
+ *    ENQUEUED, not when it was actually claimed) — a URL claimed shortly
+ *    before it would've gone stale anyway was immediately eligible for a
+ *    second worker to reclaim it. `claimed_at` is now stamped fresh at the
+ *    moment of THIS claim, so the staleness clock always measures actual
+ *    claim duration.
+ * 2. The claim used to SELECT candidate ids, then unconditionally UPDATE
+ *    by those ids with no re-check — if a second concurrent
+ *    claimNextUrls() call claimed one of the same rows in between, this
+ *    call would still forcibly re-claim it, and both callers would
+ *    process the same URL. The UPDATE below re-applies the identical
+ *    pending/stale-claimed condition (not just the ids), so a row another
+ *    caller already won no longer matches and is silently left alone —
+ *    `.select()` on the update reports back exactly which rows THIS call
+ *    actually won, rather than trusting the ids collected a moment
+ *    earlier.
  */
 export async function claimNextUrls(batchSize: number): Promise<UrlQueueRow[]> {
   const supabase = client();
   const staleCutoff = new Date(Date.now() - STALE_CLAIM_THRESHOLD_MS).toISOString();
+  const claimableFilter = `status.eq.pending,and(status.eq.claimed,claimed_at.lt.${staleCutoff})`;
 
   const { data: candidates, error: selectError } = await supabase
     .from("scraper_url_queue")
     .select("*")
-    .or(`status.eq.pending,and(status.eq.claimed,created_at.lt.${staleCutoff})`)
+    .or(claimableFilter)
     .order("created_at", { ascending: true })
     .limit(batchSize);
 
@@ -144,7 +164,14 @@ export async function claimNextUrls(batchSize: number): Promise<UrlQueueRow[]> {
   }
 
   const ids = candidates.map((row) => row.id);
-  const { error: updateError } = await supabase.from("scraper_url_queue").update({ status: "claimed" }).in("id", ids);
+  const claimedAt = new Date().toISOString();
+
+  const { data: won, error: updateError } = await supabase
+    .from("scraper_url_queue")
+    .update({ status: "claimed", claimed_at: claimedAt })
+    .in("id", ids)
+    .or(claimableFilter)
+    .select("*");
 
   if (updateError) {
     warnIfMissingTable("claimNextUrls", updateError);
@@ -152,9 +179,19 @@ export async function claimNextUrls(batchSize: number): Promise<UrlQueueRow[]> {
     return [];
   }
 
-  console.log("[EXTRACTION WORKER] claimed batch from queue", { count: candidates.length });
+  const wonRows = won ?? [];
+  if (wonRows.length < candidates.length) {
+    // Not an error — just means a concurrent claim beat this call to some
+    // of the same rows between the SELECT and this UPDATE. Logged so this
+    // race is visible in metrics rather than silently losing candidates.
+    console.log("[EXTRACTION WORKER] lost the race for some candidates to a concurrent claim", {
+      selected: candidates.length,
+      won: wonRows.length,
+    });
+  }
+  console.log("[EXTRACTION WORKER] claimed batch from queue", { count: wonRows.length });
 
-  return candidates.map((row) => ({ ...row, status: "claimed" as const }));
+  return wonRows.map((row) => ({ ...row, status: "claimed" as const }));
 }
 
 export async function markUrlExtracted(id: string): Promise<void> {

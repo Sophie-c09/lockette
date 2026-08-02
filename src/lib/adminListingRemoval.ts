@@ -81,6 +81,41 @@ export async function removeListing(listingId: string, reason?: string): Promise
 }
 
 /**
+ * Manual override for a listing the check-listing-status cron marked
+ * 'unavailable' (or that an admin removed via removeListing above) —
+ * P0 launch-readiness requirement: that cron is deliberately conservative
+ * (requires several consecutive unavailable signals — see that route's own
+ * comment) but is still a heuristic, not a certainty, so an admin who has
+ * confirmed the listing is actually still live needs a way to undo it
+ * without going through SQL. Restores full visibility (status = 'active')
+ * and resets this row's own availability bookkeeping so the cron starts
+ * counting fresh rather than treating it as already having 3 consecutive
+ * hits against it.
+ */
+export async function restoreListing(listingId: string): Promise<{ error?: string }> {
+  const authCheck = await requireAdmin();
+  if (authCheck.error) return authCheck;
+
+  const supabase = createAdminClient();
+
+  const { error } = await supabase
+    .from("listings")
+    .update({
+      status: "active",
+      removal_reason: null,
+      consecutive_unavailable_checks: 0,
+    })
+    .eq("id", listingId);
+
+  if (error) {
+    console.error("[admin-listing-removal] Failed to restore listing:", error);
+    return { error: error.message };
+  }
+
+  return {};
+}
+
+/**
  * Non-destructive alternative to removeListing — the listing stays
  * 'active' and fully visible everywhere else (order history, its own
  * detail page), just deprioritized in Discover/Feed ranking (see

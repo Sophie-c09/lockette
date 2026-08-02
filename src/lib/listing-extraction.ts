@@ -53,6 +53,7 @@ const EMPTY_RAW: RawExtraction = {
   sourceLikesCount: null,
   sourceViewsCount: null,
   sourceCommentsCount: null,
+  unavailabilitySignal: { kind: "inconclusive" },
 };
 
 // Below this many gallery images, it's worth paying for a full browser
@@ -110,6 +111,11 @@ function mergeRaw(
     sourceLikesCount: base.sourceLikesCount ?? fallback.sourceLikesCount,
     sourceViewsCount: base.sourceViewsCount ?? fallback.sourceViewsCount,
     sourceCommentsCount: base.sourceCommentsCount ?? fallback.sourceCommentsCount,
+    // Either extraction pass spotting a sold/removed signal is enough —
+    // an "inconclusive" fast-path result should never mask a real signal
+    // the browser fallback's rendered page actually found.
+    unavailabilitySignal:
+      base.unavailabilitySignal.kind === "unavailable" ? base.unavailabilitySignal : fallback.unavailabilitySignal,
   };
 }
 

@@ -3,12 +3,18 @@
 import { useState, useTransition, type MouseEvent } from "react";
 import { Heart } from "lucide-react";
 import { saveListing, unsaveListing } from "@/app/actions/saved-items";
+import { useToast } from "@/components/ToastProvider";
 
 // Reusable heart toggle for a real (Supabase-backed) listing. Optimistic:
-// flips instantly, then persists — and reverts only if the server action
-// reports an actual error (a signed-out click still no-ops the same way
-// saveItem/unsaveItem already do elsewhere in the app, so anonymous
-// browsing stays seamless).
+// flips instantly, then persists — and reverts if the server action
+// reports an actual error.
+//
+// P0 launch-readiness fix — a signed-out click (or any other failure) used
+// to revert the heart with zero explanation: the error message
+// ("Sign in to save listings.") was already returned by saveListing/
+// unsaveListing, it was just never shown anywhere. Now surfaced via a
+// toast so an unauthenticated visitor gets a real, actionable prompt
+// instead of a heart that silently un-fills itself.
 export function SaveButton({
   listingId,
   initialSaved,
@@ -20,6 +26,7 @@ export function SaveButton({
 }) {
   const [saved, setSaved] = useState(initialSaved);
   const [isPending, startTransition] = useTransition();
+  const { showToast } = useToast();
 
   function handleClick(event: MouseEvent<HTMLButtonElement>) {
     // Save buttons sit inside clickable listing cards — never let the click
@@ -36,6 +43,7 @@ export function SaveButton({
         : await unsaveListing(listingId);
       if (result.error) {
         setSaved(!next);
+        showToast(result.error);
       }
     });
   }

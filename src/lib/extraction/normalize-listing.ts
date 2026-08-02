@@ -4,6 +4,7 @@
 // just cleanup of values that already exist.
 import type { RawExtraction } from "./html-extractor";
 import { normalizeImages } from "./normalize-images";
+import type { AvailabilitySignal } from "./availability-signal";
 
 // Field shape matches the `listings` table exactly (minus id/created_at,
 // which the database generates), so a caller can pass the result straight
@@ -29,6 +30,19 @@ export interface ExtractedListing {
   source_likes_count: number | null;
   source_views_count: number | null;
   source_comments_count: number | null;
+  // Human-readable reason the source page appears sold/removed/unavailable
+  // (see availability-signal.ts), or null when the page gave no such
+  // signal. Consulted by listing-flagging.ts so an already-dead listing
+  // never gets auto-published — this is a real signal read off THIS
+  // extraction, not the later check-listing-status cron's job.
+  removal_signal: string | null;
+}
+
+function describeUnavailabilitySignal(signal: AvailabilitySignal): string | null {
+  if (signal.kind !== "unavailable") return null;
+  return signal.source === "json-ld"
+    ? `source page's own product data marked it "${signal.detail}"`
+    : `source page says "${signal.detail}"`;
 }
 
 const PLATFORM_BY_HOSTNAME: Record<string, string> = {
@@ -166,5 +180,6 @@ export function normalizeListing(
     source_likes_count: raw.sourceLikesCount,
     source_views_count: raw.sourceViewsCount,
     source_comments_count: raw.sourceCommentsCount,
+    removal_signal: describeUnavailabilitySignal(raw.unavailabilitySignal),
   };
 }

@@ -529,6 +529,12 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   // interrupting the job poll above.
   const [largeScaleLiveMetrics, setLargeScaleLiveMetrics] = useState<{
     extractionQueueDepth: number;
+    // P0 launch-readiness dashboard fix — both already computed/returned by
+    // the metrics route (extractionQueueClaimed was already in its
+    // response; permanentlyFailedUrlCount is new), but neither was ever
+    // read into this dashboard's own state before now.
+    extractionQueueClaimed: number;
+    permanentlyFailedUrlCount: number;
     activeDiscoveryWorkers: number;
     activeExtractionWorkers: number;
     marketplaceHealth: { platform: string; attempts: number; successRate: number; timeoutRate: number; avgLatencyMs: number; enabled: boolean }[];
@@ -1922,6 +1928,14 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                       <span>
                         Extraction queue depth:{" "}
                         <span className="font-semibold">{largeScaleLiveMetrics?.extractionQueueDepth ?? "—"}</span>
+                      </span>
+                      <span>
+                        Currently leased URLs:{" "}
+                        <span className="font-semibold">{largeScaleLiveMetrics?.extractionQueueClaimed ?? "—"}</span>
+                      </span>
+                      <span>
+                        Permanently failed URLs:{" "}
+                        <span className="font-semibold">{largeScaleLiveMetrics?.permanentlyFailedUrlCount ?? "—"}</span>
                       </span>
                       {largeScaleAggressiveMode && (
                         <span>

@@ -28,6 +28,7 @@ import {
   getSignedStyleMeImageUrls,
 } from "@/lib/style-me-photo";
 import { classifyStyleAggregate } from "@/lib/style-me-classification";
+import { verifyUploadedImage } from "@/lib/image-content-verification";
 import { fetchGarmentCandidates } from "@/lib/garment-matching";
 import { nearestBudgetOption } from "@/lib/budget-options";
 import { advanceStatusIfDue, type StyleMeStatus } from "@/lib/style-me-status";
@@ -48,17 +49,45 @@ export type SubmitStyleMeState =
     }
   | undefined;
 
+/**
+ * P0 launch-readiness fix — this used to have no top-level try/catch at
+ * all, unlike its Recreate This Outfit sibling (outfit-recreations.ts's
+ * submitOutfitRecreation); an unexpected exception anywhere in the ~160
+ * lines of work below (a classification call, a Supabase write, the
+ * matching loop) would propagate uncaught straight to the framework,
+ * hitting a raw error page instead of this app's own graceful message.
+ * `redirect()` is called AFTER (outside) the try/catch, on purpose — same
+ * reasoning as submitOutfitRecreation's own comment: Next.js implements
+ * redirect() by throwing a special internal signal, and a try/catch that
+ * wrapped it would catch that throw too and misreport a successful
+ * redirect as a failure.
+ */
 export async function submitStyleMeRequest(
   _prevState: SubmitStyleMeState,
   formData: FormData,
 ): Promise<SubmitStyleMeState> {
+  let redirectRequestId: string;
+
+  try {
+    redirectRequestId = await submitStyleMeRequestInner(formData);
+  } catch (error) {
+    console.error("[style-me] submitStyleMeRequest failed unexpectedly:", error);
+    return {
+      error: error instanceof Error ? error.message : "Something went wrong submitting your request. Please try again.",
+    };
+  }
+
+  redirect(`/style-me/${redirectRequestId}`);
+}
+
+async function submitStyleMeRequestInner(formData: FormData): Promise<string> {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   if (!user) {
-    return { error: "You must be signed in to use Style Me." };
+    throw new Error("You must be signed in to use Style Me.");
   }
 
   const validatedFields = SubmitStyleMeSchema.safeParse({
@@ -67,21 +96,21 @@ export async function submitStyleMeRequest(
   });
 
   if (!validatedFields.success) {
-    return { error: validatedFields.error.issues[0]?.message ?? "Please check your request details." };
+    throw new Error(validatedFields.error.issues[0]?.message ?? "Please check your request details.");
   }
 
   const { inspoText, budget } = validatedFields.data;
 
   const requestId = formData.get("requestId");
   if (typeof requestId !== "string" || !UUID_PATTERN.test(requestId)) {
-    return { error: "Invalid request. Please try again." };
+    throw new Error("Invalid request. Please try again.");
   }
 
   let imagePaths: unknown;
   try {
     imagePaths = JSON.parse(String(formData.get("imagePaths") ?? "[]"));
   } catch {
-    return { error: "Invalid request. Please try again." };
+    throw new Error("Invalid request. Please try again.");
   }
 
   if (
@@ -90,7 +119,7 @@ export async function submitStyleMeRequest(
     imagePaths.length > MAX_LISTING_PHOTOS ||
     !imagePaths.every((path): path is string => typeof path === "string")
   ) {
-    return { error: "Add at least one photo." };
+    throw new Error("Add at least one photo.");
   }
 
   // Every path must live inside this user's own upload folder for this
@@ -102,7 +131,27 @@ export async function submitStyleMeRequest(
   // client input blindly.
   const expectedFolder = `${styleMeImagesFolder(user.id, requestId)}/`;
   if (!imagePaths.every((path) => path.startsWith(expectedFolder))) {
-    return { error: "Invalid request. Please try again." };
+    throw new Error("Invalid request. Please try again.");
+  }
+
+  // Real content verification (P0 launch-readiness fix) — the client-side
+  // check (isAllowedListingPhotoType, listing-photo.ts) only ever trusts
+  // File.type, a browser-reported and fully spoofable value; a non-image
+  // file renamed to .jpg sails through it. This reads real magic-number
+  // bytes off the already-uploaded object instead. HEIC gets its own
+  // specific, actionable message — this stack has no HEIC decoder, so a
+  // genuine iPhone HEIC export is a real, expected case, not a malformed
+  // file.
+  for (const path of imagePaths) {
+    const verification = await verifyUploadedImage(supabase, STYLE_ME_IMAGES_BUCKET, path);
+    if (!verification.isUsable) {
+      await supabase.storage.from(STYLE_ME_IMAGES_BUCKET).remove(imagePaths);
+      throw new Error(
+        verification.kind === "heic"
+          ? "HEIC photos aren't supported yet — please export as JPEG or PNG first."
+          : "One of those files doesn't look like a real photo. Please try a different image.",
+      );
+    }
   }
 
   const { data: request, error: insertError } = await supabase
@@ -124,7 +173,7 @@ export async function submitStyleMeRequest(
     // nothing for them to be attached to, so this cleans them up rather
     // than leaving them orphaned.
     await supabase.storage.from(STYLE_ME_IMAGES_BUCKET).remove(imagePaths);
-    return { error: insertError?.message ?? "Couldn't submit your request. Please try again." };
+    throw new Error(insertError?.message ?? "Couldn't submit your request. Please try again.");
   }
 
   const signedUrls = await getSignedStyleMeImageUrls(supabase, imagePaths);
@@ -158,7 +207,7 @@ export async function submitStyleMeRequest(
 
   if (patchError) {
     await cleanupFailedStyleMeRequest(supabase, user.id, request.id);
-    return { error: "Could not save your request. Please try again." };
+    throw new Error("Could not save your request. Please try again.");
   }
 
   // REVERSE-IMAGE-SEARCH UPGRADE: classification now returns `items:
@@ -213,7 +262,7 @@ export async function submitStyleMeRequest(
     }
   }
 
-  redirect(`/style-me/${request.id}`);
+  return request.id;
 }
 
 async function cleanupFailedStyleMeRequest(

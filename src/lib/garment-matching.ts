@@ -116,14 +116,26 @@ export async function fetchGarmentCandidates(
 ): Promise<Listing[]> {
   const supabase = await createClient();
 
-  const { data, error } = await supabase.from("listings").select(LISTING_COLUMNS).eq("status", "active");
+  // P0 launch-readiness fix — `.not("image_url", "is", null)` alone isn't
+  // enough (a listing can have image_url = "" rather than null, which
+  // that filter wouldn't catch), so the client-side filter below also
+  // rejects an empty string. Without this, an imageless/broken-image
+  // listing could still be scored and surface in a reverse-image-search
+  // bundle with nothing for the user to actually look at.
+  const { data, error } = await supabase
+    .from("listings")
+    .select(LISTING_COLUMNS)
+    .eq("status", "active")
+    .not("image_url", "is", null);
 
   if (error || !data) {
     console.error("[garment-matching] Failed to fetch candidates:", error);
     return [];
   }
 
-  const bucketed = (data as Listing[]).filter((listing) => bucketOf(listing) === item.category);
+  const bucketed = (data as Listing[]).filter(
+    (listing) => Boolean(listing.image_url?.trim()) && bucketOf(listing) === item.category,
+  );
 
   const scored = bucketed
     .map((listing) => ({ listing, score: scoreGarmentMatch(item, aestheticTags, listing) }))

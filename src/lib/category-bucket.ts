@@ -45,6 +45,12 @@ const CATEGORY_BUCKET_KEYWORDS: [string, CategoryBucket][] = [
   ["backpack", "bags"],
   ["tote", "bags"],
   ["clutch", "bags"],
+  // "tote" collides with the real fashion brand "Toteme" the same way
+  // "hat" collided with "Baby Phat" below — a plain substring match would
+  // misfile a Toteme sweater/coat as a bag whenever "coat"/"jacket" etc.
+  // don't ALSO appear in the title. Fixed structurally (word-boundary
+  // matching, see categorizeListing below) rather than by only patching
+  // this one specific collision.
   ["jewelry", "accessories"],
   ["necklace", "accessories"],
   ["earring", "accessories"],
@@ -70,10 +76,41 @@ const CATEGORY_BUCKET_KEYWORDS: [string, CategoryBucket][] = [
   ["top", "tops"],
 ];
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+// P0 launch-readiness fix — the previous plain `haystack.includes(keyword)`
+// check had no boundary awareness at all, which is WHY "hat" had to be
+// removed outright above rather than fixed (it collided with the real
+// brand "Baby Phat" — "hat" as a SUFFIX of an unrelated word). The same
+// class of bug exists on the other side too: "tote" is a substring PREFIX
+// of the real fashion brand "Toteme," which a plain substring check
+// misfiles as a bag.
+//
+// Deliberately a RIGHT-boundary check only (keyword not immediately
+// followed by another letter, allowing a plain "s"/"es" plural suffix) —
+// NOT a full `\bkeyword\b`. A full word-boundary would fix the Toteme
+// class but BREAK a real, common category of legitimate compound garment
+// words where the keyword is a SUFFIX with no space before it: "sundress"
+// (dress), "raincoat"/"overcoat"/"trenchcoat" (coat), "sweatpants" (pant),
+// "sweatshirt" (shirt) would all stop matching their correct bucket if the
+// left side were anchored too. Checked directly against this exact list:
+// every current keyword's plural is either a plain "+s" or "+es" (e.g.
+// "clutch"/"clutches", "dress"/"dresses") — "scarf"/"scarves" is the one
+// keyword whose irregular plural this still doesn't catch, same as the
+// plain-substring code before it (not a regression, a pre-existing,
+// disclosed limitation). Precompiled once at module load, not per call —
+// this runs over every scraped candidate during ingestion.
+const CATEGORY_BUCKET_MATCHERS: [RegExp, CategoryBucket][] = CATEGORY_BUCKET_KEYWORDS.map(([keyword, bucket]) => [
+  new RegExp(`${escapeRegExp(keyword)}(?:es|s)?(?![a-z])`),
+  bucket,
+]);
+
 export function categorizeListing(listing: { title: string; category: string | null | undefined }): CategoryBucket {
   const haystack = `${listing.category ?? ""} ${listing.title ?? ""}`.toLowerCase();
-  for (const [keyword, bucket] of CATEGORY_BUCKET_KEYWORDS) {
-    if (haystack.includes(keyword)) return bucket;
+  for (const [pattern, bucket] of CATEGORY_BUCKET_MATCHERS) {
+    if (pattern.test(haystack)) return bucket;
   }
   return "other";
 }

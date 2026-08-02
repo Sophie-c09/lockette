@@ -135,22 +135,27 @@ export async function forceCloseAllTrackedBrowsers(reason: string): Promise<void
 // launch a brand-new browser per platform per round/call. Over a
 // long-running overnight job that's hundreds of real chromium launches,
 // each one an expensive OS process spawn — this pool reuses already-warm
-// browsers across calls instead. Deliberately SEPARATE state from
-// acquireBrowserSlot/registerBrowserLaunch/registerBrowserClose above
-// (still used unchanged by browser-extractor.ts's per-URL fallback, which
-// isn't switched to this pool): merging the two would make the
-// `[browser] launched (count=X)` logging ambiguous between "currently
-// active" and "idle in the reuse pool." Bounded by the SAME
-// MAX_ACTIVE_BROWSERS constant, but as a hard cap on TOTAL browsers ever
-// created for the pool (active + idle), not a slot that frees up while a
-// browser merely sits idle — an idle-but-alive browser is still a real OS
-// process consuming real memory, so it must keep counting against the cap
-// exactly as an active one does.
+// browsers across calls instead.
+//
+// P0 launch-readiness fix — this used to gate new launches on its OWN
+// `pooledBrowsers.length < MAX_ACTIVE_BROWSERS` check, entirely independent
+// from acquireBrowserSlot/reservedSlots above (still used unchanged by
+// browser-extractor.ts's per-URL fallback). That meant up to
+// MAX_ACTIVE_BROWSERS fallback browsers AND MAX_ACTIVE_BROWSERS pooled
+// browsers could be alive at the same moment — genuinely up to 2x the
+// intended ceiling, the exact class of resource-exhaustion incident this
+// constant exists to prevent (see this file's own header comment). Now a
+// NEW pooled-browser launch reserves a slot from the SAME shared
+// reservedSlots/waitQueue every fallback launch already uses — an idle
+// pooled browser being reused (the common case) never touches slot
+// accounting at all (it never released its slot in the first place; an
+// idle-but-alive browser is still a real OS process, so it must keep
+// counting against the cap exactly as an active one does), only a genuine
+// new chromium.launch() call (from either pool) does.
 // ---------------------------------------------------------------------------
 
 const pooledBrowsers: Browser[] = [];
 const idlePooledBrowsers: Browser[] = [];
-const pooledBrowserWaiters: Array<(browser: Browser) => void> = [];
 
 function dropFromPool(browser: Browser): void {
   const poolIndex = pooledBrowsers.indexOf(browser);
@@ -161,9 +166,10 @@ function dropFromPool(browser: Browser): void {
 
 /**
  * Hands back an already-launched, idle browser when one is available;
- * launches a fresh one only if the pool hasn't yet reached
- * MAX_ACTIVE_BROWSERS; otherwise waits for whichever caller currently
- * holds one to call releasePooledBrowser. Pair with EXACTLY ONE call to
+ * otherwise reserves a slot from the SAME global counter
+ * acquireBrowserSlot/browser-extractor.ts's fallback path uses (waiting,
+ * if necessary, for a fallback browser OR another pooled browser to free
+ * one up) and launches a fresh one. Pair with EXACTLY ONE call to
  * releasePooledBrowser (in a finally block) once done with it — never
  * call browser.close() directly on a pooled browser, that would defeat
  * the entire point of reusing it.
@@ -175,38 +181,38 @@ export async function acquirePooledBrowser(launchOptions?: LaunchOptions): Promi
       console.log(`[browser] reused from pool (pool size=${pooledBrowsers.length})`);
       return candidate;
     }
-    // Crashed/disconnected while idle — discard and keep looking.
+    // Crashed/disconnected while idle — this browser is genuinely gone, so
+    // its globally-shared slot frees up too, same as a real browser.close().
     dropFromPool(candidate);
+    releaseSlotAndAdvanceQueue();
   }
 
-  if (pooledBrowsers.length < MAX_ACTIVE_BROWSERS) {
+  await acquireBrowserSlot();
+  try {
     const browser = await chromium.launch(launchOptions);
     pooledBrowsers.push(browser);
     console.log(`[browser] launched into pool (pool size=${pooledBrowsers.length})`);
     return browser;
+  } catch (error) {
+    // Launch itself failed — release the slot this call reserved, same
+    // "acquire failed launches must still release their slot" reasoning
+    // as browser-extractor.ts's own releaseBrowserSlotOnLaunchFailure.
+    releaseSlotAndAdvanceQueue();
+    throw error;
   }
-
-  return new Promise<Browser>((resolve) => pooledBrowserWaiters.push(resolve));
 }
 
 /**
- * Returns a browser acquired via acquirePooledBrowser back to the pool
- * for reuse — hands it directly to the next waiter if one exists (skips
- * the idle queue entirely, so a waiting caller doesn't sit behind an idle
- * browser it could have used immediately), otherwise parks it as idle.
- * A disconnected/crashed browser is dropped from the pool outright rather
- * than being handed to a waiter or re-idled — the NEXT acquirePooledBrowser
- * call will see the pool has room again and launch a fresh replacement.
+ * Returns a browser acquired via acquirePooledBrowser back to the pool for
+ * reuse. A disconnected/crashed browser is dropped from the pool outright
+ * (freeing its global slot) rather than being re-idled — the NEXT
+ * acquirePooledBrowser call will see the pool has room again and launch a
+ * fresh replacement.
  */
 export function releasePooledBrowser(browser: Browser): void {
   if (!browser.isConnected()) {
     dropFromPool(browser);
-    return;
-  }
-
-  const waiter = pooledBrowserWaiters.shift();
-  if (waiter) {
-    waiter(browser);
+    releaseSlotAndAdvanceQueue();
     return;
   }
 
@@ -221,7 +227,6 @@ async function forceClosePooledBrowsers(reason: string): Promise<void> {
   console.warn(`[browser] Forced cleanup — closing ${browsers.length} pooled browser(s): ${reason}`);
   pooledBrowsers.length = 0;
   idlePooledBrowsers.length = 0;
-  pooledBrowserWaiters.length = 0;
 
   await Promise.all(
     browsers.map(async (browser) => {
@@ -229,6 +234,11 @@ async function forceClosePooledBrowsers(reason: string): Promise<void> {
         await browser.close();
       } catch (error) {
         console.error("[browser] Forced cleanup — error closing pooled browser:", error);
+      } finally {
+        // Every closed pooled browser held a global slot — free it,
+        // same as forceCloseAllTrackedBrowsers already does for the
+        // fallback pool via registerBrowserClose.
+        releaseSlotAndAdvanceQueue();
       }
     }),
   );

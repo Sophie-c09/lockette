@@ -5,7 +5,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { LinkButton } from "@/components/ui/Button";
 import { CartNavLink } from "@/components/CartNavLink";
+import { useCart } from "@/components/CartProvider";
 import { isActivePath } from "@/lib/nav";
+import { signOut } from "@/app/actions/auth";
 
 const TAB_CLASS =
   "rounded-pill px-3 py-1.5 text-sm font-medium transition-colors duration-200 ease-in-out hover:text-ink";
@@ -23,6 +25,7 @@ interface UnderlineRect {
 // regardless of how many tabs are present (signed in vs signed out).
 export function NavTabs({ isSignedIn }: { isSignedIn: boolean }) {
   const pathname = usePathname();
+  const { clearCart } = useCart();
   const containerRef = useRef<HTMLDivElement>(null);
   const tabRefs = useRef(new Map<string, HTMLAnchorElement>());
   const [underline, setUnderline] = useState<UnderlineRect>({
@@ -105,6 +108,24 @@ export function NavTabs({ isSignedIn }: { isSignedIn: boolean }) {
         <LinkButton href="/signup" className="ml-2">
           Get started
         </LinkButton>
+      )}
+
+      {/* signOut is a Server Action — importing it directly into this
+          client component and passing it as a <form>'s action is the
+          standard Next.js pattern; no client-side fetch/handler needed.
+          Previously there was no logout affordance anywhere in the app. */}
+      {isSignedIn && (
+        // Clearing the in-memory cart on submit (not just relying on the
+        // server redirect) matters because CartProvider mounts once at the
+        // root layout and never remounts on a client-side navigation — a
+        // shared device signing out and a different user signing back in
+        // would otherwise still see the previous user's cart items until a
+        // hard refresh.
+        <form action={signOut} onSubmit={() => clearCart()}>
+          <button type="submit" className={`${TAB_CLASS} text-teal`}>
+            Log out
+          </button>
+        </form>
       )}
 
       <span

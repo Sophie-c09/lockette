@@ -113,7 +113,7 @@ import { PipelineFunnel } from "@/lib/pipeline-debug";
 import { scoreImagesOutfitPotentialBatch } from "@/lib/image-score";
 import { mapWithConcurrency } from "@/lib/concurrency";
 import type { ListingsDatabase } from "@/lib/supabase/listings.types";
-import { extractMarketplaceId, computeImageHash } from "@/lib/inventory/duplicate-detection";
+import { extractMarketplaceId, computeImageHash, fallbackFingerprintKey } from "@/lib/inventory/duplicate-detection";
 import { flagListing } from "@/lib/inventory/listing-flagging";
 import { enqueueUrls, claimNextUrls, markUrlExtracted, markUrlFailed, getUrlQueueStats } from "@/lib/inventory/url-queue";
 import type { UrlQueueRow } from "@/lib/supabase/url-queue.types";
@@ -180,6 +180,10 @@ function withoutOptionalFields({
   quality_score,
   quality_reason,
   quality_breakdown,
+  // Transient (consumed by flagListing only) — never a real column on
+  // `listings`, unlike every other field destructured above, which ARE
+  // real columns that just might not be migrated on a given database yet.
+  removal_signal,
   ...rest
 }: StyleFilteredListing & {
   status: "active" | "flagged";
@@ -195,6 +199,15 @@ function withoutOptionalFields({
   return rest;
 }
 /* eslint-enable @typescript-eslint/no-unused-vars */
+
+// Strips ONLY the transient removal_signal field (see withoutOptionalFields
+// above) — used on the happy-path insert calls below, which otherwise
+// never go through withoutOptionalFields at all (that function only runs
+// on the missing-column retry path).
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- destructured only to omit this transient field
+function withoutRemovalSignal<T extends { removal_signal?: unknown }>({ removal_signal, ...rest }: T): Omit<T, "removal_signal"> {
+  return rest;
+}
 
 export interface AdminScraperOptions extends AdminScraperFilterOptions {
   allowedSources: string[];
@@ -1378,7 +1391,7 @@ async function filterOutDuplicateCandidates(
   // still catches real duplicates, just not unrelated items anymore.
   const { data: titleMatchData, error: titleMatchError } = await supabase
     .from("listings")
-    .select("title, price")
+    .select("title, price, brand, platform, category")
     .in(
       "title",
       byImageHash.map((row) => row.title),
@@ -1388,26 +1401,46 @@ async function filterOutDuplicateCandidates(
     console.error("[admin-scraper] Title duplicate check failed (continuing without it):", titleMatchError);
   }
 
-  function titlePriceKey(title: string, price: number | null): string {
-    return `${normalizeTitleForDedup(title)}::${price ?? "null"}`;
-  }
-
+  // Same conservative fingerprint (title+brand+price+platform+category)
+  // bulk-import.ts and import-listing/route.ts use via
+  // duplicate-detection.ts's checkForDuplicate/fallbackFingerprintKey — one
+  // shared key/normalization across all three ingestion paths, even though
+  // this path keeps its own batched `.in()` architecture (necessary at
+  // 50,000+ row scale) rather than calling checkForDuplicate per row.
   const existingTitlePriceKeys = new Set(
-    (titleMatchData ?? []).map((row: { title: string; price: number | null }) => titlePriceKey(row.title, row.price)),
+    (titleMatchData ?? []).map((row) =>
+      fallbackFingerprintKey({
+        title: row.title,
+        price: row.price,
+        brand: row.brand ?? null,
+        platform: row.platform ?? null,
+        category: row.category ?? null,
+        product_url: null,
+        image_url: null,
+      }),
+    ),
   );
 
   const seenInBatch = new Set<string>();
 
   return byImageHash.filter((row) => {
-    const key = titlePriceKey(row.title, row.price);
+    const key = fallbackFingerprintKey({
+      title: row.title,
+      price: row.price,
+      brand: row.brand,
+      platform: row.platform,
+      category: row.category,
+      product_url: null,
+      image_url: null,
+    });
 
     if (existingTitlePriceKeys.has(key)) {
-      console.log("Skipping duplicate (matching title + price already in inventory):", row.product_url);
+      console.log("Skipping duplicate (matching title + brand + price + platform + category already in inventory):", row.product_url);
       counts.duplicates++;
       return false;
     }
     if (seenInBatch.has(key)) {
-      console.log("Skipping duplicate (matching title + price earlier in this same batch):", row.product_url);
+      console.log("Skipping duplicate (matching title + brand + price + platform + category earlier in this same batch):", row.product_url);
       counts.duplicates++;
       return false;
     }
@@ -1821,6 +1854,9 @@ export async function runAdminScraper(
           images: survivor.images,
           price: survivor.price,
           category: survivor.category,
+          productUrl: survivor.product_url,
+          platform: survivor.platform,
+          removalSignal: survivor.removal_signal,
         });
 
         if (flag.isSafe) {
@@ -1881,7 +1917,7 @@ export async function runAdminScraper(
           });
         }
 
-        let { data, error } = await supabase.from("listings").insert(chunk).select("id");
+        let { data, error } = await supabase.from("listings").insert(chunk.map(withoutRemovalSignal)).select("id");
 
         if (error && isMissingColumnError(error)) {
           console.warn(
@@ -1936,7 +1972,7 @@ export async function runAdminScraper(
             imageCount: row.images.length,
             source: row.product_url,
           });
-          let single = await supabase.from("listings").insert(row).select("id").single();
+          let single = await supabase.from("listings").insert(withoutRemovalSignal(row)).select("id").single();
 
           if (single.error && isMissingColumnError(single.error)) {
             single = await supabase.from("listings").insert(withoutOptionalFields(row)).select("id").single();

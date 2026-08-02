@@ -29,16 +29,21 @@ export interface ModeratedListing {
   product_url: string | null;
   platform: string | null;
   created_at: string;
-  // Only 'flagged' and 'active' are ever fetched here (see
-  // getListingsForModeration's filter param) — a listing already 'sold',
-  // 'unavailable', 'pending', or 'removed' has left the moderation
-  // dashboard's scope. 'flagged' is the primary review state since the
-  // "scraped listings go live automatically" ingestion change — see this
-  // file's own header comment.
-  status: "flagged" | "active";
+  // 'flagged'/'active' are the primary review states (see this file's own
+  // header comment). 'unavailable' is fetched only via the "unavailable"
+  // filter — P0 launch-readiness dead-listing cleanup: check-listing-status
+  // (src/app/api/cron/check-listing-status/route.ts) flips a listing here
+  // after several consecutive sold/removed signals, and an admin needs
+  // somewhere to review and, if it was wrong, restore it (restoreListing,
+  // src/lib/adminListingRemoval.ts). Still deliberately narrow — 'sold',
+  // 'pending', and 'removed' remain outside this dashboard's scope.
+  status: "flagged" | "active" | "unavailable";
   // Why a 'flagged' listing was flagged (src/lib/inventory/listing-flagging.ts)
   // — a comma-joined list of reasons, null for 'active' listings.
   flag_reason: string | null;
+  // Why check-listing-status marked an 'unavailable' listing that way (the
+  // matched phrase or JSON-LD value) — null otherwise.
+  removal_reason: string | null;
   // "Detected aesthetics" on the admin card is just this — already
   // computed by enrichListing (text classification + AI image tagging)
   // before insert, not a separate field.
@@ -50,7 +55,7 @@ export interface ModeratedListing {
   quality_breakdown: QualityScoreBreakdown | null;
 }
 
-export type ModerationFilter = "all" | "flagged" | "approved";
+export type ModerationFilter = "all" | "flagged" | "approved" | "unavailable";
 
 async function requireAdmin(): Promise<{ error?: string }> {
   const supabase = await createClient();
@@ -88,7 +93,7 @@ export async function getListingsForModeration(
   // and not expected to be missing, but included in the same fallback for
   // simplicity) rather than showing an error over it.
   const FULL_COLUMNS =
-    "id, title, price, brand, image_url, images, product_url, platform, status, flag_reason, created_at, aesthetic_tags, quality_score, quality_reason, quality_breakdown";
+    "id, title, price, brand, image_url, images, product_url, platform, status, flag_reason, removal_reason, created_at, aesthetic_tags, quality_score, quality_reason, quality_breakdown";
   const FALLBACK_COLUMNS = "id, title, price, brand, image_url, product_url, platform, status, created_at";
 
   // status descending puts 'flagged' (f) ahead of 'active' (a) — "Default
@@ -101,7 +106,9 @@ export async function getListingsForModeration(
       ? fullQuery.eq("status", "flagged")
       : filter === "approved"
         ? fullQuery.eq("status", "active")
-        : fullQuery.in("status", ["flagged", "active"]);
+        : filter === "unavailable"
+          ? fullQuery.eq("status", "unavailable")
+          : fullQuery.in("status", ["flagged", "active"]);
   const full = await fullQuery.order("status", { ascending: false }).order("created_at", { ascending: true });
 
   let data = full.data;
@@ -115,7 +122,9 @@ export async function getListingsForModeration(
         ? fallbackQuery.eq("status", "flagged")
         : filter === "approved"
           ? fallbackQuery.eq("status", "active")
-          : fallbackQuery.in("status", ["flagged", "active"]);
+          : filter === "unavailable"
+            ? fallbackQuery.eq("status", "unavailable")
+            : fallbackQuery.in("status", ["flagged", "active"]);
     const fallback = await fallbackQuery
       .order("status", { ascending: false })
       .order("created_at", { ascending: true });
@@ -124,6 +133,7 @@ export async function getListingsForModeration(
         ...row,
         images: null,
         flag_reason: null,
+        removal_reason: null,
         aesthetic_tags: [],
         quality_score: null,
         quality_reason: null,

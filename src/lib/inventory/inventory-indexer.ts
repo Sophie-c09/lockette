@@ -44,7 +44,7 @@ const DEFAULT_PROCESS_BATCH_SIZE = 20; // AI-call-bound, deliberately smaller th
 const MAX_ENRICHMENT_ATTEMPTS = 3; // matches this feature's own MAX_RETRIES
 
 const LISTING_SELECT_COLUMNS =
-  "id, title, description, price, image_url, images, product_url, category, aesthetic_tags, image_score, created_at, last_verified_at";
+  "id, title, description, price, image_url, images, product_url, category, brand, platform, aesthetic_tags, image_score, created_at, last_verified_at";
 
 export interface IndexingStageResult {
   fetched: number;
@@ -120,7 +120,15 @@ export async function indexNewListings(batchSize: number = DEFAULT_FETCH_BATCH_S
     }
 
     const duplicate = await checkForDuplicate(
-      { title: listing.title, product_url: listing.product_url, image_url: listing.image_url },
+      {
+        title: listing.title,
+        product_url: listing.product_url,
+        image_url: listing.image_url,
+        price: listing.price,
+        brand: listing.brand ?? null,
+        platform: listing.platform ?? null,
+        category: listing.category ?? null,
+      },
       listing.id,
     );
     if (duplicate.isDuplicate) {

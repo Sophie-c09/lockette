@@ -34,6 +34,7 @@ function makeListing(overrides: Partial<ExtractedListing> = {}): ExtractedListin
     source_likes_count: null,
     source_views_count: null,
     source_comments_count: null,
+    removal_signal: null,
     ...overrides,
   };
 }

@@ -77,6 +77,7 @@ import {
   MAX_LISTING_PHOTO_BYTES,
 } from "@/lib/listing-photo";
 import { OUTFIT_PHOTOS_BUCKET, outfitPhotoPath, getSignedOutfitPhotoUrl } from "@/lib/outfit-photo";
+import { detectImageKind } from "@/lib/image-content-verification";
 import { classifyOutfitPhoto, type OutfitCategory } from "@/lib/outfit-classification";
 import { searchMarketplaceItems } from "@/lib/marketplace-search";
 import { rankBySimilarity } from "@/lib/garment-similarity-ranking";
@@ -160,6 +161,24 @@ export async function classifyOutfitPhotoForRecreation(formData: FormData): Prom
     }
     if (image.size > MAX_LISTING_PHOTO_BYTES) {
       return { error: "Photo must be 5MB or smaller." };
+    }
+
+    // Real content verification (P0 launch-readiness fix) — the check
+    // above only ever trusts File.type, a browser-reported and fully
+    // spoofable value; a non-image file renamed to .jpg sails through it.
+    // This route receives the raw file bytes directly (unlike Style Me's
+    // client-direct-to-Storage upload), so the real magic-number bytes can
+    // be checked BEFORE ever uploading it at all. HEIC gets its own
+    // specific, actionable message — this stack has no HEIC decoder, so a
+    // genuine iPhone HEIC export is a real, expected case, not a malformed
+    // file.
+    const sniffBytes = new Uint8Array(await image.slice(0, 16).arrayBuffer());
+    const imageKind = detectImageKind(sniffBytes);
+    if (imageKind === "heic") {
+      return { error: "HEIC photos aren't supported yet — please export as JPEG or PNG first." };
+    }
+    if (imageKind === "unknown") {
+      return { error: "That file doesn't look like a real photo. Please try a different image." };
     }
 
     // Random path token, not this row's own id — there's only ever one

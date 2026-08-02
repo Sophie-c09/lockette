@@ -28,6 +28,8 @@ import {
   updateLargeScaleScraperJobProgress,
   completeScraperJob,
   failScraperJob,
+  claimBatchLease,
+  releaseBatchLease,
   type ScraperJobRow,
 } from "@/lib/scraper-jobs";
 
@@ -126,13 +128,54 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, jobId, status: job.status, batchRan: false });
     }
 
-    console.log(`[${routeName}] Processing one batch`, {
-      userId: user.id,
-      jobId,
-      currentStatus: job.status,
-      currentRound: job.current_round ?? 0,
-      targetCount: job.target_count ?? null,
+    // P0 launch-readiness fix — the status check above does NOT prevent
+    // two concurrent process-batch calls for the SAME job from both
+    // reaching here (status stays "running" across many sequential calls
+    // by design). A short lease (see claimBatchLease's own comment) makes
+    // sure only one of them actually runs runLargeScaleAdminScraper this
+    // poll tick; the other treats it exactly like the status mismatch
+    // above — not an error, just "nothing to do this tick."
+    const { claimed, leaseId } = await claimBatchLease(jobId);
+    if (!claimed) {
+      console.log(`[${routeName}] Lost the race for this job's batch lease — another call is already processing it`, {
+        userId: user.id,
+        jobId,
+      });
+      return NextResponse.json({ success: true, jobId, status: job.status, batchRan: false });
+    }
+
+    try {
+      return await runOneBatch({ routeName, userId: user.id, jobId, job });
+    } finally {
+      await releaseBatchLease(jobId, leaseId);
+    }
+  } catch (error) {
+    console.error(`[${routeName}] Uncaught error processing batch`, {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined,
     });
+    return sanitizedErrorResponse(error instanceof Error ? error.message : "Unexpected server error.", 500);
+  }
+}
+
+async function runOneBatch({
+  routeName,
+  userId,
+  jobId,
+  job,
+}: {
+  routeName: string;
+  userId: string;
+  jobId: string;
+  job: ScraperJobRow;
+}): Promise<Response> {
+  console.log(`[${routeName}] Processing one batch`, {
+    userId,
+    jobId,
+    currentStatus: job.status,
+    currentRound: job.current_round ?? 0,
+    targetCount: job.target_count ?? null,
+  });
 
     const checkpoint = job.checkpoint ?? {};
     const savedOptions = (checkpoint.options as LargeScaleAdminScraperOptions | undefined) ?? {
@@ -215,7 +258,7 @@ export async function POST(request: Request) {
     } catch (batchError) {
       const message = batchError instanceof Error ? batchError.message : "Unexpected error running this batch.";
       console.error(`[${routeName}] Batch attempt threw — marking job failed`, {
-        userId: user.id,
+        userId,
         jobId,
         message,
         stack: batchError instanceof Error ? batchError.stack : undefined,
@@ -275,7 +318,7 @@ export async function POST(request: Request) {
     // up; nothing else to do here.
 
     console.log(`[${routeName}] Batch complete`, {
-      userId: user.id,
+      userId,
       jobId,
       stopReason: result.stopReason,
       batchesRun: result.batchesRun,
@@ -297,11 +340,4 @@ export async function POST(request: Request) {
       status: result.stopReason === "target_reached" ? "completed" : result.stopReason === "consecutive_failures" ? "failed" : result.stopReason === "paused" ? "paused" : "running",
       batchRan: result.batchesRun > 0,
     });
-  } catch (error) {
-    console.error(`[${routeName}] Uncaught error processing batch`, {
-      message: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-    });
-    return sanitizedErrorResponse(error instanceof Error ? error.message : "Unexpected server error.", 500);
-  }
 }

@@ -38,6 +38,16 @@ const RECHECK_INTERVAL_MINUTES = 20;
 // whole batch well inside maxDuration.
 const CONCURRENCY = 5;
 
+// P0 launch-readiness fix — a SINGLE unavailable signal used to flip a
+// listing straight to 'unavailable', with no memory of prior checks. A
+// transient false positive (an ambiguous banner, a misfired phrase match)
+// could remove a genuinely still-active listing on one bad read. Requiring
+// several CONSECUTIVE unavailable signals — reset to 0 by any run that
+// does NOT return "unavailable" (see below) — makes an accidental removal
+// require the source page to look sold/removed on every check across
+// several separate days (this cron runs once daily), not just once.
+const CONSECUTIVE_UNAVAILABLE_THRESHOLD = 3;
+
 function debugLog(message: string, extra?: unknown): void {
   console.log(`[check-listing-status] ${message}`, extra ?? "");
 }
@@ -59,7 +69,7 @@ export async function GET(request: Request) {
 
   const { data: listings, error } = await supabase
     .from("listings")
-    .select("id, product_url, last_checked_at")
+    .select("id, product_url, last_checked_at, consecutive_unavailable_checks, availability_check_count")
     .eq("status", "active")
     .or(`last_checked_at.is.null,last_checked_at.lt.${cutoff}`)
     .order("last_checked_at", { ascending: true, nullsFirst: true })
@@ -73,7 +83,7 @@ export async function GET(request: Request) {
   const candidates = listings ?? [];
   debugLog(`Checking ${candidates.length} listing(s)`);
 
-  const summary = { checked: 0, unavailable: 0, inconclusive: 0, skipped: 0 };
+  const summary = { checked: 0, unavailable: 0, markedUnavailable: 0, inconclusive: 0, skipped: 0 };
 
   await mapWithConcurrency(candidates, CONCURRENCY, async (listing) => {
     const now = new Date().toISOString();
@@ -94,32 +104,61 @@ export async function GET(request: Request) {
 
     const result = await checkListingAvailability(listing.product_url);
     summary.checked++;
+    const availabilityCheckCount = (listing.availability_check_count ?? 0) + 1;
 
     if (result.outcome === "unavailable") {
       summary.unavailable++;
-      debugLog(`Listing ${listing.id} flagged unavailable`, {
+      const consecutiveUnavailableChecks = (listing.consecutive_unavailable_checks ?? 0) + 1;
+      const reachedThreshold = consecutiveUnavailableChecks >= CONSECUTIVE_UNAVAILABLE_THRESHOLD;
+
+      debugLog(`Listing ${listing.id} got an unavailable signal (${consecutiveUnavailableChecks} consecutive)`, {
         signalSource: result.signalSource,
         detail: result.detail,
+        reachedThreshold,
       });
+
+      // Below the threshold: record the signal (so the NEXT run knows how
+      // many consecutive hits there have been) but leave status alone —
+      // requiring several consecutive hits before treating this as
+      // confirmed, not a guess from one page load. `.eq("status", "active")`
+      // guards against a race with a concurrent admin action on the same row.
       const { error: updateError } = await supabase
         .from("listings")
-        .update({ status: "unavailable", last_checked_at: now })
+        .update({
+          ...(reachedThreshold ? { status: "unavailable" as const, removal_reason: result.detail } : {}),
+          last_checked_at: now,
+          availability_check_count: availabilityCheckCount,
+          consecutive_unavailable_checks: consecutiveUnavailableChecks,
+        })
         .eq("id", listing.id)
         .eq("status", "active");
+
       if (updateError) {
-        console.error("[check-listing-status] Failed to mark listing unavailable:", updateError);
+        console.error("[check-listing-status] Failed to update listing after an unavailable signal:", updateError);
+      } else if (reachedThreshold) {
+        summary.markedUnavailable++;
       }
       return;
     }
 
-    // Inconclusive — the spec's own failsafe: never guess. Fetch failed,
-    // was blocked, or genuinely had no recognizable signal — either way,
-    // only the checked-at timestamp moves; status is left exactly as it
-    // was for a later retry.
+    // Inconclusive (or a confirmed-available JSON-LD signal, which
+    // detectUnavailabilitySignal also reports as inconclusive — see that
+    // module's own comment) — the spec's own failsafe: never guess. A
+    // fetch that failed, was blocked, or genuinely had no recognizable
+    // signal resets consecutive_unavailable_checks to 0 (preserving what
+    // "consecutive" actually means — see this route's own threshold
+    // comment above) and stamps last_available_at, since this run did NOT
+    // find a confirmed-unavailable signal either way. Status itself is
+    // left exactly as it was for a later retry.
     summary.inconclusive++;
     const { error: stampError } = await supabase
       .from("listings")
-      .update({ last_checked_at: now })
+      .update({
+        last_checked_at: now,
+        last_available_at: now,
+        availability_check_count: availabilityCheckCount,
+        consecutive_unavailable_checks: 0,
+      })
       .eq("id", listing.id);
     if (stampError) {
       console.error("[check-listing-status] Failed to stamp last_checked_at:", stampError);

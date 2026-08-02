@@ -116,7 +116,15 @@ export async function saveListing(listingId: string): Promise<{ error?: string }
 
     console.log("[saveListing] insert result:", { data: inserted, error });
 
-    if (error) {
+    // P0 launch-readiness fix — this check-then-insert has a real TOCTOU
+    // race (rapid double-click, two open tabs): both calls can pass the
+    // `!existing` check above before either insert lands. Postgres code
+    // 23505 (unique_violation) means the OTHER call already won that race
+    // — see supabase/migrations/20260801000300_add_saved_items_listing_unique_constraint.sql,
+    // which (finally) actually applies the unique(user_id, listing_id)
+    // constraint this needs to fire at all. Treated as success, not a
+    // failure: the listing IS saved, just not by this particular call.
+    if (error && error.code !== "23505") {
       debugLogLike({ userId: user.id, listingId, action: "save", success: false });
       return { error: error.message };
     }

@@ -21,7 +21,11 @@ const nextConfig: NextConfig = {
   // normally at runtime instead of bundling it, matching Next's own
   // documented guidance for native/binary Node dependencies (Playwright,
   // sharp, etc.) in Route Handlers.
-  serverExternalPackages: ["playwright"],
+  // @sparticuz/chromium added alongside playwright (same P0 launch-
+  // readiness pass, see src/lib/browser-launch-options.ts) — it's the
+  // exact same class of native/binary-shipping package, so it needs the
+  // same "leave it alone, don't try to statically bundle it" treatment.
+  serverExternalPackages: ["playwright", "@sparticuz/chromium"],
   // Continuous Import / Style-Aware Scraper root cause (the "Failed to
   // start the scraper" investigation) — confirmed live via the real
   // scraper_jobs.error_message this app's own failScraperJob recorded:
@@ -42,9 +46,24 @@ const nextConfig: NextConfig = {
   // else — see this repo's own "never import admin-scraper.ts from a
   // route real users' browsers wait on" convention), so the file the
   // deployed Function actually reaches for is there.
+  // @sparticuz/chromium (added in this same P0 launch-readiness pass, see
+  // src/lib/browser-launch-options.ts's own header comment) ships its OWN
+  // compressed Chromium build INSIDE its npm package specifically so
+  // ordinary node_modules file-tracing picks it up — unlike a normal
+  // Playwright install, whose actual browser executable lives in an
+  // OS-level cache directory outside node_modules entirely and can never
+  // be reached by any node_modules/** glob, browsers.json notwithstanding.
   outputFileTracingIncludes: {
-    "/api/admin-scraper/run": ["./node_modules/playwright/**", "./node_modules/playwright-core/**"],
-    "/api/admin-scraper/large-scale/process-batch": ["./node_modules/playwright/**", "./node_modules/playwright-core/**"],
+    "/api/admin-scraper/run": [
+      "./node_modules/playwright/**",
+      "./node_modules/playwright-core/**",
+      "./node_modules/@sparticuz/chromium/**",
+    ],
+    "/api/admin-scraper/large-scale/process-batch": [
+      "./node_modules/playwright/**",
+      "./node_modules/playwright-core/**",
+      "./node_modules/@sparticuz/chromium/**",
+    ],
   },
   // Default Server Action body limit is 1MB — too small for Recreate This
   // Outfit's photo upload (RecreateOutfitForm.tsx posts the image File

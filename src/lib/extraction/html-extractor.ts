@@ -9,6 +9,7 @@
 // serve (attributes in unexpected order, unquoted values, nested quotes)
 // than a `<meta\b[^>]*>`-style pattern can reliably handle.
 import * as cheerio from "cheerio";
+import { detectUnavailabilitySignal, type AvailabilitySignal } from "./availability-signal";
 
 // Raw, pre-normalization signal from either extractor — normalize-listing.ts
 // turns this into the final ExtractedListing shape. Values may still be
@@ -41,6 +42,13 @@ export interface RawExtraction {
   sourceLikesCount: number | null;
   sourceViewsCount: number | null;
   sourceCommentsCount: number | null;
+  // Sold/removed signal read off THIS extraction's own HTML — computed here
+  // (not as a separate pass) so both html-extractor.ts's fast path and
+  // browser-extractor.ts's rendered-page fallback get it for free via their
+  // shared extractFromHtml() call below, and so an already-dead listing can
+  // be flagged at IMPORT time (see listing-flagging.ts), not just caught
+  // later by the check-listing-status cron.
+  unavailabilitySignal: AvailabilitySignal;
 }
 
 function debugLog(message: string): void {
@@ -447,6 +455,7 @@ export function extractFromHtml(html: string): RawExtraction {
     sourceLikesCount: jsonLd?.likesCount ?? null,
     sourceViewsCount: jsonLd?.viewsCount ?? null,
     sourceCommentsCount: jsonLd?.commentsCount ?? null,
+    unavailabilitySignal: detectUnavailabilitySignal(html),
   };
 }
 

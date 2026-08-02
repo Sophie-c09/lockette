@@ -73,6 +73,14 @@ export interface ScraperJobsDatabase {
           queries_completed?: number;
           pages_searched?: number;
           unique_urls_discovered?: number;
+          // P0 launch-readiness fix — per-batch lease so two concurrent
+          // process-batch calls for the SAME job can't both run
+          // runLargeScaleAdminScraper at once (see claimBatchLease in
+          // scraper-jobs.ts). Cleared back to null once a batch attempt
+          // finishes; a lease past batch_lease_expires_at is reclaimable,
+          // same "stale claims recover" posture as scraper_url_queue.
+          batch_lease_id?: string | null;
+          batch_lease_expires_at?: string | null;
         };
         Insert: {
           id?: string;
@@ -106,6 +114,14 @@ export interface ScraperJobsDatabase {
           queries_completed?: number;
           pages_searched?: number;
           unique_urls_discovered?: number;
+          // P0 launch-readiness fix — per-batch lease so two concurrent
+          // process-batch calls for the SAME job can't both run
+          // runLargeScaleAdminScraper at once (see claimBatchLease in
+          // scraper-jobs.ts). Cleared back to null once a batch attempt
+          // finishes; a lease past batch_lease_expires_at is reclaimable,
+          // same "stale claims recover" posture as scraper_url_queue.
+          batch_lease_id?: string | null;
+          batch_lease_expires_at?: string | null;
         };
         Update: {
           id?: string;
@@ -139,6 +155,14 @@ export interface ScraperJobsDatabase {
           queries_completed?: number;
           pages_searched?: number;
           unique_urls_discovered?: number;
+          // P0 launch-readiness fix — per-batch lease so two concurrent
+          // process-batch calls for the SAME job can't both run
+          // runLargeScaleAdminScraper at once (see claimBatchLease in
+          // scraper-jobs.ts). Cleared back to null once a batch attempt
+          // finishes; a lease past batch_lease_expires_at is reclaimable,
+          // same "stale claims recover" posture as scraper_url_queue.
+          batch_lease_id?: string | null;
+          batch_lease_expires_at?: string | null;
         };
         Relationships: [];
       };

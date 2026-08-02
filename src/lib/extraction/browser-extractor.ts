@@ -19,6 +19,7 @@ import {
   registerBrowserClose,
   releaseBrowserSlotOnLaunchFailure,
 } from "@/lib/browser-concurrency";
+import { resolveBrowserLaunchOptions } from "@/lib/browser-launch-options";
 
 const NAV_TIMEOUT_MS = 15_000;
 // Networkidle doesn't guarantee client-side rendering has *finished* —
@@ -197,7 +198,7 @@ export async function runBrowserExtraction(url: string): Promise<RawExtraction |
     debugLog(`Browser extraction started for ${url}`);
     await acquireBrowserSlot();
     slotAcquired = true;
-    browser = await chromium.launch({ headless: true, timeout: LAUNCH_TIMEOUT_MS });
+    browser = await chromium.launch(await resolveBrowserLaunchOptions({ headless: true, timeout: LAUNCH_TIMEOUT_MS }));
     registerBrowserLaunch(browser);
     const context = await browser.newContext({
       userAgent: BROWSER_USER_AGENT,
@@ -277,6 +278,12 @@ export async function runBrowserExtraction(url: string): Promise<RawExtraction |
       sourceLikesCount: fromRenderedHtml.sourceLikesCount,
       sourceViewsCount: fromRenderedHtml.sourceViewsCount,
       sourceCommentsCount: fromRenderedHtml.sourceCommentsCount,
+      // No visible-DOM heuristic for this either — same reasoning as the
+      // engagement counts above; a rendered page's sold/removed banner is
+      // covered by extractFromHtml's own phrase/JSON-LD scan already run
+      // above (fromRenderedHtml), not something the generic DOM script
+      // looks for.
+      unavailabilitySignal: fromRenderedHtml.unavailabilitySignal,
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);

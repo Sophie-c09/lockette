@@ -1,5 +1,4 @@
-// Internal-tool endpoint for /admin/import — no auth yet (see that page's
-// comment for why). Not linked from anywhere in the public app.
+// Internal-tool endpoint for /admin/import, called from ImportListingView.tsx.
 //
 // Also owns the Supabase write for each imported listing, via the
 // service-role client (createAdminClient) — the client-side bulk-import
@@ -9,12 +8,23 @@
 // a "Cannot read properties of undefined (reading 'apply')" runtime error
 // (see ImportListingView.tsx for the full explanation) — consolidating
 // the write in here removes that code path entirely.
+//
+// This route lives under /api/, not /admin/ — src/app/admin/layout.tsx's
+// shared auth gate only covers page routes, not API routes, so the admin
+// check below is this route's own, real enforcement boundary (not
+// decorative), same convention as /api/bulk-import/discover and every
+// other /api/admin-scraper/* route. This was previously missing here —
+// an unauthenticated caller could write directly to `listings` via the
+// service-role client below, bypassing RLS entirely.
 import { NextResponse } from "next/server";
+import { createClient } from "@/lib/supabase/server";
+import { isCurrentUserAdmin } from "@/lib/admin";
 import { extractListingFromUrl } from "@/lib/listing-extraction";
 import { enrichListing } from "@/lib/listing-enrichment";
 import { generateAndSaveListingEmbedding } from "@/lib/listing-embeddings";
 import { scoreListingQuality } from "@/lib/listing-quality";
 import { flagListing } from "@/lib/inventory/listing-flagging";
+import { checkForDuplicate } from "@/lib/inventory/duplicate-detection";
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { ListingsDatabase } from "@/lib/supabase/listings.types";
 
@@ -74,6 +84,15 @@ function withoutSourceEngagementFields<T extends Record<string, unknown>>(payloa
 }
 
 export async function POST(request: Request) {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user || !(await isCurrentUserAdmin(supabase, user.id))) {
+    return NextResponse.json({ error: "Not authorized." }, { status: 401 });
+  }
+
   let body: unknown;
   try {
     body = await request.json();
@@ -120,9 +139,9 @@ export async function POST(request: Request) {
   // discovery. Never throws — scoreListingQuality already fails open.
   const { qualityScore, qualityReason, breakdown } = await scoreListingQuality(enrichedListing);
 
-  let supabase;
+  let adminSupabase;
   try {
-    supabase = createAdminClient<ListingsDatabase>();
+    adminSupabase = createAdminClient<ListingsDatabase>();
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Server misconfigured.";
@@ -140,7 +159,7 @@ export async function POST(request: Request) {
   // this check existed), .maybeSingle() would error on "multiple rows
   // returned" — picking the most recent match to update is a safe,
   // idempotent way to converge back toward one row per URL over time.
-  const { data: existingRows } = await supabase
+  const { data: existingRows } = await adminSupabase
     .from("listings")
     .select("id")
     .eq("product_url", enrichedListing.product_url)
@@ -149,8 +168,45 @@ export async function POST(request: Request) {
 
   const existing = existingRows?.[0] ?? null;
 
+  // Same conservative duplicate cascade bulk-import.ts and admin-scraper.ts
+  // use (image hash + a title/brand/price/platform/category fallback
+  // fingerprint) — an exact product_url match above already means "same
+  // URL, refresh it" (handled below), but a DIFFERENT URL for the same
+  // physical item (a reseller re-listing, or the same photo re-hosted)
+  // must not silently create a second row just because this is a manual
+  // single-URL import rather than a scraper batch.
+  if (!existing) {
+    const duplicate = await checkForDuplicate({
+      title: enrichedListing.title,
+      product_url: enrichedListing.product_url,
+      image_url: enrichedListing.image_url,
+      price: enrichedListing.price,
+      brand: enrichedListing.brand,
+      platform: enrichedListing.platform,
+      category: enrichedListing.category,
+    });
+    if (duplicate.isDuplicate) {
+      return NextResponse.json(
+        {
+          error:
+            "This looks like a duplicate of a listing already in the catalog " +
+            `(match confidence ${Math.round(duplicate.confidence * 100)}%).`,
+          duplicateOfListingId: duplicate.matchedListingId,
+        },
+        { status: 409 },
+      );
+    }
+  }
+
+  // removal_signal is a transient field the extraction pipeline computes
+  // for flagListing() below — it has no matching column on `listings`, so
+  // it's destructured out here rather than spread into the DB write
+  // payload (which would fail with an "unknown column" type error, or
+  // worse, at the actual PostgREST call).
+  const { removal_signal: removalSignal, ...enrichedListingForStorage } = enrichedListing;
+
   const listingToWrite = {
-    ...enrichedListing,
+    ...enrichedListingForStorage,
     shipping_cost: shippingCostForPlatform(enrichedListing.platform),
     quality_score: qualityScore,
     quality_reason: qualityReason,
@@ -160,7 +216,7 @@ export async function POST(request: Request) {
   if (existing) {
     console.warn(`[listing-import] Existing listing found, updating: ${existing.id}`);
 
-    let { data, error } = await supabase
+    let { data, error } = await adminSupabase
       .from("listings")
       .update(listingToWrite)
       .eq("id", existing.id)
@@ -171,7 +227,7 @@ export async function POST(request: Request) {
       console.warn(
         "[listing-import] source_* engagement columns not found on this database yet — retrying without them. Run the latest supabase/schema.sql to enable Hot Item detection.",
       );
-      ({ data, error } = await supabase
+      ({ data, error } = await adminSupabase
         .from("listings")
         .update(withoutSourceEngagementFields(listingToWrite))
         .eq("id", existing.id)
@@ -198,6 +254,9 @@ export async function POST(request: Request) {
     images: listingToWrite.images,
     price: listingToWrite.price,
     category: listingToWrite.category,
+    productUrl: listingToWrite.product_url,
+    platform: listingToWrite.platform,
+    removalSignal,
   });
   const computedStatus = flag.isSafe ? ("active" as const) : ("flagged" as const);
   const computedFlagReason = flag.isSafe ? null : (flag.reasons ?? []).join(", ");
@@ -208,7 +267,7 @@ export async function POST(request: Request) {
     console.log("[IMPORT] Flagged:", flag.reasons);
   }
 
-  let { data, error } = await supabase
+  let { data, error } = await adminSupabase
     .from("listings")
     .insert({ ...listingToWrite, status: computedStatus, flag_reason: computedFlagReason })
     .select()
@@ -247,7 +306,7 @@ export async function POST(request: Request) {
       flag_reason: computedFlagReason,
     };
     /* eslint-enable @typescript-eslint/no-unused-vars */
-    ({ data, error } = await supabase
+    ({ data, error } = await adminSupabase
       .from("listings")
       .insert(withoutOptionalFields)
       .select()

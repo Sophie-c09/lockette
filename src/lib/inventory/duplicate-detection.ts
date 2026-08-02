@@ -99,12 +99,38 @@ export interface DuplicateCandidate {
   title: string;
   product_url: string | null;
   image_url: string | null;
+  // Added for the P0 launch-readiness "one consistent duplicate strategy
+  // across all import paths" pass — tier 4 below used to be fuzzy title
+  // similarity ALONE, which admin-scraper.ts's own dedup cascade already
+  // found (in production) rejects genuinely distinct listings that share a
+  // generic generated title ("item · other") purely by coincidence. Price/
+  // brand/platform/category narrow tier 4 down to the same conservative
+  // fingerprint every ingestion path now shares.
+  price: number | null;
+  brand: string | null;
+  platform: string | null;
+  category: string | null;
 }
 
 export interface DuplicateCheckResult {
   isDuplicate: boolean;
   matchedListingId?: string;
   confidence: number;
+}
+
+// Exported so callers that want an in-batch (not-yet-inserted) fingerprint
+// check can use the EXACT same key this function's own tier 4 uses below —
+// e.g. bulk-import.ts, which processes a whole batch of candidates at once
+// and needs to catch two candidates in the SAME batch fingerprinting as
+// the same item, not just a match against the already-live table.
+export function fallbackFingerprintKey(candidate: DuplicateCandidate): string {
+  return [
+    normalizeTitleForDedup(candidate.title),
+    candidate.brand?.trim().toLowerCase() ?? "",
+    candidate.price ?? "null",
+    candidate.platform?.trim().toLowerCase() ?? "",
+    candidate.category?.trim().toLowerCase() ?? "",
+  ].join("::");
 }
 
 /**
@@ -162,13 +188,23 @@ export async function checkForDuplicate(
     if (data) return { isDuplicate: true, matchedListingId: data.id, confidence: 0.9 };
   }
 
-  // 4. Fuzzy title — narrowed by the longest token to keep this bounded.
+  // 4. Conservative fallback fingerprint — fuzzy title similarity narrowed
+  // by the longest token to keep this bounded, but title similarity ALONE
+  // is deliberately not enough to call two rows the same item: admin-
+  // scraper.ts's own dedup cascade found in production that this
+  // codebase's title generator falls back to generic titles ("item ·
+  // other") shared by many genuinely different listings, so a fuzzy title
+  // match only counts here when price also matches exactly, and platform
+  // matches whenever both sides know their platform (brand/category are
+  // folded into the exact-match key below rather than compared
+  // independently, since two items with the same brand+category are
+  // extremely common and not itself a duplicate signal).
   const tokens = Array.from(tokenize(candidate.title)).sort((a, b) => b.length - a.length);
   const anchorToken = tokens[0];
   if (anchorToken) {
     const { data } = await supabase
       .from("listings")
-      .select("id, title")
+      .select("id, title, price, platform")
       .ilike("title", `%${anchorToken}%`)
       .neq("id", excludeListingId ?? "")
       .limit(20);
@@ -176,7 +212,10 @@ export async function checkForDuplicate(
     let best: { id: string; similarity: number } | null = null;
     for (const row of data ?? []) {
       const similarity = titleSimilarity(candidate.title, row.title);
-      if (similarity >= FUZZY_TITLE_MATCH_THRESHOLD && (!best || similarity > best.similarity)) {
+      if (similarity < FUZZY_TITLE_MATCH_THRESHOLD) continue;
+      if (candidate.price !== row.price) continue;
+      if (candidate.platform && row.platform && candidate.platform !== row.platform) continue;
+      if (!best || similarity > best.similarity) {
         best = { id: row.id, similarity };
       }
     }

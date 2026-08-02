@@ -106,20 +106,33 @@ export async function updateProfile(
 
   // Identity data only — fashion preferences live on style_profiles and are
   // written exclusively by the /onboarding flow (src/app/actions/onboarding.ts).
+  //
+  // P0 launch-readiness fix — this used to be a plain `.update()`, which
+  // matches zero rows (and this whole action returns "couldn't be saved")
+  // if a user's profile row genuinely doesn't exist (the handle_new_user()
+  // trigger not having fired, or any other edge case) — unlike
+  // onboarding.ts, which already uses upsert for exactly this reason.
+  // `upsert` with an explicit `id` self-heals a missing row instead of
+  // erroring; the RLS "Profiles are insertable by their owner" policy
+  // (supabase/schema.sql) already allows this, and the column-level UPDATE
+  // grant already covers every field written here.
   const { data, error } = await supabase
     .from("profiles")
-    .update({
-      username,
-      display_name: displayName,
-      bio: bio || null,
-      // Only touched when a new photo was actually uploaded this
-      // submission — omitting the key entirely (rather than setting it to
-      // null) leaves whatever avatar_url already exists untouched when the
-      // user is just editing their name/username/bio.
-      ...(avatarUrl ? { avatar_url: avatarUrl } : {}),
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", user.id)
+    .upsert(
+      {
+        id: user.id,
+        username,
+        display_name: displayName,
+        bio: bio || null,
+        // Only touched when a new photo was actually uploaded this
+        // submission — omitting the key entirely (rather than setting it
+        // to null) leaves whatever avatar_url already exists untouched
+        // when the user is just editing their name/username/bio.
+        ...(avatarUrl ? { avatar_url: avatarUrl } : {}),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "id" },
+    )
     .select("id")
     .single();
 

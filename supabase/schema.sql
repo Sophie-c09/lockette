@@ -492,6 +492,18 @@ alter table public.scraper_jobs add column if not exists insert_failed_count int
 alter table public.scraper_jobs add column if not exists extracted_successfully_count integer not null default 0;
 alter table public.scraper_jobs add column if not exists extraction_failures_by_reason jsonb not null default '{}'::jsonb;
 
+-- P0 launch-readiness fix (scraper reliability) — see supabase/migrations/
+-- 20260801000200_add_scraper_jobs_batch_lease.sql. process-batch/route.ts's
+-- own status check can't prevent two concurrent calls for the SAME job
+-- from both running a batch at once (status stays 'running' across many
+-- sequential calls by design); these two columns back claimBatchLease
+-- (src/lib/scraper-jobs.ts), a short-lived per-attempt mutex with the same
+-- "a stale claim past its expiry is reclaimable" posture as
+-- scraper_url_queue.claimed_at.
+alter table public.scraper_jobs add column if not exists batch_lease_id uuid;
+alter table public.scraper_jobs add column if not exists batch_lease_expires_at timestamptz;
+create index if not exists scraper_jobs_batch_lease_expires_at_idx on public.scraper_jobs (batch_lease_expires_at);
+
 -- Full Style Learning System (src/lib/rejection-learning.ts,
 -- src/lib/positive-learning.ts) — negative-learning signal fields added
 -- to the table already populated by removeListing() rather than a
@@ -1643,6 +1655,13 @@ create unique index if not exists scraper_url_queue_url_idx on public.scraper_ur
 -- here, before that migration).
 create index if not exists scraper_url_queue_status_idx on public.scraper_url_queue (status, created_at);
 
+-- P0 launch-readiness fix — see supabase/migrations/
+-- 20260801000100_add_scraper_url_queue_claimed_at.sql. Staleness used to be
+-- measured against created_at (enqueue time, not claim time); claimed_at is
+-- stamped fresh at the actual moment of claim instead.
+alter table public.scraper_url_queue add column if not exists claimed_at timestamptz;
+create index if not exists scraper_url_queue_status_claimed_at_idx on public.scraper_url_queue (status, claimed_at);
+
 alter table public.scraper_url_queue enable row level security;
 
 drop policy if exists "URL queue is viewable by admins" on public.scraper_url_queue;
@@ -2370,3 +2389,66 @@ alter table public.listings drop constraint if exists listings_status_check;
 alter table public.listings
   add constraint listings_status_check
   check (status in ('active', 'sold', 'unavailable', 'pending', 'flagged', 'rejected', 'removed', 'expired'));
+
+-- ---------------------------------------------------------------------------
+-- P0 launch-readiness fix (dead-listing cleanup) — see
+-- supabase/migrations/20260801000000_add_listing_availability_tracking.sql,
+-- which is what actually applies this against a live database (this file
+-- is the reference document only). check-listing-status/route.ts now
+-- requires several CONSECUTIVE unavailable signals (never a single one)
+-- before actually marking a listing unavailable, and these columns are
+-- what make that possible plus give an admin real data for a manual
+-- restore decision.
+-- ---------------------------------------------------------------------------
+alter table public.listings add column if not exists last_available_at timestamptz;
+alter table public.listings add column if not exists availability_check_count integer not null default 0;
+alter table public.listings add column if not exists consecutive_unavailable_checks integer not null default 0;
+alter table public.listings add column if not exists removal_reason text;
+
+-- ---------------------------------------------------------------------------
+-- P0 launch-readiness fix (inventory quality + duplicate protection,
+-- DB-level backstop) — see supabase/migrations/
+-- 20260801000400_add_listings_active_row_constraints.sql for the full
+-- rationale (conditional on status='active' so the flagging architecture
+-- above isn't broken; NOT VALID so existing rows aren't retroactively
+-- checked; product_url dedup is a PARTIAL unique index scoped to active
+-- rows only, with a pre-dedup step demoting older active duplicates to
+-- 'rejected' first).
+-- ---------------------------------------------------------------------------
+do $$
+begin
+  if not exists (select 1 from pg_constraint where conname = 'listings_active_requires_valid_price') then
+    alter table public.listings
+      add constraint listings_active_requires_valid_price
+      check (status <> 'active' or (price is not null and price > 0))
+      not valid;
+  end if;
+
+  if not exists (select 1 from pg_constraint where conname = 'listings_active_requires_title') then
+    alter table public.listings
+      add constraint listings_active_requires_title
+      check (status <> 'active' or (title is not null and length(trim(title)) > 0))
+      not valid;
+  end if;
+
+  if not exists (select 1 from pg_constraint where conname = 'listings_active_requires_image') then
+    alter table public.listings
+      add constraint listings_active_requires_image
+      check (status <> 'active' or (image_url is not null and length(trim(image_url)) > 0))
+      not valid;
+  end if;
+end $$;
+
+create unique index if not exists listings_active_product_url_unique
+  on public.listings (product_url)
+  where status = 'active';
+
+-- P0 launch-readiness fix (scraper dashboard) — see supabase/migrations/
+-- 20260801000500_add_scraper_jobs_retry_metrics.sql. Schema-readiness only:
+-- not yet written by any application code as of this migration (the live
+-- per-URL data already exists on scraper_url_queue and is already exposed
+-- live via the metrics route — see that route's own permanentlyFailedUrlCount
+-- fix); these columns are for a future durable, point-in-time snapshot on
+-- the job row itself.
+alter table public.scraper_jobs add column if not exists retry_count integer not null default 0;
+alter table public.scraper_jobs add column if not exists permanently_failed_count integer not null default 0;

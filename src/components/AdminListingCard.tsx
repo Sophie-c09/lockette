@@ -15,11 +15,15 @@ function formatCreatedAt(iso: string): string {
 }
 
 function statusLabel(status: ModeratedListing["status"]): string {
-  return status === "flagged" ? "Flagged" : "Approved";
+  if (status === "flagged") return "Flagged";
+  if (status === "unavailable") return "Unavailable";
+  return "Approved";
 }
 
 function statusClass(status: ModeratedListing["status"]): string {
-  return status === "flagged" ? "bg-tag-yellow text-tag-yellow-ink" : "bg-tag-teal text-tag-teal-ink";
+  if (status === "flagged") return "bg-tag-yellow text-tag-yellow-ink";
+  if (status === "unavailable") return "bg-tag-pink text-tag-pink-ink";
+  return "bg-tag-teal text-tag-teal-ink";
 }
 
 function photosFor(listing: Pick<ModeratedListing, "images" | "image_url">): string[] {
@@ -41,6 +45,7 @@ export function AdminListingCard({
   listing,
   onApprove,
   onDelete,
+  onRestore,
   onPhotosSaved,
   onError,
   busy = false,
@@ -48,6 +53,9 @@ export function AdminListingCard({
   listing: ModeratedListing;
   onApprove: () => void;
   onDelete: () => void;
+  // Undoes check-listing-status marking this listing 'unavailable' (or a
+  // past manual removal) — only ever rendered for that status below.
+  onRestore: () => void;
   onPhotosSaved: (images: string[]) => void;
   onError: (message: string) => void;
   busy?: boolean;
@@ -127,6 +135,13 @@ export function AdminListingCard({
           <p className="mt-2 text-xs font-medium text-oxblood">Flagged: {listing.flag_reason}</p>
         )}
 
+        {listing.status === "unavailable" && (
+          <p className="mt-2 text-xs font-medium text-oxblood">
+            Marked unavailable{listing.removal_reason ? `: ${listing.removal_reason}` : ""} — confirm on the source
+            listing before restoring.
+          </p>
+        )}
+
         <div className="mt-4 flex gap-2">
           {listing.status === "flagged" && (
             <button
@@ -136,6 +151,16 @@ export function AdminListingCard({
               className="flex-1 cursor-pointer rounded-pill bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
             >
               Approve
+            </button>
+          )}
+          {listing.status === "unavailable" && (
+            <button
+              type="button"
+              onClick={onRestore}
+              disabled={busy}
+              className="flex-1 cursor-pointer rounded-pill bg-green-600 px-4 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-green-700 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Restore
             </button>
           )}
           <button
