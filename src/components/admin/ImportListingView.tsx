@@ -656,6 +656,12 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       setLargeScalePhase("done");
       window.localStorage.removeItem(LARGE_SCALE_JOB_STORAGE_KEY);
       refreshStats();
+      // Inventory count display fix — the "done" card below shows the
+      // real current total (inventoryStats.totalInventory), not just this
+      // run's own inserted_count, so it must be fresh the moment a run
+      // finishes rather than whatever it was on page load/last manual
+      // "Refresh" click.
+      void refreshInventoryStats();
     } else if (job.status === "paused") {
       setLargeScalePhase("paused");
     } else {
@@ -1995,10 +2001,26 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
               <p className="font-display text-base font-semibold text-ink">
                 {largeScaleJob.status === "failed"
                   ? "Inventory growth run failed"
-                  : `Inventory now at ${largeScaleJob.inserted_count.toLocaleString()} / ${(largeScaleJob.target_count ?? largeScaleTarget).toLocaleString()}`}
+                  : `This run added ${largeScaleJob.inserted_count.toLocaleString()} new listing${largeScaleJob.inserted_count === 1 ? "" : "s"}`}
               </p>
               {largeScaleJob.status === "failed" && largeScaleJob.error_message && (
                 <p className="max-w-sm text-center text-xs text-ink-soft">{largeScaleJob.error_message}</p>
+              )}
+              {largeScaleJob.status !== "failed" && (
+                // Inventory count display fix — inserted_count above is
+                // this RUN's own contribution, not the marketplace's real
+                // size; without this line, a run that (correctly) adds
+                // few or zero new listings because the target is already
+                // met reads as "inventory is nearly empty," when
+                // production may already hold thousands. inventoryStats
+                // is refreshed the moment this run finishes (see
+                // pollLargeScaleJob's refreshInventoryStats() call) so
+                // this reflects the real, current total, not a stale one.
+                <p className="text-sm text-ink-soft">
+                  {inventoryStats
+                    ? `Inventory is now at ${inventoryStats.totalInventory.toLocaleString()} / ${(largeScaleJob.target_count ?? largeScaleTarget).toLocaleString()} total`
+                    : "Loading current inventory total..."}
+                </p>
               )}
               <Button type="button" variant="secondary" onClick={handleLargeScaleStartOver} className="w-fit">
                 Start another run
