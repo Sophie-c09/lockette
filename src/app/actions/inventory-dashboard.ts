@@ -16,7 +16,10 @@ import type { ListingsDatabase } from "@/lib/supabase/listings.types";
 import type { ScraperJobsDatabase } from "@/lib/supabase/scraper-jobs.types";
 
 export interface InventoryIntelligenceStats {
-  totalInventory: number;
+  // null means "unknown" (not yet loaded, or this specific count's own
+  // query failed) — never a stand-in for a real 0. See this file's own
+  // ROOT CAUSE REGRESSION comment below for why this matters.
+  totalInventory: number | null;
   targetInventory: number;
   aiAnalyzedCount: number;
   pendingAiJobs: number;
@@ -36,7 +39,7 @@ export interface InventoryIntelligenceStats {
 }
 
 const EMPTY_STATS: InventoryIntelligenceStats = {
-  totalInventory: 0,
+  totalInventory: null,
   targetInventory: TARGET_INVENTORY_SIZE,
   aiAnalyzedCount: 0,
   pendingAiJobs: 0,
@@ -79,13 +82,25 @@ export async function getInventoryIntelligenceStats(): Promise<{
     createAdminClient<ScraperJobsDatabase>().from("scraper_jobs").select("duplicate_count"),
   ]);
 
-  if (totalResult.error || analyzedResult.error || todayResult.error) {
-    console.error("[inventory-dashboard] Failed to fetch stats:", {
-      totalError: totalResult.error,
-      analyzedError: analyzedResult.error,
-      todayError: todayResult.error,
-    });
-    return { stats: EMPTY_STATS, error: "Failed to load inventory stats." };
+  // ROOT CAUSE REGRESSION FIX — these three queries used to share ONE gate
+  // ("if any of them errored, return EMPTY_STATS for everything"), which
+  // meant a genuinely broken, UNRELATED column (analyzedResult's
+  // visual_analysis — confirmed live: 42703 "column does not exist", the
+  // Inventory Intelligence Layer migration was never actually applied)
+  // blanked totalInventory — a completely healthy query with its own
+  // real count — down to a fake 0. A real production incident: the
+  // Inventory Growth "done" card read "Inventory is now at 0 / 5 total"
+  // while production held ~8,700 real listings. Each count now degrades
+  // independently — one broken column can never take an unrelated,
+  // working count down with it.
+  if (totalResult.error) {
+    console.error("[inventory-dashboard] totalInventory query failed:", totalResult.error);
+  }
+  if (analyzedResult.error) {
+    console.error("[inventory-dashboard] aiAnalyzedCount query failed:", analyzedResult.error);
+  }
+  if (todayResult.error) {
+    console.error("[inventory-dashboard] newListingsToday query failed:", todayResult.error);
   }
 
   const qualityScores = (avgQualityResult.data ?? [])
@@ -101,16 +116,22 @@ export async function getInventoryIntelligenceStats(): Promise<{
 
   return {
     stats: {
-      totalInventory: totalResult.count ?? 0,
+      totalInventory: totalResult.error ? null : totalResult.count ?? 0,
       targetInventory: TARGET_INVENTORY_SIZE,
-      aiAnalyzedCount: analyzedResult.count ?? 0,
+      aiAnalyzedCount: analyzedResult.error ? 0 : analyzedResult.count ?? 0,
       pendingAiJobs: queueStats.pending,
       processingAiJobs: queueStats.processing,
       failedAiJobs: queueStats.failed,
       averageQualityScore: averageQualityScore != null ? Math.round(averageQualityScore * 100) / 100 : null,
-      newListingsToday: todayResult.count ?? 0,
+      newListingsToday: todayResult.error ? 0 : todayResult.count ?? 0,
       expiredListings: lifecycle.expired,
       duplicatesPreventedAtScrapeTime,
     },
+    // Only totalInventory's OWN query failing is surfaced here — that's
+    // the one count the dashboard treats as load-bearing (see
+    // ImportListingView.tsx's done-state card). analyzedResult/
+    // todayResult failing degrades those two fields gracefully (0) above
+    // without flagging the whole fetch as failed.
+    error: totalResult.error ? "Failed to load current inventory total." : undefined,
   };
 }

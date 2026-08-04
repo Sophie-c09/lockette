@@ -214,6 +214,28 @@ export async function POST(request: Request) {
       );
     }
 
+    // Meaningless-run guard — a target at or below the inventory that
+    // already exists has nothing left to do (see currentListingsCount's
+    // own use below for estimatedTotalBatches, which already computes
+    // exactly this comparison; this just refuses to start before that
+    // point rather than silently running one no-op batch and completing
+    // immediately with 0 inserted — the exact "Inventory now at 0 / 5"
+    // confusion this fixes). This is a validation check on the request,
+    // not a scraper-behavior change — nothing about discovery,
+    // extraction, or queue processing is touched.
+    const currentCount = await currentListingsCount();
+    if (targetInventorySize <= currentCount) {
+      return NextResponse.json(
+        {
+          success: false,
+          error: "Your inventory already exceeds this target. Enter a target above the current total.",
+          code: "TARGET_ALREADY_MET",
+          currentCount,
+        },
+        { status: 400 },
+      );
+    }
+
     // Plain object, not the LargeScaleAdminScraperOptions type — this
     // route deliberately never imports @/lib/admin-scraper.ts (see this
     // file's own header comment). checkpointOptions is typed as
@@ -236,7 +258,6 @@ export async function POST(request: Request) {
       aggressiveAcquisition: isAggressive,
     };
 
-    const currentCount = await currentListingsCount();
     const estimatedTotalBatches = Math.min(
       maxBatches,
       Math.max(1, Math.ceil(Math.max(0, targetInventorySize - currentCount) / batchSize)),

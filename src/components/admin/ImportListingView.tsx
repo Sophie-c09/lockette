@@ -705,6 +705,16 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   }, []);
 
   async function handleStartLargeScale() {
+    // Prevent-meaningless-runs fix — defensive re-check even though the
+    // button above is already disabled for this case; the server route
+    // enforces the same rule (TARGET_ALREADY_MET) regardless, so this is
+    // purely to avoid a network round-trip for a request that's already
+    // known to be pointless.
+    if (inventoryStats?.totalInventory != null && largeScaleTarget <= inventoryStats.totalInventory) {
+      setLargeScaleError("Your inventory already exceeds this target. Enter a target above the current total.");
+      return;
+    }
+
     setLargeScalePhase("starting");
     setLargeScaleError(null);
     setLargeScaleJob(null);
@@ -1177,14 +1187,18 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
               <div>
                 <div className="flex items-baseline justify-between text-sm text-ink">
                   <span className="font-semibold">
-                    Inventory: {inventoryStats.totalInventory.toLocaleString()} / {inventoryStats.targetInventory.toLocaleString()}
+                    Inventory: {inventoryStats.totalInventory != null ? inventoryStats.totalInventory.toLocaleString() : "—"} /{" "}
+                    {inventoryStats.targetInventory.toLocaleString()}
                   </span>
                 </div>
                 <div className="mt-1.5 h-2 w-full overflow-hidden rounded-pill bg-inner">
                   <div
                     className="h-full rounded-pill bg-oxblood transition-all duration-500 ease-out"
                     style={{
-                      width: `${Math.min(100, Math.round((inventoryStats.totalInventory / Math.max(1, inventoryStats.targetInventory)) * 100))}%`,
+                      width:
+                        inventoryStats.totalInventory != null
+                          ? `${Math.min(100, Math.round((inventoryStats.totalInventory / Math.max(1, inventoryStats.targetInventory)) * 100))}%`
+                          : "0%",
                     }}
                   />
                 </div>
@@ -1747,6 +1761,16 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
             <div className="flex w-full max-w-xs flex-col gap-3">
               <label className="flex flex-col gap-1 text-left text-sm text-ink">
                 Target inventory size
+                {/* Prevent-meaningless-runs fix — shown right next to the
+                    input the admin is about to set a target in, so
+                    there's no need to cross-reference the Inventory
+                    Intelligence card above to know whether a given
+                    target is even worth running. */}
+                <span className="text-xs font-normal text-ink-soft">
+                  {inventoryStats?.totalInventory != null
+                    ? `Current total: ${inventoryStats.totalInventory.toLocaleString()} listings`
+                    : "Current total: unavailable"}
+                </span>
                 <input
                   type="number"
                   min={1}
@@ -1820,7 +1844,21 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                   ? "Discovery and extraction run concurrently against scraper_url_queue, AI enrichment is deferred to the background queue, and eBay is skipped until it has a working strategy — maximizes raw import throughput."
                   : "Discovery runs a full pass before extraction starts, same as an ordinary batch."}
               </p>
-              <Button type="button" onClick={handleStartLargeScale} className="w-fit self-center">
+              {/* Prevent-meaningless-runs fix — client-side half of the
+                  same check the start route now also enforces
+                  server-side (TARGET_ALREADY_MET); this is just the
+                  earlier, no-network-round-trip warning. */}
+              {inventoryStats?.totalInventory != null && largeScaleTarget <= inventoryStats.totalInventory && (
+                <p className="text-xs text-oxblood">
+                  Your inventory already exceeds this target. Enter a target above the current total.
+                </p>
+              )}
+              <Button
+                type="button"
+                onClick={handleStartLargeScale}
+                disabled={inventoryStats?.totalInventory != null && largeScaleTarget <= inventoryStats.totalInventory}
+                className="w-fit self-center"
+              >
                 Start Inventory Growth
               </Button>
             </div>
@@ -2007,20 +2045,40 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                 <p className="max-w-sm text-center text-xs text-ink-soft">{largeScaleJob.error_message}</p>
               )}
               {largeScaleJob.status !== "failed" && (
-                // Inventory count display fix — inserted_count above is
-                // this RUN's own contribution, not the marketplace's real
-                // size; without this line, a run that (correctly) adds
-                // few or zero new listings because the target is already
-                // met reads as "inventory is nearly empty," when
-                // production may already hold thousands. inventoryStats
-                // is refreshed the moment this run finishes (see
-                // pollLargeScaleJob's refreshInventoryStats() call) so
-                // this reflects the real, current total, not a stale one.
-                <p className="text-sm text-ink-soft">
-                  {inventoryStats
-                    ? `Inventory is now at ${inventoryStats.totalInventory.toLocaleString()} / ${(largeScaleJob.target_count ?? largeScaleTarget).toLocaleString()} total`
-                    : "Loading current inventory total..."}
-                </p>
+                <>
+                  {/* Inventory count display fix — ROOT CAUSE REGRESSION:
+                      this used to render `inventoryStats.totalInventory`
+                      unconditionally the moment inventoryStats was
+                      non-null, which is also exactly the shape a FAILED
+                      request returns (EMPTY_STATS, totalInventory: null
+                      — see inventory-dashboard.ts's own comment on why
+                      that used to be a fake 0). A null totalInventory
+                      here means "unknown right now," never "zero
+                      listings" — the three branches below are the only
+                      three real states: still loading (never got a
+                      value yet), loaded but this specific count's own
+                      query failed (never got a value, and won't retry on
+                      its own), or a genuine number. A PREVIOUS valid
+                      number is always preferred over either loading/
+                      failed text while a refresh is in flight, so the
+                      real total never disappears just because a new
+                      fetch started. */}
+                  <p className="text-sm text-ink-soft">
+                    {inventoryStats?.totalInventory != null
+                      ? `Current inventory: ${inventoryStats.totalInventory.toLocaleString()} listing${inventoryStats.totalInventory === 1 ? "" : "s"}${inventoryStatsLoading ? " (refreshing…)" : ""}.`
+                      : inventoryStatsLoading
+                        ? "Refreshing inventory total…"
+                        : "Current inventory total is temporarily unavailable."}
+                  </p>
+                  <p className="text-xs text-ink-soft">
+                    Run target: {(largeScaleJob.target_count ?? largeScaleTarget).toLocaleString()} listing
+                    {(largeScaleJob.target_count ?? largeScaleTarget) === 1 ? "" : "s"}
+                    {inventoryStats?.totalInventory != null &&
+                    inventoryStats.totalInventory >= (largeScaleJob.target_count ?? largeScaleTarget)
+                      ? " — already met by the existing inventory."
+                      : "."}
+                  </p>
+                </>
               )}
               <Button type="button" variant="secondary" onClick={handleLargeScaleStartOver} className="w-fit">
                 Start another run
