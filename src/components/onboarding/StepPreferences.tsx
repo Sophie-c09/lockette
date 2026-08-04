@@ -7,30 +7,7 @@ import {
   COLOR_OPTIONS,
   SIZE_OPTIONS,
 } from "@/lib/onboarding-data";
-
-function Chip({
-  label,
-  selected,
-  onClick,
-}: {
-  label: string;
-  selected: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`cursor-pointer rounded-pill border px-4 py-2 text-sm font-medium transition-colors ${
-        selected
-          ? "border-oxblood bg-oxblood text-parchment"
-          : "border-border bg-surface text-ink-soft hover:border-oxblood/60"
-      }`}
-    >
-      {label}
-    </button>
-  );
-}
+import { Chip } from "@/components/ui/Chip";
 
 export function StepPreferences({
   size,

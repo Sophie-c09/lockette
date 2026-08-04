@@ -286,8 +286,6 @@ export async function submitOutfitRecreation(
       data: { user },
     } = await supabase.auth.getUser();
 
-    console.log("[outfit-recreations] user:", user);
-
     if (!user) {
       // Do NOT attempt the insert — an RLS policy check (auth.uid() =
       // user_id) can never pass without a real authenticated user, and a

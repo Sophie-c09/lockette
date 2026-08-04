@@ -47,9 +47,25 @@ export interface FulfillmentOrder {
   totalAmount: number;
   refundedAmount: number;
   processingStartedAt: string | null;
-  // Payment infrastructure only — see src/lib/payment.ts. Nothing in this
-  // dashboard triggers a payment transition yet; this is purely a badge.
-  paymentStatus: "unpaid" | "authorized" | "captured" | "failed" | "refunded";
+  // Real Stripe payment system — see src/lib/payment.ts. Nothing in this
+  // dashboard triggers a payment transition itself; this is purely a
+  // badge. The first group (unpaid/authorized/captured/failed) are
+  // historical values from the old fake-payment flow, kept only so old
+  // orders still display correctly — new orders only ever use the second
+  // group (pending/awaiting_payment/processing/paid/payment_failed/
+  // canceled/refunded is shared by both eras).
+  paymentStatus:
+    | "unpaid"
+    | "authorized"
+    | "captured"
+    | "failed"
+    | "refunded"
+    | "pending"
+    | "awaiting_payment"
+    | "processing"
+    | "paid"
+    | "payment_failed"
+    | "canceled";
   createdAt: string;
   items: FulfillmentItem[];
 }
@@ -60,6 +76,12 @@ const PAYMENT_BADGES: Record<FulfillmentOrder["paymentStatus"], string> = {
   captured: "✅ Paid",
   failed: "⚠️ Failed",
   refunded: "↩️ Refunded",
+  pending: "💳 Unpaid",
+  awaiting_payment: "⏳ Awaiting payment",
+  processing: "⏳ Processing",
+  paid: "✅ Paid",
+  payment_failed: "⚠️ Failed",
+  canceled: "✖️ Canceled",
 };
 
 type SortMode = "newest" | "oldest-pending" | "urgency";

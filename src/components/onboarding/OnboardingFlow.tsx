@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "motion/react";
 import { Button } from "@/components/ui/Button";
 import { StepAesthetics } from "./StepAesthetics";
-import { StepBrands } from "./StepBrands";
+import { StepBrands, MIN_BRANDS_REQUIRED } from "./StepBrands";
 import { StepPreferences } from "./StepPreferences";
 import { StepComplete } from "./StepComplete";
 import { saveOnboarding } from "@/app/actions/onboarding";
@@ -56,6 +56,10 @@ export function OnboardingFlow({
   const hasSavedRef = useRef(false);
 
   const isComplete = step === FORM_STEPS;
+  // P0 first-60-seconds fix (item 9) — "user must choose at least five
+  // brands." Only actually gates the Brands step (step 1) itself; other
+  // steps are unaffected regardless of how many brands are selected.
+  const isBrandsStepBelowMinimum = step === 1 && brands.length < MIN_BRANDS_REQUIRED;
 
   function goNext() {
     setDirection(1);
@@ -160,17 +164,27 @@ export function OnboardingFlow({
       </AnimatePresence>
 
       {!isComplete && (
-        <div className="mx-auto mt-10 flex max-w-2xl items-center justify-between">
-          <Button
-            variant="ghost"
-            onClick={goBack}
-            className={step === 0 ? "invisible" : ""}
-          >
-            Back
-          </Button>
-          <Button onClick={goNext}>
-            {step === FORM_STEPS - 1 ? "Finish" : "Continue"}
-          </Button>
+        <div className="mx-auto mt-10 flex max-w-2xl flex-col items-center gap-2">
+          <div className="flex w-full items-center justify-between">
+            <Button
+              variant="ghost"
+              onClick={goBack}
+              className={step === 0 ? "invisible" : ""}
+            >
+              Back
+            </Button>
+            <Button
+              onClick={goNext}
+              disabled={isBrandsStepBelowMinimum}
+            >
+              {step === FORM_STEPS - 1 ? "Finish" : "Continue"}
+            </Button>
+          </div>
+          {isBrandsStepBelowMinimum && (
+            <p className="text-xs text-ink-soft">
+              Choose at least {MIN_BRANDS_REQUIRED} brands to continue.
+            </p>
+          )}
         </div>
       )}
     </div>

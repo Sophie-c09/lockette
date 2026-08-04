@@ -4,14 +4,30 @@ import { useActionState } from "react";
 import Link from "next/link";
 import { signUp, type AuthFormState } from "@/app/actions/auth";
 import { Button } from "@/components/ui/Button";
+import { AppleSignInButton } from "@/components/auth/AppleSignInButton";
+import { GoogleSignInButton } from "@/components/auth/GoogleSignInButton";
 
 const initialState: AuthFormState = undefined;
 
-export function SignUpForm() {
+// redirectTo mirrors LoginForm's own prop — /signup has no current caller
+// that sets one (proxy.ts only ever bounces to /login), but the button
+// itself supports it for consistency/forward-compatibility rather than
+// diverging from LoginForm's contract.
+export function SignUpForm({ redirectTo }: { redirectTo?: string } = {}) {
   const [state, formAction, pending] = useActionState(signUp, initialState);
 
   return (
-    <form action={formAction} className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5">
+      <AppleSignInButton redirectTo={redirectTo} />
+      <GoogleSignInButton />
+
+      <div className="flex items-center gap-3 text-xs font-medium text-ink-soft">
+        <span className="h-px flex-1 bg-border" />
+        or continue with email
+        <span className="h-px flex-1 bg-border" />
+      </div>
+
+      <form action={formAction} className="flex flex-col gap-5">
       <div>
         <label
           htmlFor="name"
@@ -97,6 +113,7 @@ export function SignUpForm() {
           Sign in
         </Link>
       </p>
-    </form>
+      </form>
+    </div>
   );
 }

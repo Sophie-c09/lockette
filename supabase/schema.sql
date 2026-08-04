@@ -669,7 +669,15 @@ create table if not exists public.cart_items (
 
 create table if not exists public.orders (
   id uuid primary key default gen_random_uuid(),
-  user_id uuid not null references public.profiles (id) on delete cascade,
+  -- Nullable + "on delete set null" (not the original "not null ... on
+  -- delete cascade") — see 20260802160100_add_orders_retention_support.sql.
+  -- A paid order's transaction record must survive account deletion (tax/
+  -- fraud/dispute/accounting reasons); the account-deletion server action
+  -- explicitly anonymizes (nulls this column itself) any order it needs
+  -- to retain, and explicitly deletes unpaid orders, before ever deleting
+  -- the auth user — this constraint is the safety net if that ordering is
+  -- ever violated, not the primary mechanism.
+  user_id uuid references public.profiles (id) on delete set null,
   status text not null default 'pending_purchase',
   total_amount numeric not null default 0,
   shipping_address jsonb,
@@ -685,11 +693,14 @@ create table if not exists public.orders (
   -- stamped once, the first time they view /orders/[id]. Not wired to any
   -- actual notification (email/push) yet.
   customer_notified_at timestamptz,
-  -- Payment infrastructure only — see src/lib/payment.ts. No real
-  -- payment gateway is connected yet; these exist so that integration
-  -- (whenever it happens) doesn't require another schema change.
+  -- Real Stripe payment system — see src/lib/payment.ts. payment_status
+  -- values below split into two groups: the original fake-payment-era
+  -- values (unpaid/authorized/captured/failed/refunded, kept only so
+  -- historical rows stay valid) and the truthful ones real checkout now
+  -- writes (pending/awaiting_payment/processing/paid/payment_failed/
+  -- canceled/refunded) — see 20260802160000_add_stripe_payment_system.sql.
   payment_status text not null default 'unpaid',
-  payment_provider_id text,
+  stripe_payment_intent_id text,
   payment_authorized_at timestamptz,
   -- Set (now + 5 minutes) whenever an automatic capturePayment() attempt
   -- fails — see syncOrderStatus in src/lib/orderLifecycle.ts. Read by
@@ -698,7 +709,27 @@ create table if not exists public.orders (
   -- left stale (never cleared) once payment_status moves past
   -- "authorized" — harmless, since retryPendingCaptures() only ever
   -- queries orders still "authorized" in the first place.
+  --
+  -- Deprecated alongside the old manual-capture flow both of these
+  -- supported (see the payment-system pass's own report) — no longer
+  -- written to by new code, kept only so old rows aren't dropped.
   capture_retry_at timestamptz,
+  -- Cents-based, integer amounts — what Stripe itself works in, and what
+  -- new code treats as authoritative (never a client-submitted total).
+  -- total_amount above is still kept in sync for every existing reader
+  -- (admin dashboard, order-analytics.ts, notifications).
+  amount_subtotal_cents integer,
+  service_fee_cents integer,
+  shipping_cents integer,
+  amount_total_cents integer,
+  currency text not null default 'usd',
+  -- Only ever stamped by the Stripe webhook (src/app/api/stripe/webhook/
+  -- route.ts) — the sole source of truth for "the customer was actually
+  -- charged," never a client callback.
+  paid_at timestamptz,
+  payment_failure_code text,
+  payment_failure_message text,
+  refunded_at timestamptz,
   created_at timestamptz not null default now()
 );
 
@@ -706,20 +737,66 @@ alter table public.orders add column if not exists refunded_amount numeric not n
 alter table public.orders add column if not exists processing_started_at timestamptz;
 alter table public.orders add column if not exists customer_notified_at timestamptz;
 alter table public.orders add column if not exists payment_status text not null default 'unpaid';
-alter table public.orders add column if not exists payment_provider_id text;
 alter table public.orders add column if not exists payment_authorized_at timestamptz;
 alter table public.orders add column if not exists capture_retry_at timestamptz;
 
 do $$
 begin
-  if not exists (
-    select 1 from pg_constraint where conname = 'orders_payment_status_check'
+  if exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'orders' and column_name = 'payment_provider_id'
+  ) and not exists (
+    select 1 from information_schema.columns
+    where table_schema = 'public' and table_name = 'orders' and column_name = 'stripe_payment_intent_id'
   ) then
-    alter table public.orders
-      add constraint orders_payment_status_check
-      check (payment_status in ('unpaid', 'authorized', 'captured', 'failed', 'refunded'));
+    alter table public.orders rename column payment_provider_id to stripe_payment_intent_id;
   end if;
 end $$;
+alter table public.orders add column if not exists stripe_payment_intent_id text;
+
+alter table public.orders add column if not exists amount_subtotal_cents integer;
+alter table public.orders add column if not exists service_fee_cents integer;
+alter table public.orders add column if not exists shipping_cents integer;
+alter table public.orders add column if not exists amount_total_cents integer;
+alter table public.orders add column if not exists currency text not null default 'usd';
+alter table public.orders add column if not exists paid_at timestamptz;
+alter table public.orders add column if not exists payment_failure_code text;
+alter table public.orders add column if not exists payment_failure_message text;
+alter table public.orders add column if not exists refunded_at timestamptz;
+
+-- Widened, not narrowed — see this table's own column comment above.
+alter table public.orders drop constraint if exists orders_payment_status_check;
+alter table public.orders add constraint orders_payment_status_check
+  check (payment_status in (
+    'unpaid', 'authorized', 'captured', 'failed', 'refunded',
+    'pending', 'awaiting_payment', 'processing', 'paid', 'payment_failed', 'canceled'
+  ));
+
+-- Account deletion support — see this table's own user_id column comment.
+do $$
+begin
+  if exists (
+    select 1 from pg_constraint where conname = 'orders_user_id_fkey'
+  ) then
+    alter table public.orders drop constraint orders_user_id_fkey;
+  end if;
+end $$;
+alter table public.orders alter column user_id drop not null;
+alter table public.orders add constraint orders_user_id_fkey
+  foreign key (user_id) references public.profiles (id) on delete set null;
+
+-- Webhook idempotency — Stripe explicitly documents the same event can be
+-- delivered more than once; recording each processed event.id here lets
+-- the webhook route no-op a duplicate delivery instead of double-applying
+-- it. No RLS policies (same convention as every other service-role-only
+-- table in this file) — only the webhook route's service-role client ever
+-- touches this table.
+create table if not exists public.stripe_webhook_events (
+  id text primary key,
+  type text not null,
+  processed_at timestamptz not null default now()
+);
+alter table public.stripe_webhook_events enable row level security;
 
 do $$
 begin
@@ -953,6 +1030,14 @@ alter table public.styled_bundles add column if not exists generation_error text
 -- these say how far along.
 alter table public.styled_bundles add column if not exists generation_step text;
 alter table public.styled_bundles add column if not exists generation_progress integer not null default 0;
+
+-- Retry support (retryBundleGeneration, src/app/actions/style-requests.ts)
+-- — attempt_count is incremented on every retry (capped, see that
+-- action's own MAX_GENERATION_ATTEMPTS) and last_attempt_at is stamped
+-- on every attempt (initial generation included), so a stuck/failed
+-- bundle's history is inspectable without a separate audit table.
+alter table public.styled_bundles add column if not exists attempt_count integer not null default 0;
+alter table public.styled_bundles add column if not exists last_attempt_at timestamptz;
 
 create table if not exists public.styled_bundle_items (
   id uuid primary key default gen_random_uuid(),

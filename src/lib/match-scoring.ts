@@ -8,6 +8,7 @@
 // tags with no Style DNA/onboarding component at all) — all three pages
 // read the same `listings` table but score it differently on purpose.
 import { assessListingAgainstDislikedStyles, type DislikedStyles } from "@/lib/disliked-styles";
+import { normalizeMatchPercentForDisplay } from "@/lib/match-percent-display";
 
 // Strips a leading "#" in addition to the usual trim+lowercase: real
 // listing.aesthetic_tags are hashtag-prefixed (e.g. "#Y2K", set by
@@ -131,15 +132,6 @@ export interface MatchScoreBreakdown {
   // listing.
   dislikePenalty: number;
   total: number;
-}
-
-function debugLogScore(breakdown: MatchScoreBreakdown): void {
-  console.log("[match-score]");
-  console.log(`styleScore: ${breakdown.styleScore}`);
-  console.log(`onboardingScore: ${breakdown.onboardingScore}`);
-  console.log(`likesScore: ${breakdown.likesScore}`);
-  console.log(`dislikePenalty: ${breakdown.dislikePenalty}`);
-  console.log(`total: ${breakdown.total}`);
 }
 
 // A) Style DNA match (0-50): +10 per distinct tag shared between the
@@ -300,9 +292,7 @@ export function scoreListingMatch(inputs: MatchScoreInputs): MatchScoreBreakdown
 
   const clamped = Math.max(0, Math.min(100, Math.round(total)));
 
-  const breakdown = { styleScore, onboardingScore, likesScore, dislikePenalty, total: clamped };
-  debugLogScore(breakdown);
-  return breakdown;
+  return { styleScore, onboardingScore, likesScore, dislikePenalty, total: clamped };
 }
 
 /**
@@ -332,15 +322,6 @@ export function attachMatchPercent<
   },
 ): (T & { matchPercent: number })[] {
   return listings.map((listing) => {
-    // Required debug visibility into what's actually flowing into the
-    // scorer for this listing, before scoring runs — makes it obvious at a
-    // glance if any of these three inputs is unexpectedly empty.
-    console.log("[match-debug]", {
-      listingTags: listing.aesthetic_tags,
-      styleTags: options.stylePreferences,
-      likedTags: options.topLikedTags,
-    });
-
     const { total } = scoreListingMatch({
       listingTags: listing.aesthetic_tags,
       listingBrand: listing.brand,
@@ -356,6 +337,6 @@ export function attachMatchPercent<
       dislikedStyles: options.dislikedStyles,
       now: options.now,
     });
-    return { ...listing, matchPercent: total };
+    return { ...listing, matchPercent: normalizeMatchPercentForDisplay(total) };
   });
 }

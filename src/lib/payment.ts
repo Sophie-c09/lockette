@@ -1,280 +1,349 @@
 "use server";
 
-// Payment service layer. Stripe is now genuinely wired in (manual-capture
-// PaymentIntents) behind the exact same public interface this file always
-// had — authorizePayment/capturePayment/refundPayment still take just an
-// orderId and return { success, paymentStatus }, so nothing that calls
-// these (admin UI, future integrations) needs to change. capturePayment's
-// actual Stripe-plus-DB logic also lives behind capturePaymentInternal, a
-// second, trusted-caller-only entry point with no cookie/session
-// dependency — see its own doc comment for why (src/lib/paymentRetry.ts
-// needs to capture payments with no user session available at all).
+// Real Stripe payment system. Replaces the old fake flow, which called
+// stripe.paymentIntents.create() with no payment_method ever attached
+// (PaymentForm.tsx was a fully disabled placeholder) and then blindly
+// stamped payment_status = "authorized" regardless of what Stripe actually
+// returned — every order was marked "Payment secured" without a real card
+// ever being charged.
 //
-// Every Stripe call is wrapped in try/catch: this file must NEVER throw —
-// a Stripe outage or a bad/missing STRIPE_SECRET_KEY degrades to
-// { success: false, paymentStatus: "failed" }, never an unhandled
-// rejection. createOrder.ts calls authorizePayment immediately after every
-// order it creates (best-effort, itself wrapped in a try/catch there too)
-// so most orders arrive already authorized — a Stripe failure there just
-// leaves the order's payment_status at "unpaid" instead of blocking
-// checkout. capturePayment/refundPayment are the separate, later steps an
-// admin triggers (or, for capture, the retry sweep triggers automatically
-// via capturePaymentInternal).
+// Standard automatic-capture PaymentIntents (Stripe's default — no
+// capture_method override): the customer is genuinely charged the moment
+// they confirm payment with the Payment Element, not on some later
+// admin-triggered "capture" step. The old manual-capture/authorize-then-
+// capture-later architecture never actually worked (no card was ever
+// attached, so nothing was ever really authorized) — see
+// src/lib/orderLifecycle.ts and the deleted src/lib/paymentRetry.ts for
+// what it used to do. Order-level FULFILLMENT tracking (order_items'
+// pending_purchase/securing/purchased/failed_unavailable states, and
+// orders.status's own pending_purchase/processing/completed lifecycle —
+// both untouched, unrelated systems) is completely separate from payment
+// and is not affected by this file at all.
+//
+// The Stripe webhook (src/app/api/stripe/webhook/route.ts) is the ONLY
+// writer of payment_status = "paid"/"payment_failed"/"canceled"/
+// "refunded" — every function below either creates/updates a PaymentIntent
+// (which only ever leaves it at "pending"/"awaiting_payment") or issues an
+// admin-triggered refund request (which leaves the actual "refunded"
+// stamp to the webhook's own charge.refunded handling). No function here,
+// and no client code anywhere, can mark an order paid.
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
-import { stripe } from "@/lib/stripe";
+import { stripe, requireStripeConfigured } from "@/lib/stripe";
+import { calculateCartTotal } from "@/lib/pricing";
 
-export type PaymentStatus = "unpaid" | "authorized" | "captured" | "failed" | "refunded";
-
-export interface PaymentResult {
-  success: boolean;
-  paymentStatus: string;
-}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching createClient()'s own untyped default (see supabase/server.ts)
+type AnySupabase = SupabaseClient<any>;
 
 function toSafeNumber(value: unknown): number {
   const num = Number(value ?? 0);
   return Number.isFinite(num) ? num : 0;
 }
 
-// capturePayment/refundPayment are admin-gated (see spec's SECURITY
-// section: only admins can move money further once a hold exists).
-// authorizePayment has its own, more permissive check below — it's the
-// one payment action a customer's own checkout session legitimately
-// triggers itself.
-async function requireAdmin(): Promise<{ error?: string }> {
+function toCents(dollars: number): number {
+  return Math.round(dollars * 100);
+}
+
+export interface OrderAmount {
+  amountSubtotalCents: number;
+  serviceFeeCents: number;
+  shippingCents: number;
+  amountTotalCents: number;
+  currency: string;
+}
+
+// The server-side price authority this whole system depends on: never
+// trusts a client-submitted total, always recomputes from this order's
+// OWN order_items rows, using the exact same fee calculation
+// (calculateCartTotal) Cart/Checkout already display to the customer, so
+// what Stripe charges can never drift from what was shown. Items already
+// marked "failed_unavailable" (sold out before Lockette could secure them
+// — a fulfillment-side outcome, unrelated to payment) are excluded: a
+// customer should never pay for something that was never actually
+// available. Returns null for an order with nothing payable (empty order,
+// or every item already failed) — every caller below treats that as a
+// hard stop, never a $0 charge.
+async function computeTrustedOrderAmount(supabase: AnySupabase, orderId: string): Promise<OrderAmount | null> {
+  const { data: items, error } = await supabase
+    .from("order_items")
+    .select("price, shipping_cost, status")
+    .eq("order_id", orderId);
+
+  if (error) {
+    console.error("[payment] Failed to fetch order_items for pricing:", error);
+    return null;
+  }
+
+  const payableItems = (items ?? []).filter((item) => item.status !== "failed_unavailable");
+  if (payableItems.length === 0) return null;
+
+  const { subtotal, fee, total } = calculateCartTotal(payableItems.map((item) => ({ price: toSafeNumber(item.price) })));
+  const shippingDollars = payableItems.reduce((sum, item) => sum + toSafeNumber(item.shipping_cost), 0);
+
+  return {
+    amountSubtotalCents: toCents(subtotal),
+    serviceFeeCents: toCents(fee),
+    shippingCents: toCents(shippingDollars),
+    amountTotalCents: toCents(total + shippingDollars),
+    currency: "usd",
+  };
+}
+
+// Statuses under which an order is not yet paid and not in a terminal
+// failure/cancellation state — the only states a PaymentIntent may
+// legitimately be created or reused for.
+const PAYABLE_STATUSES = new Set(["unpaid", "pending", "awaiting_payment", "processing", "payment_failed"]);
+const PAID_STATUSES = new Set(["authorized", "captured", "paid"]);
+
+export type PaymentIntentResult =
+  | {
+      clientSecret: string;
+      amountSubtotalCents: number;
+      serviceFeeCents: number;
+      shippingCents: number;
+      amountTotalCents: number;
+      currency: string;
+    }
+  | { error: string };
+
+/**
+ * The protected server action Task 1 calls for: verifies the
+ * authenticated user, verifies ownership, recomputes the trusted amount
+ * from the database, and creates (or reuses/updates) exactly ONE
+ * PaymentIntent for this order. Safe to call repeatedly — a duplicate
+ * click, a page refresh mid-checkout, or a re-render never creates a
+ * second PaymentIntent; it retrieves the existing one and only updates
+ * its amount if the trusted total has actually changed since it was
+ * created (e.g. an item was marked unavailable in the interim), so the
+ * amount the customer is about to confirm on the Payment Element is
+ * always the current, correct one — never a stale cached total.
+ *
+ * Returns only a client secret and safe display data (never the raw
+ * PaymentIntent, never anything from Stripe that isn't needed to render
+ * the payment form) — matches this file's "never trust/leak more than
+ * necessary" posture throughout.
+ */
+export async function createOrReusePaymentIntent(orderId: string): Promise<PaymentIntentResult> {
+  try {
+    requireStripeConfigured();
+  } catch (error) {
+    console.error("[payment] Stripe not configured:", error);
+    return { error: "Payments are temporarily unavailable. Please try again shortly." };
+  }
+
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return { error: "Sign in to continue." };
+  }
+
+  const { data: order, error: orderError } = await supabase
+    .from("orders")
+    .select("id, user_id, payment_status, stripe_payment_intent_id")
+    .eq("id", orderId)
+    .maybeSingle();
+
+  if (orderError || !order) {
+    return { error: "This order could not be found." };
+  }
+
+  // Ownership only — no admin bypass. Paying for an order is the
+  // customer's own action; an admin never has legitimate reason to pay on
+  // someone else's behalf.
+  if (order.user_id !== user.id) {
+    return { error: "This order could not be found." };
+  }
+
+  if (PAID_STATUSES.has(order.payment_status) || order.payment_status === "refunded") {
+    return { error: "This order has already been paid." };
+  }
+
+  if (!PAYABLE_STATUSES.has(order.payment_status)) {
+    return { error: "This order can no longer be paid." };
+  }
+
+  const amount = await computeTrustedOrderAmount(supabase, orderId);
+  if (!amount || amount.amountTotalCents <= 0) {
+    return { error: "This order has no items available to pay for." };
+  }
+
+  let clientSecret: string | null = null;
+
+  if (order.stripe_payment_intent_id) {
+    // Reuse — prevents a duplicate PaymentIntent on a repeated click,
+    // page refresh, or re-render. Only ever updates the amount (never
+    // creates a second intent) if the trusted total actually changed.
+    try {
+      const existing = await stripe.paymentIntents.retrieve(order.stripe_payment_intent_id);
+
+      if (existing.status === "succeeded" || existing.status === "canceled") {
+        // The PaymentIntent itself has already moved on (e.g. the webhook
+        // for a success/cancellation hasn't been reflected in this row
+        // yet, or Stripe canceled it independently) — fall through to
+        // create a fresh one rather than handing back a client secret
+        // that can never be confirmed again.
+      } else {
+        if (existing.amount !== amount.amountTotalCents || existing.currency !== amount.currency) {
+          const updated = await stripe.paymentIntents.update(order.stripe_payment_intent_id, {
+            amount: amount.amountTotalCents,
+            currency: amount.currency,
+            metadata: { order_id: orderId, user_id: user.id },
+          });
+          clientSecret = updated.client_secret;
+        } else {
+          clientSecret = existing.client_secret;
+        }
+      }
+    } catch (error) {
+      console.error("[payment] Failed to retrieve/update existing PaymentIntent, creating a new one:", error);
+    }
+  }
+
+  if (!clientSecret) {
+    try {
+      const intent = await stripe.paymentIntents.create(
+        {
+          amount: amount.amountTotalCents,
+          currency: amount.currency,
+          metadata: { order_id: orderId, user_id: user.id },
+          automatic_payment_methods: { enabled: true },
+        },
+        // Idempotency key tied to the order — a genuinely simultaneous
+        // double-submit (e.g. a double-click before React state disables
+        // the button) that races past the stripe_payment_intent_id reuse
+        // check above still can't create two PaymentIntents for the same
+        // order; Stripe itself collapses concurrent requests with the
+        // same key into one.
+        { idempotencyKey: `order-${orderId}-create-payment-intent` },
+      );
+      clientSecret = intent.client_secret;
+
+      const { error: updateError } = await supabase
+        .from("orders")
+        .update({ stripe_payment_intent_id: intent.id })
+        .eq("id", orderId);
+
+      if (updateError) {
+        console.error("[payment] Failed to persist stripe_payment_intent_id:", updateError);
+      }
+    } catch (error) {
+      console.error("[payment] Stripe PaymentIntent creation failed:", error);
+      return { error: "We couldn't start payment for this order. Please try again." };
+    }
+  }
+
+  if (!clientSecret) {
+    return { error: "We couldn't start payment for this order. Please try again." };
+  }
+
+  // awaiting_payment is purely informational (lets the admin dashboard and
+  // any future customer-facing order list show "waiting on the customer"
+  // rather than a bare "unpaid"/"pending") — the webhook, never this
+  // function, is what ever moves payment_status to "paid".
+  if (order.payment_status === "unpaid" || order.payment_status === "pending") {
+    const { error: statusError } = await supabase
+      .from("orders")
+      .update({
+        payment_status: "awaiting_payment",
+        amount_subtotal_cents: amount.amountSubtotalCents,
+        service_fee_cents: amount.serviceFeeCents,
+        shipping_cents: amount.shippingCents,
+        amount_total_cents: amount.amountTotalCents,
+        currency: amount.currency,
+      })
+      .eq("id", orderId);
+
+    if (statusError) {
+      console.error("[payment] Failed to stamp awaiting_payment state:", statusError);
+    }
+  } else {
+    // Re-fetched/updated amount on a repeat call — keep the stored
+    // breakdown in sync even when payment_status itself doesn't change.
+    const { error: amountError } = await supabase
+      .from("orders")
+      .update({
+        amount_subtotal_cents: amount.amountSubtotalCents,
+        service_fee_cents: amount.serviceFeeCents,
+        shipping_cents: amount.shippingCents,
+        amount_total_cents: amount.amountTotalCents,
+        currency: amount.currency,
+      })
+      .eq("id", orderId);
+
+    if (amountError) {
+      console.error("[payment] Failed to refresh stored amount breakdown:", amountError);
+    }
+  }
+
+  return {
+    clientSecret,
+    amountSubtotalCents: amount.amountSubtotalCents,
+    serviceFeeCents: amount.serviceFeeCents,
+    shippingCents: amount.shippingCents,
+    amountTotalCents: amount.amountTotalCents,
+    currency: amount.currency,
+  };
+}
+
+export interface PaymentResult {
+  success: boolean;
+  paymentStatus: string;
+}
+
+/**
+ * Admin-only. Issues a Stripe refund request against the order's
+ * PaymentIntent. Deliberately does NOT write payment_status = "refunded"
+ * itself — the webhook's charge.refunded handling is the single source of
+ * truth for that transition (src/app/api/stripe/webhook/route.ts), same
+ * "Stripe confirms, then the DB reflects it" principle as payment success
+ * itself. A { success: true } here means Stripe accepted the refund
+ * request, not that the DB has caught up yet.
+ *
+ * No admin UI calls this yet (see this feature's own report — refunds can
+ * be initiated directly in the Stripe Dashboard in the meantime); kept
+ * here, correct and ready, for whenever a refund action is added.
+ */
+export async function refundPayment(orderId: string): Promise<PaymentResult> {
   const supabase = await createClient();
   const {
     data: { user },
   } = await supabase.auth.getUser();
 
   if (!user || !(await isCurrentUserAdmin(supabase, user.id))) {
-    return { error: "Not authorized." };
-  }
-
-  return {};
-}
-
-// Reads just enough of an order to drive the Stripe call — never throws;
-// a missing/misconfigured payment_status/payment_provider_id column (this
-// infrastructure not having been migrated onto the live DB yet) surfaces
-// as `null` here, same as an order that simply doesn't exist, so every
-// caller's existing "fail softly if not found" branch already covers it
-// without needing a separate fallback query shape.
-async function fetchOrderPaymentState(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching createClient()'s own untyped default (see supabase/server.ts)
-  supabase: SupabaseClient<any>,
-  orderId: string,
-): Promise<{ userId: string; paymentStatus: string; paymentProviderId: string | null; totalAmount: number } | null> {
-  const { data, error } = await supabase
-    .from("orders")
-    .select("user_id, payment_status, payment_provider_id, total_amount")
-    .eq("id", orderId)
-    .maybeSingle();
-
-  if (error || !data) {
-    console.error("[payment] Failed to fetch order:", error);
-    return null;
-  }
-
-  return {
-    userId: data.user_id,
-    paymentStatus: data.payment_status ?? "unpaid",
-    paymentProviderId: data.payment_provider_id ?? null,
-    totalAmount: toSafeNumber(data.total_amount),
-  };
-}
-
-/**
- * Creates a manual-capture Stripe PaymentIntent for this order and stamps
- * orders.payment_status = "authorized" (plus payment_provider_id/
- * payment_authorized_at). No-op (not an error) if the order isn't
- * currently "unpaid" — never creates a second PaymentIntent for an order
- * that already has one.
- *
- * Unlike capturePayment/refundPayment (admin-only), this one also allows
- * the order's own owner — createOrder.ts calls this immediately after
- * checkout, on behalf of the customer who just placed the order, not an
- * admin. Creating an authorization hold is the customer's own action
- * (equivalent to entering their card at checkout); only moving money
- * further — capturing or refunding it — is restricted to admins.
- */
-export async function authorizePayment(orderId: string): Promise<PaymentResult> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) return { success: false, paymentStatus: "unpaid" };
-
-  const order = await fetchOrderPaymentState(supabase, orderId);
-  if (!order) return { success: false, paymentStatus: "unpaid" };
-
-  if (!(await isCurrentUserAdmin(supabase, user.id)) && user.id !== order.userId) {
     return { success: false, paymentStatus: "unpaid" };
   }
 
-  if (order.paymentStatus !== "unpaid") {
-    return { success: order.paymentStatus === "authorized", paymentStatus: order.paymentStatus };
-  }
-
-  let intentId: string;
   try {
-    const intent = await stripe.paymentIntents.create({
-      amount: Math.round(order.totalAmount * 100),
-      currency: "usd",
-      capture_method: "manual",
-      metadata: { orderId },
-    });
-    intentId = intent.id;
+    requireStripeConfigured();
   } catch (error) {
-    console.error("[payment] Stripe PaymentIntent creation failed:", error);
+    console.error("[payment] Stripe not configured:", error);
     return { success: false, paymentStatus: "failed" };
   }
 
-  const { error: updateError } = await supabase
+  const { data: order, error: orderError } = await supabase
     .from("orders")
-    .update({
-      payment_status: "authorized",
-      payment_provider_id: intentId,
-      payment_authorized_at: new Date().toISOString(),
-    })
-    .eq("id", orderId);
+    .select("payment_status, stripe_payment_intent_id")
+    .eq("id", orderId)
+    .maybeSingle();
 
-  if (updateError) {
-    console.error("[payment] Failed to persist authorized payment state:", updateError);
-    return { success: false, paymentStatus: "failed" };
+  if (orderError || !order) {
+    return { success: false, paymentStatus: "unpaid" };
   }
 
-  return { success: true, paymentStatus: "authorized" };
-}
-
-export interface CapturablePaymentOrder {
-  id: string;
-  paymentStatus: string;
-  paymentProviderId: string | null;
-}
-
-/**
- * The actual Stripe-capture core of capturePayment — no cookie/session
- * read, no requireAdmin() call of its own. NOT part of this file's public
- * interface: it exists only so a trusted, already-server-side caller that
- * has no user session to check against (see retryPendingCaptures in
- * src/lib/paymentRetry.ts, which runs the checkout-triggered retry sweep
- * via the service-role client) can still perform a real capture, without
- * reintroducing a cookie dependency or duplicating the Stripe call in a
- * second place. The only other caller is capturePayment below, which
- * still fully gates access via requireAdmin() before ever reaching this
- * function — this function itself trusts whoever calls it to have already
- * done that.
- *
- * Deliberately does NOT write payment_status = "captured" itself.
- * Stripe's payment_intent.succeeded webhook (src/app/api/stripe/webhook/
- * route.ts) is the single source of truth for that transition — this
- * function's job ends the moment Stripe accepts the capture request;
- * payment_status stays "authorized" until the webhook confirms it
- * asynchronously. That also means a caller seeing { success: true } here
- * only means "Stripe accepted the capture," not "the DB already reflects
- * it" — by design, so there's never a window where the DB claims
- * "captured" before Stripe has actually said so.
- *
- * The `supabase` parameter is kept (unused in the body) rather than
- * dropped, to avoid changing this function's signature now that it no
- * longer needs to write anything — every caller (capturePayment,
- * retryPendingCaptures) still passes one in unchanged.
- *
- * Reuses the exact same guard capturePayment always had: no-ops (returns
- * success: false, not an error) unless payment_status is exactly
- * "authorized" and a payment_provider_id exists — so this can never
- * attempt to capture an order twice, or one that was never authorized,
- * regardless of who calls it or how many times. On top of that,
- * capturing the same PaymentIntent a second time (e.g. a retry that fires
- * before the webhook has caught up — see src/lib/paymentRetry.ts) is
- * itself rejected by Stripe, not by anything in this file — Stripe is the
- * actual enforcement against a double capture.
- */
-export async function capturePaymentInternal(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching createClient()'s own untyped default (see supabase/server.ts)
-  supabase: SupabaseClient<any>,
-  order: CapturablePaymentOrder,
-): Promise<PaymentResult> {
-  if (order.paymentStatus !== "authorized" || !order.paymentProviderId) {
-    return { success: false, paymentStatus: order.paymentStatus };
+  if (!order.stripe_payment_intent_id || !PAID_STATUSES.has(order.payment_status)) {
+    return { success: false, paymentStatus: order.payment_status };
   }
 
   try {
-    await stripe.paymentIntents.capture(order.paymentProviderId);
-  } catch (error) {
-    console.error("[payment] Stripe PaymentIntent capture failed:", error);
-    return { success: false, paymentStatus: "failed" };
-  }
-
-  return { success: true, paymentStatus: "authorized" };
-}
-
-/**
- * Requests a capture of the order's existing PaymentIntent from Stripe.
- * Admin-only. Fails (not an error, just success: false) if the order
- * isn't currently "authorized" or has no payment_provider_id to capture —
- * a real payment gateway can't capture funds that were never authorized
- * either (see capturePaymentInternal, which actually enforces this).
- *
- * A successful { success: true } result means Stripe accepted the
- * capture request, not that payment_status has already moved to
- * "captured" — see capturePaymentInternal's doc comment for why that
- * transition now only ever happens via the Stripe webhook.
- */
-export async function capturePayment(orderId: string): Promise<PaymentResult> {
-  const authCheck = await requireAdmin();
-  if (authCheck.error) return { success: false, paymentStatus: "unpaid" };
-
-  const supabase = await createClient();
-
-  const order = await fetchOrderPaymentState(supabase, orderId);
-  if (!order) return { success: false, paymentStatus: "unpaid" };
-
-  return capturePaymentInternal(supabase, {
-    id: orderId,
-    paymentStatus: order.paymentStatus,
-    paymentProviderId: order.paymentProviderId,
-  });
-}
-
-/**
- * Issues a Stripe refund against the order's PaymentIntent, moving it to
- * "refunded". Admin-only. Fails softly if there's no payment_provider_id
- * to refund, or if the order was never authorized/captured in the first
- * place (an "unpaid" or already-"refunded" order has nothing to refund).
- */
-export async function refundPayment(orderId: string): Promise<PaymentResult> {
-  const authCheck = await requireAdmin();
-  if (authCheck.error) return { success: false, paymentStatus: "unpaid" };
-
-  const supabase = await createClient();
-
-  const order = await fetchOrderPaymentState(supabase, orderId);
-  if (!order) return { success: false, paymentStatus: "unpaid" };
-
-  if (!order.paymentProviderId || (order.paymentStatus !== "authorized" && order.paymentStatus !== "captured")) {
-    return { success: false, paymentStatus: order.paymentStatus };
-  }
-
-  try {
-    await stripe.refunds.create({ payment_intent: order.paymentProviderId });
+    await stripe.refunds.create({ payment_intent: order.stripe_payment_intent_id });
   } catch (error) {
     console.error("[payment] Stripe refund failed:", error);
     return { success: false, paymentStatus: "failed" };
   }
 
-  const { error: updateError } = await supabase
-    .from("orders")
-    .update({ payment_status: "refunded" })
-    .eq("id", orderId);
-
-  if (updateError) {
-    console.error("[payment] Failed to persist refunded payment state:", updateError);
-    return { success: false, paymentStatus: "failed" };
-  }
-
-  return { success: true, paymentStatus: "refunded" };
+  return { success: true, paymentStatus: order.payment_status };
 }

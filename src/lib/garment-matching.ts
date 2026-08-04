@@ -31,7 +31,14 @@
 // integrations for those platforms, which is a discovery-pipeline
 // project of its own, out of scope for a matching/ranking upgrade.
 import { createClient } from "@/lib/supabase/server";
-import { categorizeListing } from "@/lib/bulk-import";
+// Imported directly from the dependency-free category-bucket.ts, NOT from
+// "@/lib/bulk-import" (which merely re-exports the same function) — that
+// module transitively imports @/lib/listing-extraction -> Playwright at
+// module scope, which would otherwise contaminate every real-time caller
+// of this file (Style Me, Recreate This Outfit) with the exact
+// "native-binary package in a user-facing request path" crash class
+// already fixed once for Discover (see next.config.ts's own comment).
+import { categorizeListing } from "@/lib/category-bucket";
 import { scoreListingMatch } from "@/lib/listing-scoring";
 import { budgetMaxPrice, type BudgetOption } from "@/lib/budget-options";
 import type { DetectedGarment } from "@/lib/garment-detection";

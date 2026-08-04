@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { ImageOff } from "lucide-react";
 import { Button } from "@/components/ui/Button";
+import { PlatformBadge } from "@/components/ui/PlatformBadge";
 import { updateOrderItemStatus, markOrderItemOpened } from "@/lib/orderActions";
 import { getPurchaseQueueItems, type PurchaseQueueItem } from "@/lib/purchaseQueue";
 
@@ -370,9 +371,7 @@ export function PurchaseQueueView({ initialItems }: { initialItems: PurchaseQueu
                   </div>
                 )}
                 {currentItem.platform && (
-                  <span className="absolute bottom-3 right-3 rounded-pill bg-darkgreen/45 px-3 py-1.5 text-xs font-medium text-white">
-                    {currentItem.platform}
-                  </span>
+                  <PlatformBadge platform={currentItem.platform} size="md" className="absolute bottom-3 right-3" />
                 )}
               </div>
 

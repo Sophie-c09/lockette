@@ -5,8 +5,11 @@ import { motion } from "motion/react";
 import { Camera, Gift, Heart, Pencil, Shirt, Sparkles, Wand2 } from "lucide-react";
 import type { StyleDna } from "@/lib/style-dna";
 import { Card } from "@/components/ui/Card";
-import { LinkButton } from "@/components/ui/Button";
+import { Button, LinkButton } from "@/components/ui/Button";
 import { Badge, tagVariantForIndex } from "@/components/ui/Badge";
+import { DeleteAccountSection } from "@/components/profile/DeleteAccountSection";
+import { useCart } from "@/components/CartProvider";
+import { signOut } from "@/app/actions/auth";
 
 const EYEBROW =
   "text-xs font-semibold uppercase tracking-[0.2em] text-oxblood";
@@ -30,6 +33,8 @@ export function ProfileView({
   styleDna: StyleDna | null;
   aesthetics: string[];
 }) {
+  const { clearCart } = useCart();
+
   return (
     <div className="min-h-[calc(100vh-137px)] px-6 py-16">
       <motion.div
@@ -56,7 +61,7 @@ export function ProfileView({
           <h1 className="mt-5 text-2xl font-semibold tracking-tight text-ink">
             {displayName}
           </h1>
-          <p className="mt-1 text-sm tracking-wide text-muted">
+          <p className="mt-1 text-sm tracking-wide text-ink-soft">
             @{username}
           </p>
           <p className="mt-4 max-w-[280px] text-sm text-ink-soft">
@@ -197,6 +202,17 @@ export function ProfileView({
             Coming soon — a digital wardrobe of everything you own and wear.
           </p>
         </Card>
+
+        {/* Account management — logout kept visible here alongside
+            account deletion, rather than only in the top nav, so both
+            actions live in one predictable place. */}
+        <form action={signOut} onSubmit={() => clearCart()} className="w-full">
+          <Button type="submit" variant="secondary" className="w-full">
+            Log out
+          </Button>
+        </form>
+
+        <DeleteAccountSection />
       </motion.div>
     </div>
   );

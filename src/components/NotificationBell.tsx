@@ -4,8 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Bell } from "lucide-react";
 import {
-  getRecentNotifications,
-  getUnreadNotificationCount,
+  getNotificationsWithUnreadCount,
   markNotificationRead,
   type Notification,
 } from "@/lib/notifications";
@@ -41,7 +40,7 @@ export function NotificationBell({
 
   useEffect(() => {
     const interval = setInterval(async () => {
-      const [list, count] = await Promise.all([getRecentNotifications(), getUnreadNotificationCount()]);
+      const { notifications: list, unreadCount: count } = await getNotificationsWithUnreadCount();
       setNotifications(list);
       setUnreadCount(count);
     }, POLL_INTERVAL_MS);
@@ -66,7 +65,7 @@ export function NotificationBell({
     if (next) {
       // Refresh on open too, not just on the poll interval, so a bell
       // click always shows the latest state.
-      const [list, count] = await Promise.all([getRecentNotifications(), getUnreadNotificationCount()]);
+      const { notifications: list, unreadCount: count } = await getNotificationsWithUnreadCount();
       setNotifications(list);
       setUnreadCount(count);
     }

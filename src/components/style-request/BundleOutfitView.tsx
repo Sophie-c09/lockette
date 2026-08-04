@@ -19,6 +19,7 @@ import {
   getBundleById,
   getReplacementOptions,
   replaceBundleItem,
+  retryBundleGeneration,
   type MyStyleRequestBundle,
   type MyStyleRequestBundleItem,
   type ReplacementOption,
@@ -63,6 +64,15 @@ function formatDeliveryWithDays(start: string | null, end: string | null): strin
 // reveal feels sluggish.
 const POLL_INTERVAL_MS = 2_500;
 
+// P0 first-60-seconds fix — this polling loop previously had NO timeout
+// at all: if generation genuinely never finished (an OpenAI outage, or
+// any other real failure the server-side pipeline itself didn't catch),
+// the user would watch the progress bar spin forever with no error, no
+// retry, nothing. 2 minutes comfortably covers a real generation (vision
+// analysis + several marketplace searches + embeddings, normally well
+// under a minute) while still giving up on a genuinely stuck one.
+const GENERATION_TIMEOUT_MS = 120_000;
+
 // Mirrors the exact step values src/lib/bundle-generation.ts's
 // runBundleGenerationAsync writes to generation_step, in order.
 const GENERATION_STEP_LABELS: Record<string, string> = {
@@ -94,7 +104,7 @@ const KNOWN_SAFE_GENERATION_ERRORS = new Set([
   // through to the generic message.
   "Couldn't identify any garments in the inspiration photo(s).",
   "We couldn't process the inspiration photo(s). Please try again.",
-  "Couldn't find any matching listings for this outfit yet — try again once more inventory is imported.",
+  "Couldn't find enough matching items for this outfit yet. Try again in a bit, or submit a new style request with a different photo.",
 ]);
 
 function friendlyGenerationError(raw: string | null): string {
@@ -173,7 +183,7 @@ function ItemSidePanel({
             type="button"
             onClick={onClose}
             aria-label="Close"
-            className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full text-ink-soft hover:bg-inner"
+            className="flex h-10 w-10 cursor-pointer items-center justify-center rounded-full text-ink-soft hover:bg-inner"
           >
             <X className="h-4 w-4" strokeWidth={2.5} />
           </button>
@@ -193,7 +203,7 @@ function ItemSidePanel({
             </div>
             <div>
               <p className="font-display text-base font-semibold text-ink">{item.listing.title}</p>
-              <p className="mt-1 text-lg font-semibold text-oxblood">${(item.listing.price ?? 0).toFixed(2)}</p>
+              <p className="mt-1 text-lg font-semibold text-oxblood">${Number(item.listing.price ?? 0).toFixed(2)}</p>
               {item.listing.platform && (
                 <p className="mt-0.5 text-sm text-ink-soft">Found on {item.listing.platform}</p>
               )}
@@ -209,7 +219,7 @@ function ItemSidePanel({
             <div className="rounded-2xl border border-border bg-inner/40 p-3">
               <p className="text-xs uppercase tracking-wide text-ink-soft">Current</p>
               <p className="mt-1 text-sm font-medium text-ink">{item.listing.title}</p>
-              <p className="text-sm text-oxblood">${(item.listing.price ?? 0).toFixed(2)}</p>
+              <p className="text-sm text-oxblood">${Number(item.listing.price ?? 0).toFixed(2)}</p>
             </div>
 
             {loading && <p className="mt-4 text-sm text-ink-soft">Finding similar alternatives…</p>}
@@ -239,7 +249,7 @@ function ItemSidePanel({
                     </div>
                     <div className="p-2">
                       <p className="truncate text-xs font-medium text-ink">{listing.title}</p>
-                      <p className="text-xs text-oxblood">${(listing.price ?? 0).toFixed(2)}</p>
+                      <p className="text-xs text-oxblood">${Number(listing.price ?? 0).toFixed(2)}</p>
                       {swappingId === listing.id && <p className="text-xs text-ink-soft">Swapping…</p>}
                     </div>
                   </button>
@@ -295,7 +305,7 @@ function BuyConfirmationModal({
               type="button"
               onClick={onClose}
               aria-label="Close"
-              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full text-ink-soft hover:bg-inner"
+              className="flex h-10 w-10 cursor-pointer items-center justify-center rounded-full text-ink-soft hover:bg-inner"
             >
               <X className="h-4 w-4" strokeWidth={2.5} />
             </button>
@@ -326,7 +336,7 @@ function BuyConfirmationModal({
                       <p className="text-xs text-ink-soft">{listing.platform ?? "Lockette"}</p>
                     </div>
                     <span className="shrink-0 text-sm font-semibold text-oxblood">
-                      ${(listing.price ?? 0).toFixed(2)}
+                      ${Number(listing.price ?? 0).toFixed(2)}
                     </span>
                   </div>
                 ))}
@@ -334,9 +344,9 @@ function BuyConfirmationModal({
 
               <div className="mt-4 flex items-center justify-between border-t border-border pt-3 text-sm">
                 <span className="text-ink-soft">
-                  Subtotal ${bundle.itemSubtotal?.toFixed(2)} + Lockette fee ${bundle.mavelleFee?.toFixed(2)}
+                  Subtotal ${Number(bundle.itemSubtotal ?? 0).toFixed(2)} + Lockette fee ${Number(bundle.mavelleFee ?? 0).toFixed(2)}
                 </span>
-                <span className="font-display text-base font-semibold text-ink">${bundle.totalPrice?.toFixed(2)}</span>
+                <span className="font-display text-base font-semibold text-ink">${Number(bundle.totalPrice ?? 0).toFixed(2)}</span>
               </div>
 
               <Button type="button" onClick={handleConfirm} disabled={confirming} className="mt-4 w-full">
@@ -407,16 +417,40 @@ export function BundleOutfitView({
   const [panelItem, setPanelItem] = useState<MyStyleRequestBundleItem | null>(null);
   const [panelMode, setPanelMode] = useState<PanelMode>("info");
   const [showBuyModal, setShowBuyModal] = useState(false);
+  // Pre-launch polish fix (item 3) — the server-side pipeline is durable
+  // now (runBundleGenerationAsync runs inside after(), see
+  // src/app/actions/style-requests.ts's own comment), so a bundle that's
+  // still 'generating' past this client's own polling window is very
+  // likely still genuinely working, not stuck — this is why timing out
+  // here no longer means "failed." It just means: stop hammering the
+  // server every 2.5s and let the user leave/come back instead of
+  // watching a frozen progress bar forever. Reopening this page (a fresh
+  // server render — see /bundle/[id]/page.tsx) always reflects the real,
+  // current status regardless of this flag; "Check now" (below) does the
+  // same without a full navigation.
+  const [pollTimedOut, setPollTimedOut] = useState(false);
+  const [checkingNow, setCheckingNow] = useState(false);
+  const [retrying, setRetrying] = useState(false);
 
   // Polling — only while actually generating; a no-op for the
   // already-'ready'/'error'/manual-bundle cases (MyStyleRequestsView.tsx
   // never even mounts this component until a request is 'completed', so
   // this effect fires at most once per /bundle/[id] visit in practice).
+  // Depends on pollTimedOut (not just bundle.id/status) so "Check now"
+  // resetting it back to false genuinely resumes polling with a fresh
+  // timeout window, rather than needing a full page reload to try again.
   useEffect(() => {
-    if (bundle.status !== "generating") return;
+    if (bundle.status !== "generating" || pollTimedOut) return;
 
     let cancelled = false;
+    const startedAt = Date.now();
     const interval = setInterval(async () => {
+      if (Date.now() - startedAt > GENERATION_TIMEOUT_MS) {
+        clearInterval(interval);
+        if (!cancelled) setPollTimedOut(true);
+        return;
+      }
+
       const result = await getBundleById(bundle.id);
       if (cancelled || !result.bundle) return;
 
@@ -430,7 +464,56 @@ export function BundleOutfitView({
       cancelled = true;
       clearInterval(interval);
     };
-  }, [bundle.id, bundle.status]);
+  }, [bundle.id, bundle.status, pollTimedOut]);
+
+  // "Check now" — a single manual re-fetch for the calm, still-working
+  // state below. If the bundle has actually finished (or failed) since
+  // the client gave up automatic polling, this reveals that immediately;
+  // if it's still generating, resuming polling (pollTimedOut -> false)
+  // picks the automatic checks back up with a fresh timeout window,
+  // rather than leaving the user stuck re-clicking forever.
+  async function handleCheckNow() {
+    setCheckingNow(true);
+    const result = await getBundleById(bundle.id);
+    setCheckingNow(false);
+    if (!result.bundle) return;
+
+    setBundle(result.bundle);
+    if (result.bundle.status === "generating") {
+      setPollTimedOut(false);
+    }
+  }
+
+  // Retries a genuinely failed ("error") bundle in place — see
+  // retryBundleGeneration's own doc comment (src/app/actions/
+  // style-requests.ts) for why this can never duplicate the request or
+  // the bundle. `retrying` both shows progress and guards against a
+  // rapid double-click firing two retries at once.
+  async function handleRetry() {
+    if (retrying) return;
+
+    setRetrying(true);
+    const result = await retryBundleGeneration(bundle.id);
+    setRetrying(false);
+
+    if (!result.success) {
+      showToast(result.error ?? "Something went wrong retrying this bundle. Please try again.");
+      return;
+    }
+
+    // Optimistic — the server already flipped this row to 'generating';
+    // reflecting that locally immediately (rather than waiting for the
+    // next poll tick) is what makes the progress bar/polling effect above
+    // pick back up right away instead of still showing the old error.
+    setBundle((prev) => ({
+      ...prev,
+      status: "generating",
+      generationStep: "starting",
+      generationProgress: 5,
+      generationError: null,
+    }));
+    setPollTimedOut(false);
+  }
 
   function openPanel(item: MyStyleRequestBundleItem) {
     setPanelItem(item);
@@ -459,10 +542,20 @@ export function BundleOutfitView({
   }
 
   const deliveryLabel = formatDeliveryWithDays(bundle.estimatedDeliveryStart, bundle.estimatedDeliveryEnd);
-  const isGenerating = bundle.status === "generating";
+  // Pre-launch polish fix (item 3) — pollTimedOut and a genuine server-side
+  // status === "error" used to be merged into one `isError` flag with
+  // identical "we couldn't finish" copy. They're not the same thing: a
+  // poll timeout just means this client stopped checking — generation is
+  // durable server-side (after(), see style-requests.ts) and very likely
+  // still finishing — while status === "error" means the pipeline itself
+  // gave up. Keeping them visually/semantically distinct means the
+  // still-working case never reads as a failure, and never loses the
+  // request by offering to "submit a new one" for something still in flight.
+  const isGenerating = bundle.status === "generating" && !pollTimedOut;
+  const isStillWorking = bundle.status === "generating" && pollTimedOut;
   const isError = bundle.status === "error";
   const isReady = bundle.status === "ready" || bundle.status === "purchased";
-  const isAiGenerated = isGenerating || isError || bundle.itemSubtotal != null;
+  const isAiGenerated = isGenerating || isStillWorking || isError || bundle.itemSubtotal != null;
 
   return (
     <div className={isReady && isAiGenerated ? "pb-24" : undefined}>
@@ -474,17 +567,40 @@ export function BundleOutfitView({
 
       {bundle.description && <p className="mt-1 text-sm text-ink-soft">{bundle.description}</p>}
 
-      {isError && (
+      {isStillWorking && (
         <div className="mt-3 rounded-2xl bg-highlight-cream px-4 py-3 text-sm text-ink">
-          <p className="font-semibold">We couldn&apos;t finish building your bundle</p>
-          <p className="mt-1 text-ink-soft">{friendlyGenerationError(bundle.generationError)}</p>
-          <LinkButton href="/style-request" variant="secondary" className="mt-3">
-            Submit a new style request
-          </LinkButton>
+          <p className="font-semibold">We&apos;ll keep working on your bundle</p>
+          <p className="mt-1 text-ink-soft">
+            This is taking longer than expected, but your request hasn&apos;t been lost — we&apos;re still putting
+            it together. Check back here anytime, or come back later from My Style Requests.
+          </p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="secondary" onClick={handleCheckNow} disabled={checkingNow}>
+              {checkingNow ? "Checking..." : "Check now"}
+            </Button>
+            <LinkButton href="/my-style-requests" variant="secondary">
+              My style requests
+            </LinkButton>
+          </div>
         </div>
       )}
 
-      {bundle.items.length === 0 && isGenerating ? null : (
+      {isError && (
+        <div className="mt-3 rounded-2xl bg-highlight-cream px-4 py-3 text-sm text-ink">
+          <p className="font-semibold">We couldn&apos;t finish this bundle</p>
+          <p className="mt-1 text-ink-soft">{friendlyGenerationError(bundle.generationError)}</p>
+          <div className="mt-3 flex flex-wrap gap-2">
+            <Button variant="primary" onClick={handleRetry} disabled={retrying}>
+              {retrying ? "Retrying…" : "Try again"}
+            </Button>
+            <LinkButton href="/style-request" variant="secondary">
+              Submit a new style request
+            </LinkButton>
+          </div>
+        </div>
+      )}
+
+      {bundle.items.length === 0 && (isGenerating || isStillWorking) ? null : (
         <div className="mt-4">
           {isGenerating && bundle.items.length > 0 && (
             <GenerationProgressBar progress={bundle.generationProgress} step={bundle.generationStep} compact />
@@ -514,10 +630,13 @@ export function BundleOutfitView({
       {/* Sticky purchase bar — only once there's actually a real total to
           buy; never shown mid-generation or on a failed bundle. */}
       {isReady && isAiGenerated && (
-        <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-surface px-6 py-3 shadow-card">
+        // Pre-launch polish fix (item 7) — pb uses env(safe-area-inset-bottom)
+        // so this fixed purchase bar doesn't sit under the home-indicator
+        // area on notched/gestural iOS devices (see AppTabBar.tsx's own fix).
+        <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-surface px-6 pt-3 pb-[calc(0.75rem+env(safe-area-inset-bottom))] shadow-card">
           <div className="mx-auto flex max-w-2xl items-center justify-between gap-3">
             <div className="min-w-0">
-              <p className="font-display text-base font-semibold text-ink">${bundle.totalPrice?.toFixed(2)}</p>
+              <p className="font-display text-base font-semibold text-ink">${Number(bundle.totalPrice ?? 0).toFixed(2)}</p>
               <p className="truncate text-xs text-ink-soft">
                 Lockette fee included{deliveryLabel ? ` · ${deliveryLabel}` : ""}
               </p>

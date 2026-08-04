@@ -328,7 +328,7 @@ export async function generateBundleForRequest(
   }
 
   if (generatedItems.length === 0) {
-    return { error: "Couldn't find any matching listings for this outfit yet — try again once more inventory is imported." };
+    return { error: "Couldn't find enough matching items for this outfit yet. Try again in a bit, or submit a new style request with a different photo." };
   }
 
   const pricing = calculateBundlePricing(generatedItems.map((entry) => entry.listing.price ?? 0));
@@ -424,17 +424,18 @@ export async function saveGeneratedBundle(
 // this is a second, independent way to arrive at the same
 // styled_bundles/styled_bundle_items shape, not a replacement.
 //
-// IMPORTANT CAVEAT ON HOW THIS ACTUALLY RUNS: runBundleGenerationAsync is
-// called WITHOUT being awaited (see submitStyleRequest's own comment) —
+// HOW THIS ACTUALLY RUNS: runBundleGenerationAsync is called WITHOUT
+// being directly awaited (see submitStyleRequest's own comment) —
 // deliberately, so the request can redirect immediately instead of
-// blocking on the full pipeline. That only keeps running afterward
-// because this app's current deployment model is a long-lived Node
-// process (`next dev` / `next start`), not a strict per-request
-// serverless/edge function — on a platform that freezes or tears down
-// compute the instant a response is sent (e.g. Vercel's default
-// serverless functions, without something like `waitUntil`), this
-// fire-and-forget call would be killed mid-flight. If this app is ever
-// deployed that way, this needs a real durable queue instead.
+// blocking on the full pipeline. This app IS deployed on Vercel
+// serverless Functions, which freeze/tear down compute the instant a
+// response is sent — a real, confirmed production bug this caused
+// ("Style Bundle" getting stuck at status='generating' forever, since
+// the fire-and-forget call was killed mid-flight right after redirect()
+// sent its response). Fixed by wrapping the call in `after()` (Next.js's
+// built-in equivalent to a serverless waitUntil) at the call site in
+// style-requests.ts — that's what actually keeps this function running
+// to completion past the response, not anything in this file itself.
 // ---------------------------------------------------------------------------
 
 /**
@@ -452,6 +453,8 @@ export async function createGeneratingBundle(requestId: string): Promise<{ bundl
       status: "generating",
       generation_step: "starting",
       generation_progress: 5,
+      attempt_count: 1,
+      last_attempt_at: new Date().toISOString(),
     })
     .select("id")
     .single();
@@ -573,7 +576,7 @@ export async function runBundleGenerationAsync(requestId: string, bundleId: stri
       .filter((value): value is { listing: Listing; category: GarmentCategory } => value !== null);
 
     if (foundItems.length === 0) {
-      await fail("Couldn't find any matching listings for this outfit yet — try again once more inventory is imported.");
+      await fail("Couldn't find enough matching items for this outfit yet. Try again in a bit, or submit a new style request with a different photo.");
       return;
     }
 

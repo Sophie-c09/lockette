@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/Button";
 import { addBundleToCart, type MyStyleRequest } from "@/app/actions/style-requests";
 import { BundleOutfitView } from "@/components/style-request/BundleOutfitView";
 import { useToast } from "@/components/ToastProvider";
+import { RetryButton } from "@/components/ui/RetryButton";
 
 const STATUS_LABELS: Record<MyStyleRequest["status"], string> = {
   pending: "Pending review",
@@ -68,7 +69,7 @@ function BundleCard({ bundle, onChanged }: { bundle: NonNullable<MyStyleRequest[
               )}
               <div className="p-3">
                 <p className="truncate text-sm font-medium text-ink">{listing.title}</p>
-                {listing.price != null && <p className="text-sm text-oxblood">${listing.price.toFixed(2)}</p>}
+                {listing.price != null && <p className="text-sm text-oxblood">${Number(listing.price).toFixed(2)}</p>}
               </div>
             </div>
           ))}
@@ -82,17 +83,40 @@ function BundleCard({ bundle, onChanged }: { bundle: NonNullable<MyStyleRequest[
   );
 }
 
-export function MyStyleRequestsView({ requests }: { requests: MyStyleRequest[] }) {
+export function MyStyleRequestsView({
+  requests,
+  hasError = false,
+}: {
+  requests: MyStyleRequest[];
+  hasError?: boolean;
+}) {
   const [, forceRefresh] = useState(0);
 
+  // Pre-launch polish fix (item 4) — a failed fetch (requests: [], error
+  // set) used to render identically to a genuinely empty list, telling a
+  // user whose request fetch just failed "you haven't sent a style
+  // request yet," which is actively misleading. hasError distinguishes
+  // the two so a real failure gets a real retry instead.
   if (requests.length === 0) {
     return (
-      <div className="mx-auto flex max-w-md flex-col items-center gap-4 px-6 py-16 text-center">
-        <Sparkles className="h-8 w-8 text-oxblood" strokeWidth={1.5} />
-        <p className="text-sm text-ink-soft">You haven&apos;t sent a style request yet.</p>
-        <Link href="/style-request" className="text-sm font-semibold text-oxblood underline underline-offset-4">
-          Get Styled
-        </Link>
+      <div className="mx-auto max-w-3xl px-6 py-12">
+        <h1 className="font-display text-2xl font-semibold text-ink">My style requests</h1>
+        <div className="mx-auto mt-8 flex max-w-md flex-col items-center gap-4 rounded-card bg-highlight-cream px-8 py-16 text-center">
+          <Sparkles className="h-8 w-8 text-oxblood" strokeWidth={1.5} />
+          {hasError ? (
+            <>
+              <p className="text-sm text-ink-soft">Something went wrong loading your style requests.</p>
+              <RetryButton />
+            </>
+          ) : (
+            <>
+              <p className="text-sm text-ink-soft">You haven&apos;t sent a style request yet.</p>
+              <Link href="/style-request" className="text-sm font-semibold text-oxblood underline underline-offset-4">
+                Get Styled
+              </Link>
+            </>
+          )}
+        </div>
       </div>
     );
   }

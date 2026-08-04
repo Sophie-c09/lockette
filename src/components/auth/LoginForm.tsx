@@ -4,14 +4,34 @@ import { useActionState } from "react";
 import Link from "next/link";
 import { signIn, type AuthFormState } from "@/app/actions/auth";
 import { Button } from "@/components/ui/Button";
+import { AppleSignInButton } from "@/components/auth/AppleSignInButton";
+import { GoogleSignInButton } from "@/components/auth/GoogleSignInButton";
 
 const initialState: AuthFormState = undefined;
 
-export function LoginForm() {
+// Pre-submission fix — proxy.ts bounces a signed-out visit to a protected
+// route (/likes, /profile, etc.) to /login?redirectTo=<path>, but nothing
+// ever read that param: a successful sign-in always landed on /profile
+// regardless of what the user was actually trying to reach. Threaded
+// through as a hidden field so signIn (src/app/actions/auth.ts) can honor
+// it — validated there against being an absolute/external URL before ever
+// being used as a redirect target.
+export function LoginForm({ redirectTo }: { redirectTo?: string } = {}) {
   const [state, formAction, pending] = useActionState(signIn, initialState);
 
   return (
-    <form action={formAction} className="flex flex-col gap-5">
+    <div className="flex flex-col gap-5">
+      <AppleSignInButton redirectTo={redirectTo} />
+      <GoogleSignInButton />
+
+      <div className="flex items-center gap-3 text-xs font-medium text-ink-soft">
+        <span className="h-px flex-1 bg-border" />
+        or continue with email
+        <span className="h-px flex-1 bg-border" />
+      </div>
+
+      <form action={formAction} className="flex flex-col gap-5">
+      {redirectTo && <input type="hidden" name="redirectTo" value={redirectTo} />}
       <div>
         <label
           htmlFor="email"
@@ -80,6 +100,7 @@ export function LoginForm() {
           Create an account
         </Link>
       </p>
-    </form>
+      </form>
+    </div>
   );
 }

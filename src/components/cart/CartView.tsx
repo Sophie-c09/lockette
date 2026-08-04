@@ -130,14 +130,14 @@ export function CartView({ initialCartListings }: { initialCartListings: CartLis
 
                 <div className="flex flex-1 flex-col gap-1.5">
                   <div className="flex items-start justify-between gap-2">
-                    <h3 className="font-display text-sm font-semibold leading-tight text-ink sm:text-base">
+                    <h3 className="min-w-0 line-clamp-2 font-display text-sm font-semibold leading-tight text-ink sm:text-base">
                       {item.name}
                     </h3>
                     <button
                       type="button"
                       onClick={() => handleRemove(index)}
                       aria-label={`Remove ${item.name} from cart`}
-                      className="flex h-7 w-7 shrink-0 cursor-pointer items-center justify-center rounded-full text-ink-soft transition-colors hover:bg-inner hover:text-oxblood"
+                      className="flex h-9 w-9 shrink-0 cursor-pointer items-center justify-center rounded-full text-ink-soft transition-colors hover:bg-inner hover:text-oxblood"
                     >
                       <X className="h-3.5 w-3.5" strokeWidth={2.5} />
                     </button>

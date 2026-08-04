@@ -24,5 +24,5 @@ export default async function MyStyleRequestsPage() {
     console.error("[my-style-requests-page]", error);
   }
 
-  return <MyStyleRequestsView requests={requests} />;
+  return <MyStyleRequestsView requests={requests} hasError={Boolean(error)} />;
 }

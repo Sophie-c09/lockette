@@ -79,7 +79,19 @@ export async function signUp(
   const { data, error } = await supabase.auth.signUp({
     email,
     password,
-    options: { data: { full_name: name } },
+    options: {
+      data: { full_name: name },
+      // P0 first-60-seconds fix (item 3) — without this, the confirmation
+      // email uses whatever this Supabase project's dashboard "Site URL"
+      // is set to, landing wherever that happens to be (often the
+      // homepage) instead of a page that actually tells the user to sign
+      // in. Routes through /auth/confirm (the same Route Handler
+      // requestPasswordReset already uses) so a real, server-verifiable
+      // token_hash/code lands on /login?verified=true; error_next keeps a
+      // failed/expired confirmation link off the unrelated
+      // /forgot-password page.
+      emailRedirectTo: `${SITE_URL}/auth/confirm?next=${encodeURIComponent("/login?verified=true")}&error_next=${encodeURIComponent("/login")}`,
+    },
   });
 
   if (error) {
@@ -104,6 +116,18 @@ export async function signUp(
   }
 
   redirect("/profile/setup");
+}
+
+// Only ever a same-origin relative path (proxy.ts only ever sets it from
+// request.nextUrl.pathname) — but it arrives as a plain query/form param,
+// so it must be validated before ever being used as a redirect target.
+// Rejects anything absolute ("https://...") or protocol-relative ("//...")
+// to prevent an open-redirect via a crafted /login?redirectTo= link.
+function safeRedirectTarget(candidate: FormDataEntryValue | null): string {
+  if (typeof candidate !== "string" || !candidate.startsWith("/") || candidate.startsWith("//")) {
+    return "/profile";
+  }
+  return candidate;
 }
 
 export async function signIn(
@@ -158,7 +182,112 @@ export async function signIn(
     return { message: "Something went wrong signing you in. Please try again." };
   }
 
-  redirect("/profile");
+  redirect(safeRedirectTarget(formData.get("redirectTo")));
+}
+
+// P0 first-60-seconds fix (item 2) — "Continue with Google," first option
+// on both /login and /signup. Supabase Auth's signInWithOAuth (server-
+// side call) returns a real provider consent URL rather than performing
+// the redirect itself — this Server Action's only job is to get that URL
+// and hand off to it. Works identically for a brand-new email (creates
+// the account) and a returning one (signs in) — Supabase Auth doesn't
+// need this app to know which case it is ahead of time.
+//
+// Existing-email-account merging: if "Enable automatic linking" is on for
+// this Supabase project (Authentication -> Sign In / Providers), a Google
+// sign-in that matches an existing email/password account's email links
+// to that SAME user automatically — no separate, duplicate account. That
+// setting lives in the Supabase dashboard, not in this codebase; nothing
+// here can enable it remotely. If it's off, Supabase's default behavior
+// is to still create/sign in a distinct identity, which is why this is
+// called out explicitly rather than silently assumed.
+//
+// redirectTo routes through /auth/confirm (the same Route Handler
+// requestPasswordReset/signUp's email confirmation already use) — it
+// already handles a PKCE `code` via exchangeCodeForSession; `next=/profile`
+// matches signIn's own post-login landing above, so a first-time Google
+// user is naturally forwarded to /profile/setup by that page's own
+// existing incomplete-profile check, same as a first-time email signup
+// reaching /profile/setup via signUp above.
+// eslint-disable-next-line @typescript-eslint/no-unused-vars -- required by useActionState's calling convention (GoogleSignInButton.tsx), unused since this action needs no form fields
+export async function signInWithGoogle(_prevState: AuthFormState): Promise<AuthFormState> {
+  const supabase = await createClient();
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: "google",
+    options: {
+      redirectTo: `${SITE_URL}/auth/confirm?next=${encodeURIComponent("/profile")}&error_next=${encodeURIComponent("/login")}`,
+    },
+  });
+
+  if (error || !data.url) {
+    // Graceful failure state (requirement) — never a raw Supabase error,
+    // and never a silent no-op either (the button would otherwise appear
+    // to do nothing at all).
+    logAuthError("signInWithOAuth", error ?? new Error("No redirect URL returned"));
+    return { message: "Couldn't connect to Google right now. Please try again, or sign in with email." };
+  }
+
+  redirect(data.url);
+}
+
+// Sign in with Apple — App Store compliance requirement, same safe
+// architecture as signInWithGoogle above (a Server Action that only ever
+// hands off to Supabase's own hosted OAuth consent flow; Lockette's code
+// never sees an Apple client secret or token — that exchange happens
+// entirely inside Supabase Auth, configured once in its dashboard, see
+// this feature's own setup docs). Works identically for a brand-new
+// Apple ID (creates the account) and a returning one (signs in) — same
+// as Google, Supabase doesn't need this app to know which case it is
+// ahead of time.
+//
+// redirectTo — unlike signInWithGoogle (which has never needed one),
+// this accepts and validates an optional redirectTo via the SAME
+// safeRedirectTarget guard signIn (email/password) already uses, so a
+// user bounced to /login?redirectTo=/likes by proxy.ts and choosing
+// "Continue with Apple" still lands back on /likes, not always /profile.
+// Reuses /auth/confirm (the same Route Handler Google/email-confirmation/
+// password-reset already share) — that route's exchangeCodeForSession
+// call is provider-agnostic, so no second callback path is needed.
+//
+// Apple-specific notes (see this feature's own report for the full
+// account-behavior/linking documentation):
+// - Apple only ever includes the user's name in the FIRST authorization
+//   response, and only if requested — Supabase Auth captures whatever
+//   Apple sends into user_metadata at that moment; this app's own
+//   on_auth_user_created trigger (supabase/schema.sql) never copies any
+//   provider's name into profiles.display_name at all (Google included),
+//   so there's no name-overwrite risk here to begin with — a first-time
+//   Apple user reaches /profile/setup and enters their name manually,
+//   identically to Google/email signup.
+// - Apple private-relay email addresses (@privaterelay.appleid.com) are
+//   handled with no special casing needed — Supabase Auth treats them as
+//   an ordinary email address on the account; nothing in this app reads
+//   or validates email domains at sign-in time.
+// - Existing-email-account merging: identical caveat as signInWithGoogle
+//   above — governed entirely by this Supabase project's own
+//   "Authentication -> Sign In / Providers -> Enable automatic linking"
+//   setting, not by anything in this codebase.
+export async function signInWithApple(_prevState: AuthFormState, formData: FormData): Promise<AuthFormState> {
+  const supabase = await createClient();
+  const redirectTo = safeRedirectTarget(formData.get("redirectTo"));
+
+  const { data, error } = await supabase.auth.signInWithOAuth({
+    provider: "apple",
+    options: {
+      redirectTo: `${SITE_URL}/auth/confirm?next=${encodeURIComponent(redirectTo)}&error_next=${encodeURIComponent("/login")}`,
+    },
+  });
+
+  if (error || !data.url) {
+    // Graceful failure state (requirement) — never a raw Supabase error,
+    // and never a silent no-op either (the button would otherwise appear
+    // to do nothing at all).
+    logAuthError("signInWithOAuth:apple", error ?? new Error("No redirect URL returned"));
+    return { message: "Couldn't connect to Apple right now. Please try again, or sign in with email." };
+  }
+
+  redirect(data.url);
 }
 
 export async function signOut() {

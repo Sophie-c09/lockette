@@ -187,7 +187,7 @@ export function StyleMeForm() {
                     type="button"
                     onClick={() => handleRemovePhoto(index)}
                     aria-label="Remove photo"
-                    className="absolute right-1 top-1 flex h-6 w-6 cursor-pointer items-center justify-center rounded-full bg-ink-strong/70 text-white hover:bg-ink-strong"
+                    className="absolute right-1 top-1 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-ink-strong/70 text-white hover:bg-ink-strong"
                   >
                     <X className="h-3.5 w-3.5" strokeWidth={2.5} />
                   </button>

@@ -5,7 +5,9 @@ import { createClient } from "@/lib/supabase/server";
 import { LinkButton } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
 import { Badge, tagVariantForIndex } from "@/components/ui/Badge";
+import { PlatformBadge } from "@/components/ui/PlatformBadge";
 import { unsaveListingAction } from "@/app/actions/saved-items";
+import { RetryButton } from "@/components/ui/RetryButton";
 
 export const metadata: Metadata = {
   title: "Your likes — Lockette",
@@ -49,8 +51,6 @@ export default async function LikesPage() {
     .eq("user_id", user.id)
     .not("listing_id", "is", null)
     .order("created_at", { ascending: false });
-
-  console.log("[likes-page-debug]", { userId: user.id, savedItems: savedRows });
 
   if (savedError) {
     return (
@@ -149,22 +149,20 @@ export default async function LikesPage() {
                   <button
                     type="submit"
                     aria-label={`Remove ${listing.title} from likes`}
-                    className="flex h-7 w-7 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
+                    className="flex h-10 w-10 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
                   >
                     <X className="h-3.5 w-3.5" strokeWidth={2.5} />
                   </button>
                 </form>
 
                 {listing.platform && (
-                  <span className="absolute bottom-2 right-2 rounded-pill bg-darkgreen/45 px-2.5 py-1 text-xs font-medium text-white">
-                    {listing.platform}
-                  </span>
+                  <PlatformBadge platform={listing.platform} className="absolute bottom-2 right-2" />
                 )}
               </div>
 
               <div className="flex flex-1 flex-col gap-2 p-4">
                 <div className="flex items-start justify-between gap-2">
-                  <h3 className="font-display text-sm font-semibold leading-tight text-ink">
+                  <h3 className="min-w-0 line-clamp-2 font-display text-sm font-semibold leading-tight text-ink">
                     {listing.title}
                   </h3>
                   {isSold && (
@@ -239,9 +237,8 @@ function ErrorState() {
   return (
     <div className="mx-auto flex max-w-md flex-col items-center gap-4 rounded-card bg-highlight-cream px-8 py-16 text-center">
       <Heart className="h-8 w-8 text-oxblood" strokeWidth={1.5} />
-      <p className="text-sm text-ink-soft">
-        Something went wrong loading your likes. Please try again.
-      </p>
+      <p className="text-sm text-ink-soft">Something went wrong loading your likes.</p>
+      <RetryButton />
     </div>
   );
 }

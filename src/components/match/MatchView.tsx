@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Heart, ImageOff, Sparkles, X } from "lucide-react";
 import { Card } from "@/components/ui/Card";
-import { Badge, tagVariantForIndex, type TagVariant } from "@/components/ui/Badge";
+import { Badge, type TagVariant } from "@/components/ui/Badge";
 import { SwipeableCard, SWIPE_STACK_SIZE, type SwipeDirection } from "@/components/SwipeableCard";
 import { saveListing } from "@/app/actions/saved-items";
 import { dislikeListing } from "@/app/actions/dislikes";
@@ -14,6 +14,7 @@ import { MATCH_BATCH_SIZE, MATCH_PREFETCH_THRESHOLD } from "@/lib/pagination-con
 import { useCart } from "@/components/CartProvider";
 import { FlyingImage, type FlyingItem } from "@/components/match/FlyingImage";
 import { StyleFeaturesPromo } from "@/components/StyleFeaturesPromo";
+import { useToast } from "@/components/ToastProvider";
 import type { Listing } from "@/lib/supabase/listings.types";
 
 // Lightweight subset of Listing — matches exactly what /match's Supabase
@@ -39,9 +40,13 @@ export type MatchListing = Pick<
 export type ScoredMatchListing = MatchListing & { matchPercent: number };
 
 // Same tiers ListingCard/DiscoverView use for their own match-score badge.
+// Re-tuned for the normalized 25-99 display scale
+// (normalizeMatchPercentForDisplay, src/lib/match-percent-display.ts) — 75
+// and 40 on the old raw 0-100 scale are ~81/~55 once rescaled, same
+// relative "how good is this match" meaning as before.
 function matchBadgeVariant(score: number): TagVariant {
-  if (score >= 75) return "pink";
-  if (score >= 40) return "teal";
+  if (score >= 81) return "pink";
+  if (score >= 55) return "teal";
   return "yellow";
 }
 
@@ -117,9 +122,15 @@ function SwipeCard({
             </Badge>
           </div>
 
-          <div className="flex flex-1 flex-col gap-2 p-4">
+          {/* Pre-launch polish fix (item 2) — simplified to exactly the
+              five things this card needs to communicate (large image,
+              title, brand, price, match %); the aesthetic-tag badge row
+              that used to fill this space was visual clutter competing
+              with the match badge already shown over the image, not
+              information a swipe decision actually needs. */}
+          <div className="flex flex-1 flex-col justify-center gap-1 px-4 py-3.5">
             <div className="flex items-start justify-between gap-2">
-              <h3 className="font-display text-sm font-semibold leading-tight text-ink">
+              <h3 className="font-display text-base font-semibold leading-snug text-ink">
                 {listing.title}
               </h3>
               {listing.price != null && (
@@ -129,21 +140,7 @@ function SwipeCard({
               )}
             </div>
 
-            {(listing.brand || listing.size) && (
-              <p className="text-xs text-ink-soft">
-                {[listing.brand, listing.size].filter(Boolean).join(" · ")}
-              </p>
-            )}
-
-            {listing.aesthetic_tags.length > 0 && (
-              <div className="mt-auto flex flex-wrap gap-1.5 pt-2">
-                {listing.aesthetic_tags.map((tag, index) => (
-                  <Badge key={tag} variant={tagVariantForIndex(index)} className="text-[11px]">
-                    {tag}
-                  </Badge>
-                ))}
-              </div>
-            )}
+            {listing.brand && <p className="text-xs text-ink-soft">{listing.brand}</p>}
           </div>
         </Card>
       )}
@@ -162,6 +159,7 @@ export function MatchView({
 }) {
   const router = useRouter();
   const { addToCart, cartLinkRef } = useCart();
+  const { showToast } = useToast();
   const [queue, setQueue] = useState(initialListings);
   const [exitDirection, setExitDirection] = useState<Direction | null>(null);
   const [flying, setFlying] = useState<FlyingItem | null>(null);
@@ -194,6 +192,19 @@ export function MatchView({
 
     let cancelled = false;
     loadingRef.current = true;
+    // P0 first-60-seconds fix (item 5) — the feed must NEVER show a
+    // terminal "No more matches" dead end. Once the recency-ordered pool
+    // is exhausted at the current offset (rawCount short of a full
+    // batch), this wraps back to the top instead of permanently setting
+    // hasMoreRef=false — fetchMatchBatch already excludes already-liked/
+    // disliked listings, so wrapping naturally re-surfaces anything
+    // scrolled past without swiping, and only repeats already-swiped
+    // items once truly everything has been seen, which is still strictly
+    // better than a dead end. consecutiveEmptyWraps is a safety valve
+    // against a genuinely empty catalog spinning in a tight retry loop —
+    // real production inventory is never anywhere close to this.
+    let consecutiveEmptyWraps = 0;
+    const MAX_CONSECUTIVE_EMPTY_WRAPS = 2;
 
     async function prefetchUntilQueueGrowsOrExhausted() {
       while (!cancelled && hasMoreRef.current) {
@@ -201,11 +212,30 @@ export function MatchView({
           const result = await loadMoreMatchListings(offsetRef.current);
           if (result.error) {
             hasMoreRef.current = false;
+            // Pre-launch polish fix (item 6) — this used to fail silently,
+            // unlike Discover's identical prefetch-failure path (see
+            // DiscoverView.tsx's own loadNextBatch), leaving Match's swipe
+            // queue quietly stop refilling with no explanation.
+            if (!cancelled) {
+              showToast("Couldn't load more matches. Please try refreshing the page.");
+            }
             break;
           }
 
           offsetRef.current += MATCH_BATCH_SIZE;
-          if (result.rawCount < MATCH_BATCH_SIZE) hasMoreRef.current = false;
+
+          if (result.rawCount < MATCH_BATCH_SIZE) {
+            offsetRef.current = 0;
+            if (result.rawCount === 0) {
+              consecutiveEmptyWraps += 1;
+              if (consecutiveEmptyWraps > MAX_CONSECUTIVE_EMPTY_WRAPS) {
+                hasMoreRef.current = false;
+                break;
+              }
+            } else {
+              consecutiveEmptyWraps = 0;
+            }
+          }
 
           if (result.listings.length > 0) {
             if (!cancelled) {
@@ -216,6 +246,9 @@ export function MatchView({
           // This batch's raw rows all got filtered out — try the next one.
         } catch {
           hasMoreRef.current = false;
+          if (!cancelled) {
+            showToast("Couldn't load more matches. Please try refreshing the page.");
+          }
           break;
         }
       }
@@ -226,7 +259,7 @@ export function MatchView({
     return () => {
       cancelled = true;
     };
-  }, [queue.length]);
+  }, [queue.length, showToast]);
 
   function handleSwipe(direction: Direction) {
     if (!topItem || exitDirection) return;
@@ -261,11 +294,6 @@ export function MatchView({
   function dismissFromDeck(listingId: string) {
     setQueue((current) => {
       const next = current.filter((listing) => listing.id !== listingId);
-      console.log("[super-like-dismiss]", {
-        listingId,
-        removedFromDeck: true,
-        remainingCards: next.length,
-      });
       return next;
     });
   }
@@ -343,8 +371,7 @@ export function MatchView({
           <div className="flex h-full flex-col items-center justify-center gap-4 rounded-card border border-dashed border-border-button bg-highlight-cream px-8 text-center">
             <Sparkles className="h-8 w-8 text-oxblood" strokeWidth={1.5} />
             <p className="max-w-xs text-sm text-ink-soft">
-              No more matches — import more or like more items to improve your
-              feed
+              New finds are on the way — check back again shortly.
             </p>
           </div>
         )}

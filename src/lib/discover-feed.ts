@@ -44,6 +44,7 @@ import { getItemTypeCategoryBySlug, type ItemTypeCategory } from "@/lib/item-typ
 import { getHardExcludedStyleKeys, assessListingAgainstDislikedStyles, type DislikedStyles } from "@/lib/disliked-styles";
 import { buildUserStyleVector, type LikedListingAttributes } from "@/lib/discover-style-vector";
 import { scoreGarmentStyleMatch, computeFashionQualityScore, FASHION_QUALITY_GATE } from "@/lib/discover-personalization";
+import { normalizeMatchPercentForDisplay } from "@/lib/match-percent-display";
 import type { Listing } from "@/lib/supabase/listings.types";
 // The 4 sort-control options (Default / Most Recent / Price: Low to High /
 // Price: High to Low) — "" (Default) is the default and the fallback for
@@ -658,6 +659,28 @@ export async function fetchDiscoverBatch(
     (listing) => !savedListingIdSet.has(listing.id) && !dislikedListingIdSet.has(listing.id),
   );
 
+  // P0 first-60-seconds fix (item 4, staged recommendation strategy) — a
+  // brand-new user has NO real signal for scoreGarmentStyleMatch to work
+  // with: userStyleVector.hasSignal is false, so EVERY candidate gets the
+  // exact same NEUTRAL_BASELINE_TOTAL score (discover-personalization.ts),
+  // meaning the "personalized" primary sort key is actually a flat tie for
+  // every listing and the feed silently falls back to its tiebreak
+  // (price ascending) — a brand-new user's very first session was
+  // effectively sorted CHEAPEST FIRST, not by anything resembling quality.
+  // "Meaningful interaction" (this feature's own spec: likes, passes,
+  // brand selections, style selections) is checked directly against data
+  // already fetched above — no new queries. Below the threshold, ranking
+  // uses fashionQualityScore (computed per-candidate just below, already
+  // a composite of image quality/completeness/premium-brand-adjacent
+  // signals — see computeFashionQualityScore's own weights) as the
+  // primary signal instead of the meaningless flat personalization score,
+  // so a cold-start feed actually leads with Lockette's best inventory
+  // rather than an accidental price sort.
+  const MIN_INTERACTIONS_FOR_PERSONALIZATION = 3;
+  const interactionSignalCount = savedListingIds.length + dislikedListingIds.length;
+  const hasOnboardingSignal = favoriteBrands.length > 0 || preferences.length > 0;
+  const isColdStart = interactionSignalCount < MIN_INTERACTIONS_FOR_PERSONALIZATION && !hasOnboardingSignal;
+
   // matchPercent/stylePoints now come from the garment-level style match
   // against userStyleVector (discover-personalization.ts's
   // scoreGarmentStyleMatch — see this file's own header comment for why),
@@ -680,7 +703,6 @@ export async function fetchDiscoverBatch(
       visualAnalysis: listing.visual_analysis ?? null,
     });
     const dislikePenalty = assessListingAgainstDislikedStyles(listing.aesthetic_tags, dislikedStyles, now).penalty;
-    const matchPercent = Math.max(0, Math.min(100, Math.round(breakdown.total - dislikePenalty)));
 
     const fashionQuality = computeFashionQualityScore({
       images: listing.images,
@@ -693,6 +715,18 @@ export async function fetchDiscoverBatch(
       qualityScore: hasQualityScoreColumn ? (listing.quality_score ?? null) : null,
       inventoryQualityScore: hasIntelligenceColumns ? (listing.inventory_quality_score ?? null) : null,
     });
+
+    // P0 first-60-seconds fix (item 6) — normalized for DISPLAY only; the
+    // raw 0-100 score (breakdown.total) is untouched above, so the
+    // fashionability gate/sort logic just below (which compares raw
+    // scores) and tests/discover-personalization.test.ts's own assertion
+    // on breakdown.total are both unaffected. See
+    // src/lib/match-percent-display.ts for why this is a rescale, not a
+    // flat floor.
+    const rawMatchScore = isColdStart
+      ? Math.round(fashionQuality.score)
+      : Math.max(0, Math.min(100, Math.round(breakdown.total - dislikePenalty)));
+    const matchPercent = normalizeMatchPercentForDisplay(rawMatchScore);
 
     return { listing, matchPercent, stylePoints: breakdown.aestheticScore, fashionQualityScore: fashionQuality.score };
   });

@@ -20,7 +20,11 @@ export function AppTabBar() {
 
   return (
     <nav className="fixed inset-x-0 bottom-0 z-40 border-t border-border-soft bg-nav">
-      <div className="mx-auto flex max-w-md items-center justify-around px-6 py-2.5">
+      {/* Pre-launch polish fix (item 7) — pb uses env(safe-area-inset-bottom)
+          so this fixed bottom nav doesn't sit under the home-indicator area
+          on notched/gestural iOS devices (the codebase had zero safe-area
+          handling anywhere before this). */}
+      <div className="mx-auto flex max-w-md items-center justify-around px-6 pt-2.5 pb-[calc(0.625rem+env(safe-area-inset-bottom))]">
         {TABS.map(({ href, label, icon: Icon }) => {
           const isActive = pathname === href || pathname.startsWith(`${href}/`);
           return (

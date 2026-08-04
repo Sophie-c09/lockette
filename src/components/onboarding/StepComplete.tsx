@@ -17,7 +17,7 @@ export function StepComplete({
     <div className="mx-auto flex max-w-md flex-col items-center py-16 text-center">
       {status === "saving" && (
         <>
-          <Loader2 className="h-10 w-10 animate-spin text-oxblood" />
+          <Loader2 className="h-8 w-8 animate-spin text-oxblood" strokeWidth={1.5} />
           <p className="mt-6 font-display text-xl font-semibold text-ink">
             Saving your style profile…
           </p>

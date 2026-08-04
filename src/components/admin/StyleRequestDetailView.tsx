@@ -319,7 +319,7 @@ export function StyleRequestDetailView({ detail }: { detail: StyleRequestDetail 
 
         {(scraperPhase === "discovering" || scraperPhase === "importing") && (
           <div className="flex flex-col items-center gap-2">
-            <Loader2 className="h-5 w-5 animate-spin text-oxblood" />
+            <Loader2 className="h-8 w-8 animate-spin text-oxblood" strokeWidth={1.5} />
             <p className="text-sm font-medium text-ink">
               {scraperPhase === "discovering" ? "Finding listings..." : `Imported ${scraperImported}`}
             </p>
@@ -399,7 +399,7 @@ export function StyleRequestDetailView({ detail }: { detail: StyleRequestDetail 
           <div className="mt-3 flex flex-col gap-2">
             {selected.map((listing) => (
               <div key={listing.id} className="flex items-center justify-between gap-2 rounded-2xl bg-inner/50 px-3 py-2">
-                <span className="truncate text-sm text-ink">{listing.title}</span>
+                <span className="min-w-0 truncate text-sm text-ink">{listing.title}</span>
                 <button
                   type="button"
                   onClick={() => toggleSelected(listing)}

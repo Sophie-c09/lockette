@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 import { createClient } from "@/lib/supabase/server";
 import { generateStyleDna } from "@/lib/style-dna";
 import { ProfileView } from "@/components/profile/ProfileView";
+import { RetryButton } from "@/components/ui/RetryButton";
 
 export const metadata: Metadata = {
   title: "Your profile — Lockette",
@@ -18,7 +19,10 @@ export default async function ProfilePage() {
     redirect("/login");
   }
 
-  const [{ data: profile }, { data: styleProfile }] = await Promise.all([
+  const [
+    { data: profile, error: profileError },
+    { data: styleProfile, error: styleProfileError },
+  ] = await Promise.all([
     supabase
       .from("profiles")
       .select("username, display_name, avatar_url, bio")
@@ -32,6 +36,23 @@ export default async function ProfilePage() {
       .eq("user_id", user.id)
       .maybeSingle(),
   ]);
+
+  // Pre-launch polish fix (item 4) — a failed query here used to leave
+  // profile/styleProfile as undefined, which the check right below this
+  // used to read as "never finished onboarding" and silently redirect to
+  // /profile/setup — a real fetch failure masquerading as a stale account.
+  // Surfacing it here as a genuine error state (with a retry) keeps that
+  // redirect meaning what it says: identity genuinely isn't set up yet.
+  if (profileError || styleProfileError) {
+    return (
+      <div className="flex min-h-[calc(100vh-137px)] items-center justify-center px-6 text-center">
+        <div className="mx-auto flex max-w-md flex-col items-center gap-4 rounded-card bg-highlight-cream px-8 py-16 text-center">
+          <p className="text-sm text-ink-soft">Something went wrong loading your profile.</p>
+          <RetryButton />
+        </div>
+      </div>
+    );
+  }
 
   // Basic identity isn't set up yet — finish that before viewing the profile.
   if (!profile?.username || !profile?.display_name) {

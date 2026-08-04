@@ -1045,25 +1045,6 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
         body: JSON.stringify({}),
       });
 
-      // TEMPORARY diagnostic — "mismatched error message" investigation
-      // (the displayed error said "Inventory Growth failed" for a
-      // Continuous Import click — see parseApiResponse's own featureLabel
-      // param, which is the actual fix for that; this logging is purely
-      // to confirm what this specific request's own response looks like).
-      // response.clone() so this read doesn't consume the body
-      // parseApiResponse still needs below (a fetch Response body can
-      // only be read once). Remove once a fresh test confirms the real
-      // status/content-type this request gets back.
-      const diagnosticClone = response.clone();
-      console.log("[DIAGNOSTIC]", {
-        feature: "continuous-import",
-        url: requestUrl,
-        method: requestMethod,
-        status: diagnosticClone.status,
-        contentType: diagnosticClone.headers.get("content-type"),
-        body: (await diagnosticClone.text()).slice(0, 500),
-      });
-
       // Never response.json() directly — see src/lib/api-response.ts's own
       // header comment for the exact production incident (a framework-
       // level 500 HTML page, not this route's JSON) this replaced. This is
@@ -1384,7 +1365,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
           {(bulkPhase === "discovering" || bulkPhase === "importing") && (
             <div className="flex flex-col items-center gap-2">
-              <Loader2 className="h-5 w-5 animate-spin text-oxblood" />
+              <Loader2 className="h-8 w-8 animate-spin text-oxblood" strokeWidth={1.5} />
               <p className="text-sm font-medium text-ink">
                 {bulkPhase === "discovering" ? "Finding listings..." : `Imported ${bulkImported}/${bulkTarget}`}
               </p>
@@ -1526,7 +1507,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
           {stylePhase === "starting" && (
             <div className="flex flex-col items-center gap-2">
-              <Loader2 className="h-5 w-5 animate-spin text-oxblood" />
+              <Loader2 className="h-8 w-8 animate-spin text-oxblood" strokeWidth={1.5} />
               <p className="text-sm font-medium text-ink">Starting scrape...</p>
             </div>
           )}
@@ -1546,7 +1527,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                   </Button>
                 </div>
               ) : (
-                <Loader2 className="h-5 w-5 animate-spin text-oxblood" />
+                <Loader2 className="h-8 w-8 animate-spin text-oxblood" strokeWidth={1.5} />
               )}
               <p className="text-sm font-medium text-ink">Scraper running...</p>
 

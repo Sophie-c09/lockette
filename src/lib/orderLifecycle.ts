@@ -3,70 +3,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { createClient } from "@/lib/supabase/server";
 import { createNotification } from "@/lib/notifications";
-import { capturePayment } from "@/lib/payment";
-
-const CAPTURE_RETRY_INITIAL_DELAY_MS = 5 * 60 * 1000;
-const CAPTURE_RETRY_MAX_DELAY_MS = 60 * 60 * 1000;
-
-/**
- * Best-effort — stamps capture_retry_at after a failed automatic capture,
- * so retryPendingCaptures() (src/lib/paymentRetry.ts) knows when it's
- * safe to try again. Exponential backoff: 5m, then double each
- * subsequent failure for the same order (10m, 20m, 40m), capped at 1h —
- * called both from syncOrderStatus below (first failure) and from
- * retryPendingCaptures (every failure after that).
- *
- * capture_retry_at is the only piece of state this feature is allowed to
- * add (no separate "delay" or "attempt count" column) — so the previous
- * delay is *approximated* from how far the existing capture_retry_at
- * still is from right now, floored at the initial delay so a reschedule
- * can never come out shorter than 5 minutes. This is exact when
- * consecutive failures happen close together in wall-clock time relative
- * to the delay (the common case for a retry storm); if real time drifts
- * far enough that the gap collapses to near-zero, it floors back to the
- * base delay rather than under- or over-shooting — never violates "don't
- * retry immediately," even though it can't guarantee the exact 5/10/20/40
- * rung on every single call in every timing scenario.
- *
- * Never thrown: a missing capture_retry_at column (not yet migrated onto
- * the live DB) just means the retry sweep falls back to retrying every
- * "authorized" + "completed" order it finds every time it runs, instead
- * of respecting the delay — degraded, not broken.
- */
-export async function scheduleCaptureRetry(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching createClient()'s own untyped default (see supabase/server.ts)
-  supabase: SupabaseClient<any>,
-  orderId: string,
-): Promise<void> {
-  const { data, error: fetchError } = await supabase
-    .from("orders")
-    .select("capture_retry_at")
-    .eq("id", orderId)
-    .maybeSingle();
-
-  if (fetchError) {
-    console.error("[order-lifecycle] Failed to read capture_retry_at (column may not exist yet):", fetchError);
-    return;
-  }
-
-  const now = Date.now();
-  const previousRetryAt: string | null | undefined = data?.capture_retry_at;
-
-  let nextDelayMs: number;
-  if (!previousRetryAt) {
-    nextDelayMs = CAPTURE_RETRY_INITIAL_DELAY_MS;
-  } else {
-    const impliedPreviousDelayMs = Math.max(CAPTURE_RETRY_INITIAL_DELAY_MS, Math.abs(now - new Date(previousRetryAt).getTime()));
-    nextDelayMs = Math.min(CAPTURE_RETRY_MAX_DELAY_MS, impliedPreviousDelayMs * 2);
-  }
-
-  const retryAt = new Date(now + nextDelayMs).toISOString();
-  const { error: updateError } = await supabase.from("orders").update({ capture_retry_at: retryAt }).eq("id", orderId);
-
-  if (updateError) {
-    console.error("[order-lifecycle] Failed to schedule capture retry:", updateError);
-  }
-}
 
 // Turns whatever value a numeric DB column round-tripped as into a safe,
 // finite number — same reasoning as the identical helper in createOrder.ts
@@ -161,11 +97,6 @@ export async function syncOrderStatus(
 
   const hasActiveItem = items.some((item) => ACTIVE_ITEM_STATUSES.includes(item.status));
   const allResolved = items.every((item) => RESOLVED_ITEM_STATUSES.includes(item.status));
-  // Stricter than allResolved: a fully successful order, not just a
-  // finished one — an order with even one failed_unavailable item is
-  // "resolved" but should never auto-capture (it likely needs a partial
-  // refund instead, not a full capture).
-  const allPurchased = items.every((item) => item.status === "purchased");
   const nextStatus = hasActiveItem ? "processing" : allResolved ? "completed" : null;
 
   // Recomputed as a fresh total every call — never incremented — so this
@@ -210,35 +141,15 @@ export async function syncOrderStatus(
         console.error("[order-lifecycle] Failed to create order_completed notification:", notifyError);
       }
 
-      // Automatically capture payment once fulfillment is fully
-      // successful — every item purchased, none failed_unavailable (see
-      // allPurchased above). Only fires on this same one-time transition
-      // into "completed" as the notification above, so a completed order
-      // is never captured twice. Checking payment_status === "authorized"
-      // first (rather than always calling capturePayment and letting its
-      // own internal guard no-op) avoids calling it — and logging a
-      // result — for orders that were never authorized in the first
-      // place. capturePayment itself (src/lib/payment.ts, untouched) is
-      // also already safe to call more than once: it no-ops unless
-      // payment_status is exactly "authorized", so it can never capture
-      // an already-"captured" order either.
-      if (allPurchased && order.payment_status === "authorized") {
-        try {
-          const captureResult = await capturePayment(orderId);
-          if (!captureResult.success) {
-            // Logged, payment_status deliberately left untouched here —
-            // capturePayment already leaves it exactly as it found it on
-            // failure, and this file has no business overriding that.
-            // Instead, schedule a later retry rather than requiring an
-            // admin to notice and re-trigger it manually.
-            console.error("[order-lifecycle] capturePayment did not succeed:", captureResult.paymentStatus);
-            await scheduleCaptureRetry(supabase, orderId);
-          }
-        } catch (error) {
-          console.error("[order-lifecycle] capturePayment threw unexpectedly:", error);
-          await scheduleCaptureRetry(supabase, orderId);
-        }
-      }
+      // Payment itself was already captured at checkout time (standard
+      // automatic-capture PaymentIntents — see src/lib/payment.ts's own
+      // header comment) — there is no separate "capture once fulfillment
+      // finishes" step anymore. An order with one or more
+      // failed_unavailable items still owes the customer a partial refund
+      // for those items (refunded_amount, updated above, tracks exactly
+      // how much) — issuing that Stripe refund is currently a manual,
+      // admin-initiated step (see refundPayment in src/lib/payment.ts and
+      // this feature's own report) rather than automated here.
     }
   }
 

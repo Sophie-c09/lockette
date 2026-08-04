@@ -7,6 +7,7 @@ import { submitStyleRequest, type SubmitStyleRequestState } from "@/app/actions/
 import { Button } from "@/components/ui/Button";
 import { isAllowedListingPhotoType, MAX_LISTING_PHOTOS, MAX_STYLE_REQUEST_PHOTO_BYTES } from "@/lib/listing-photo";
 import { SELECTED_CATEGORY_OPTIONS, type SelectedCategory } from "@/lib/selected-categories";
+import { STYLE_REQUEST_BUDGET_OPTIONS } from "@/lib/style-request-budget";
 
 const initialState: SubmitStyleRequestState = undefined;
 
@@ -121,18 +122,6 @@ export function StyleRequestForm() {
       formData.append("images", photo.file);
     }
 
-    // TEMPORARY DEBUG LOGGING — confirms the browser is constructing a
-    // correct FormData (real File entries, right sizes) immediately
-    // before it's handed to the Server Action. Remove once confirmed.
-    console.log("[Style Request Client Submit]", {
-      fields: [...formData.keys()],
-      files: formData.getAll("images").map((file) => ({
-        name: (file as File).name,
-        size: (file as File).size,
-        type: (file as File).type,
-      })),
-    });
-
     startTransition(() => {
       formAction(formData);
     });
@@ -155,12 +144,20 @@ export function StyleRequestForm() {
   }
 
   if (state?.requestId) {
+    // Pre-submission fix — this branch is only reached when
+    // createGeneratingBundle itself failed for a reason OTHER than a
+    // missing photo (see submitStyleRequest's own comment in
+    // style-requests.ts) — a real inspiration photo is already guaranteed
+    // present here, so the old "add a photo" copy was actively wrong,
+    // not just imprecise, and read as a cheerful success message for what
+    // is actually a backend hiccup.
     return (
       <div className="mx-auto max-w-md px-6 py-16 text-center">
         <Sparkles className="mx-auto h-8 w-8 text-oxblood" strokeWidth={1.5} />
-        <h1 className="mt-3 font-display text-2xl font-semibold text-ink">Request sent!</h1>
+        <h1 className="mt-3 font-display text-2xl font-semibold text-ink">We hit a snag starting your bundle</h1>
         <p className="mt-3 text-sm text-ink-soft">
-          Add at least one inspiration photo to generate your Lockette bundle.
+          Your request was saved, but we couldn&apos;t start building your bundle just yet. Check My Style Requests in
+          a bit, or send it again.
         </p>
         <div className="mt-6 flex justify-center gap-3">
           <Button variant="secondary" onClick={() => router.push("/my-style-requests")}>
@@ -200,17 +197,21 @@ export function StyleRequestForm() {
 
         <div>
           <label htmlFor="budget" className="mb-1.5 block text-sm font-medium text-ink">
-            Budget ($)
+            Budget
           </label>
-          <input
+          <select
             id="budget"
             name="budget"
-            type="number"
-            min="0.01"
-            step="0.01"
-            placeholder="Optional"
-            className="w-full rounded-2xl border border-border bg-surface px-4 py-3 text-sm text-ink focus:border-oxblood focus:outline-none"
-          />
+            defaultValue=""
+            className="w-full cursor-pointer rounded-2xl border border-border bg-surface px-4 py-3 text-sm text-ink focus:border-oxblood focus:outline-none"
+          >
+            <option value="">No preference</option>
+            {STYLE_REQUEST_BUDGET_OPTIONS.map((option) => (
+              <option key={option.label} value={option.value}>
+                {option.label}
+              </option>
+            ))}
+          </select>
         </div>
 
         <div>
@@ -273,7 +274,7 @@ export function StyleRequestForm() {
                     type="button"
                     onClick={() => handleRemovePhoto(index)}
                     aria-label="Remove photo"
-                    className="absolute right-1 top-1 flex h-6 w-6 cursor-pointer items-center justify-center rounded-full bg-ink-strong/70 text-white hover:bg-ink-strong"
+                    className="absolute right-1 top-1 flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-ink-strong/70 text-white hover:bg-ink-strong"
                   >
                     <X className="h-3.5 w-3.5" strokeWidth={2.5} />
                   </button>

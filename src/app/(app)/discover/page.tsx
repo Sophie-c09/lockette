@@ -5,6 +5,7 @@ import { getItemTypeCategoryBySlug } from "@/lib/item-type-categories";
 import { DiscoverView } from "@/components/discover/DiscoverView";
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
+import { RetryButton } from "@/components/ui/RetryButton";
 
 export const metadata: Metadata = {
   title: "Discover — Lockette",
@@ -37,10 +38,12 @@ export default async function DiscoverPage({
   if (error) {
     return (
       <div className="flex min-h-[calc(100vh-137px)] items-center justify-center px-6 text-center">
-        <p className="text-sm text-ink-soft">
-          Something went wrong loading the marketplace. Please try refreshing
-          the page.
-        </p>
+        <div className="mx-auto flex max-w-md flex-col items-center gap-4 rounded-card bg-highlight-cream px-8 py-16 text-center">
+          <p className="text-sm text-ink-soft">
+            Something went wrong loading the marketplace.
+          </p>
+          <RetryButton />
+        </div>
       </div>
     );
   }

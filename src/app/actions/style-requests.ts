@@ -6,6 +6,7 @@
 // src/lib/styleRequestAdmin.ts.
 import { revalidatePath } from "next/cache";
 import { redirect } from "next/navigation";
+import { after } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -24,7 +25,20 @@ import {
 import { SELECTED_CATEGORY_OPTIONS, type SelectedCategory } from "@/lib/selected-categories";
 import { searchMarketplaceItems } from "@/lib/marketplace-search";
 import { rankBySimilarity } from "@/lib/garment-similarity-ranking";
-import { categorizeListing } from "@/lib/bulk-import";
+// Root cause of "Style Bundle is broken" (P0 first-60-seconds pass) —
+// this used to import categorizeListing from "@/lib/bulk-import", which
+// transitively imports @/lib/listing-extraction -> browser-extractor.ts
+// -> `import { chromium } from "playwright"` at module scope. That's the
+// exact same "native-binary package pulled into a real user-facing
+// request path" crash already diagnosed and fixed once for Discover (see
+// next.config.ts's own comment) — except it was silently reintroduced
+// here, meaning /style-request, /bundle/[id], and /my-style-requests
+// (every export in this file, including getBundleById/addBundleToCart)
+// all transitively loaded Playwright just to categorize a listing's
+// title into a bucket. category-bucket.ts is the dependency-free module
+// bulk-import.ts itself sources this from and merely re-exports —
+// importing it directly here removes the contamination entirely.
+import { categorizeListing } from "@/lib/category-bucket";
 import { calculateBundlePricing } from "@/lib/bundle-pricing";
 import { createGeneratingBundle, runBundleGenerationAsync } from "@/lib/bundle-generation";
 import type { DetectedGarment, GarmentCategory } from "@/lib/garment-detection";
@@ -168,18 +182,36 @@ export async function submitStyleRequest(
   // src/lib/bundle-generation.ts's own header comment on the async
   // section for exactly how/why). createGeneratingBundle is awaited (it's
   // just one fast insert); runBundleGenerationAsync is deliberately NOT
-  // awaited — it keeps running after this function redirects, writing
-  // items into the bundle progressively as they're found.
+  // awaited directly — it keeps running after this function redirects,
+  // writing items into the bundle progressively as they're found.
+  //
+  // Root cause of "Style Bundle is broken" (P0 first-60-seconds pass):
+  // this used to be a bare fire-and-forget call with NO after(). This
+  // app is deployed on Vercel serverless Functions, which can freeze/tear
+  // down compute the instant a response is sent (redirect() below sends
+  // one immediately) — bundle-generation.ts's own header comment already
+  // documented this exact risk ("this needs a real durable queue instead"
+  // if ever deployed that way) but the fix was never applied. Wrapping in
+  // after() (Next.js's built-in equivalent to a serverless waitUntil) is
+  // what actually keeps this work alive past the response — the same
+  // mechanism /api/admin-scraper/run already uses for its own background
+  // scraper run. Without it, a bundle could get stuck at
+  // status='generating' forever, with no error, no retry, and no visible
+  // reason — exactly the "stuck loading" symptom this fixes.
   const generating = await createGeneratingBundle(request.id);
 
   if (generating.bundleId) {
     const bundleId = generating.bundleId;
 
-    runBundleGenerationAsync(request.id, bundleId, user.id).catch((error) => {
-      console.error(
-        "[style-requests] Async bundle generation threw unexpectedly:",
-        error
-      );
+    after(async () => {
+      try {
+        await runBundleGenerationAsync(request.id, bundleId, user.id);
+      } catch (error) {
+        console.error(
+          "[style-requests] Async bundle generation threw unexpectedly:",
+          error
+        );
+      }
     });
 
     // Outside any try/catch on purpose — redirect() throws a special
@@ -252,6 +284,11 @@ export interface MyStyleRequestBundle {
   // BundleOutfitView.tsx's GENERATION_STEP_LABELS for how each is shown.
   generationStep: string | null;
   generationProgress: number;
+  // Retry support (retryBundleGeneration below) — how many times
+  // generation has actually been attempted for this bundle (the initial
+  // attempt included), so the UI/action can cap retries truthfully rather
+  // than letting a stuck request be retried forever.
+  attemptCount: number;
 }
 
 export interface MyStyleRequest {
@@ -266,7 +303,7 @@ export interface MyStyleRequest {
 }
 
 const BUNDLE_COLUMNS =
-  "id, title, description, preview_image, item_subtotal, mavelle_fee, total_price, estimated_delivery_start, estimated_delivery_end, status, generation_error, generation_step, generation_progress";
+  "id, title, description, preview_image, item_subtotal, mavelle_fee, total_price, estimated_delivery_start, estimated_delivery_end, status, generation_error, generation_step, generation_progress, attempt_count";
 
 interface BundleRow {
   id: string;
@@ -282,6 +319,7 @@ interface BundleRow {
   generation_error: string | null;
   generation_step: string | null;
   generation_progress: number | null;
+  attempt_count: number | null;
 }
 
 // Shared by getMyStyleRequests (below) and getBundleById (the /bundle/[id]
@@ -324,6 +362,7 @@ async function loadBundleItems(
     generationError: bundleRow.generation_error,
     generationStep: bundleRow.generation_step,
     generationProgress: bundleRow.generation_progress ?? 0,
+    attemptCount: bundleRow.attempt_count ?? 0,
   };
 }
 
@@ -417,6 +456,117 @@ export async function getBundleById(bundleId: string): Promise<{ bundle?: MyStyl
 
   const bundle = await loadBundleItems(supabase, bundleRow);
   return { bundle };
+}
+
+// A stuck/failed request should get a real second (and third) chance,
+// not an infinite one — same reasoning as this app's other bounded-retry
+// sweeps (e.g. capture_retry_at's own exponential backoff). Counted from
+// attempt_count, which the initial generation already stamps at 1 (see
+// createGeneratingBundle in bundle-generation.ts), so this cap covers the
+// TOTAL number of times generation has ever run for this bundle, not just
+// manual retries.
+const MAX_GENERATION_ATTEMPTS = 3;
+
+export interface RetryBundleGenerationResult {
+  success?: boolean;
+  error?: string;
+}
+
+/**
+ * Retries a genuinely failed bundle generation in place — reuses the SAME
+ * style_requests row (same photos, same budget, same categories — never
+ * re-uploads or duplicates anything) and the SAME styled_bundles row
+ * (never creates a second bundle for one request), so a retry can never
+ * produce a duplicate paid request or duplicate bundle. Only ever retries
+ * a bundle that's actually `status: "error"` — retrying a "generating" or
+ * "ready" bundle would risk a second generation racing the first, or
+ * clobbering a completed one, so both are rejected outright. Capped at
+ * MAX_GENERATION_ATTEMPTS; once reached, returns a clear terminal message
+ * instead of ever retrying again.
+ */
+export async function retryBundleGeneration(bundleId: string): Promise<RetryBundleGenerationResult> {
+  const supabase = await createClient();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user) {
+    return { error: "You must be signed in." };
+  }
+
+  const { data: bundleRow, error } = await supabase
+    .from("styled_bundles")
+    .select("id, request_id, status, attempt_count, style_requests(user_id)")
+    .eq("id", bundleId)
+    .maybeSingle();
+
+  if (error || !bundleRow) {
+    return { error: "Bundle not found." };
+  }
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- nested PostgREST join shape, same convention as getBundleById's identical ownership check above
+  const ownerUserId = (bundleRow as any).style_requests?.user_id;
+  if (ownerUserId !== user.id) {
+    return { error: "You don't have access to this bundle." };
+  }
+
+  if (bundleRow.status !== "error") {
+    // Not a real failure to retry — either still working (the "Check now"/
+    // polling path already covers that) or already done. Retrying either
+    // would risk a second generation racing the first, or overwriting a
+    // completed bundle with a fresh (and possibly worse) one.
+    return { error: "This bundle isn't in a state that can be retried right now." };
+  }
+
+  const attemptCount = bundleRow.attempt_count ?? 0;
+  if (attemptCount >= MAX_GENERATION_ATTEMPTS) {
+    return { error: "We couldn't complete this bundle after several attempts. Please submit a new style request." };
+  }
+
+  const adminSupabase = createAdminClient();
+
+  // Defensive — a real failure this codebase has actually hit (see this
+  // feature's own launch-readiness report) is an exception thrown partway
+  // through the per-item Promise.allSettled loop in runBundleGenerationAsync,
+  // AFTER some items had already been inserted for this same attempt.
+  // Clearing any leftover items before retrying is what keeps a retry from
+  // ever producing duplicate styled_bundle_items for the same bundle.
+  const { error: clearItemsError } = await adminSupabase.from("styled_bundle_items").delete().eq("bundle_id", bundleId);
+  if (clearItemsError) {
+    console.error("[retry-bundle-generation] Failed to clear stale items before retry:", clearItemsError);
+    return { error: "Something went wrong retrying this bundle. Please try again." };
+  }
+
+  const { error: resetError } = await adminSupabase
+    .from("styled_bundles")
+    .update({
+      status: "generating",
+      generation_step: "starting",
+      generation_progress: 5,
+      generation_error: null,
+      attempt_count: attemptCount + 1,
+      last_attempt_at: new Date().toISOString(),
+    })
+    .eq("id", bundleId);
+
+  if (resetError) {
+    console.error("[retry-bundle-generation] Failed to reset bundle for retry:", resetError);
+    return { error: "Something went wrong retrying this bundle. Please try again." };
+  }
+
+  // Same after()-wrapped, detached-execution pattern as the original
+  // submission (see submitStyleRequest's own comment) — this Server
+  // Action's response is what the client is waiting on; generation itself
+  // keeps running past it.
+  after(async () => {
+    try {
+      await runBundleGenerationAsync(bundleRow.request_id, bundleId, user.id);
+    } catch (retryError) {
+      console.error("[retry-bundle-generation] Async retry generation threw unexpectedly:", retryError);
+    }
+  });
+
+  return { success: true };
 }
 
 /**

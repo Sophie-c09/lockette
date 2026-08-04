@@ -2,7 +2,6 @@ import type { Metadata } from "next";
 import { createClient } from "@/lib/supabase/server";
 import { calculateUrgencyScore } from "@/lib/urgency-scoring";
 import { buildMatchPercentLookup, computeMatchPercentForListing } from "@/lib/order-match-percent";
-import { retryPendingCaptures } from "@/lib/paymentRetry";
 import { AdminOrdersView, type FulfillmentOrder, type FulfillmentItem } from "@/components/admin/AdminOrdersView";
 
 // Internal tool — same "not linked from anywhere in the app's nav" posture
@@ -19,16 +18,6 @@ function toSafeNumber(value: unknown): number {
 
 export default async function AdminOrdersPage() {
   const supabase = await createClient();
-
-  // Best-effort — retries any order whose automatic capture (see
-  // syncOrderStatus in src/lib/orderLifecycle.ts) previously failed. No
-  // cron/background job in this app, so this dashboard's own page load is
-  // the opportunistic substitute (same pattern as releaseExpiredReservations
-  // being swept on Discover/Feed/Match page loads).
-  const retryResult = await retryPendingCaptures();
-  if (retryResult.error) {
-    console.error("[admin-orders-page] retryPendingCaptures failed:", retryResult.error);
-  }
 
   // processing_started_at/opened_at/purchased_at (this task's new time-
   // tracking columns) may not exist on the live DB yet — selecting a

@@ -5,7 +5,7 @@ import { createClient } from "@/lib/supabase/server";
 import { NavTabs } from "@/components/NavTabs";
 import { NotificationBell } from "@/components/NotificationBell";
 import { StyleFeaturesMenu } from "@/components/StyleFeaturesMenu";
-import { getRecentNotifications, getUnreadNotificationCount } from "@/lib/notifications";
+import { getNotificationsWithUnreadCount } from "@/lib/notifications";
 
 // High-fashion italic serif for the homepage-only wordmark treatment
 // below (early-2000s editorial/luxury feel — Blumarine/Dior/Miu Miu era —
@@ -57,9 +57,9 @@ export async function Nav() {
   // Rendered outside NavTabs entirely (rather than as one more of its
   // tabs) so it can't interfere with NavTabs' own DOM-measurement-based
   // sliding underline.
-  const [initialNotifications, initialUnreadCount] = user
-    ? await Promise.all([getRecentNotifications(), getUnreadNotificationCount()])
-    : [[], 0];
+  const { notifications: initialNotifications, unreadCount: initialUnreadCount } = user
+    ? await getNotificationsWithUnreadCount()
+    : { notifications: [], unreadCount: 0 };
 
   return (
     <header className="sticky top-0 z-30 border-b border-border-soft bg-nav">

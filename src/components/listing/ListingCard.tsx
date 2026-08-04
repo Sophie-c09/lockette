@@ -1,9 +1,10 @@
 "use client";
 
-import { useState, type KeyboardEvent, type MouseEvent } from "react";
+import { memo, useState, type KeyboardEvent, type MouseEvent } from "react";
 import { useRouter } from "next/navigation";
 import { MoreVertical } from "lucide-react";
 import { Badge, tagVariantForIndex } from "@/components/ui/Badge";
+import { PlatformBadge } from "@/components/ui/PlatformBadge";
 import { SaveButton } from "@/components/SaveButton";
 import { ImageCarousel } from "@/components/ImageCarousel";
 import { removeListing, markListingLowQuality } from "@/lib/adminListingRemoval";
@@ -21,7 +22,11 @@ import type { Listing } from "@/lib/supabase/listings.types";
 function MatchBadge({ score }: { score: number }) {
   if (score <= 0) return null;
 
-  const isHighMatch = score >= 70;
+  // Threshold re-tuned for the normalized 25-99 display scale
+  // (normalizeMatchPercentForDisplay, src/lib/match-percent-display.ts) —
+  // 70 on the old raw 0-100 scale is ~77 once rescaled, same relative
+  // "how good is this match" meaning as before.
+  const isHighMatch = score >= 77;
 
   return (
     <span
@@ -45,13 +50,12 @@ function MatchBadge({ score }: { score: number }) {
 // "ignore clicks inside a button" pattern (rather than a bare `<Link>`)
 // so the admin-only "..." menu's nested `<button>` composes safely with
 // SaveButton and real navigation alike.
-export function ListingCard({
+function ListingCardImpl({
   listing,
   isAdmin = false,
   initialSaved = false,
   showSaveButton = false,
   matchScore = null,
-  stylePoints = null,
 }: {
   listing: Listing;
   // Admins see Remove/Hide options on EVERY card — this is an
@@ -61,13 +65,6 @@ export function ListingCard({
   initialSaved?: boolean;
   showSaveButton?: boolean;
   matchScore?: number | null;
-  // Style DNA tag-overlap sub-score (0-50, match-scoring.ts's own
-  // MatchScoreBreakdown.styleScore) — a smaller, secondary number next to
-  // matchScore's prominent badge, not a second match percentage. Only
-  // Discover passes this today; every other existing caller (Match's
-  // "Find Similar" results, Style Me's reveal bundle) leaves it null, so
-  // this renders nothing for them, same as matchScore already does.
-  stylePoints?: number | null;
 }) {
   const router = useRouter();
   const { showToast } = useToast();
@@ -164,15 +161,13 @@ export function ListingCard({
         )}
 
         {matchScore != null && (
-          <div className={showSaveButton ? "absolute left-2 top-11" : "absolute left-2 top-2"}>
+          <div className={showSaveButton ? "absolute left-2 top-14" : "absolute left-2 top-2"}>
             <MatchBadge score={matchScore} />
           </div>
         )}
 
         {listing.platform && (
-          <span className="absolute bottom-2 right-2 rounded-pill bg-darkgreen/45 px-2.5 py-1 text-xs font-medium text-white">
-            {listing.platform}
-          </span>
+          <PlatformBadge platform={listing.platform} className="absolute bottom-2 right-2" />
         )}
 
         {isAdmin && (
@@ -185,9 +180,9 @@ export function ListingCard({
               }}
               aria-label="Listing options"
               aria-expanded={menuOpen}
-              className="flex h-6 w-6 cursor-pointer items-center justify-center rounded-full bg-surface/70 text-ink-soft backdrop-blur-sm transition-colors hover:bg-surface/90 hover:text-ink"
+              className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full bg-surface/70 text-ink-soft backdrop-blur-sm transition-colors hover:bg-surface/90 hover:text-ink"
             >
-              <MoreVertical className="h-3.5 w-3.5" strokeWidth={2} />
+              <MoreVertical className="h-4 w-4" strokeWidth={2} />
             </button>
 
             {menuOpen && (
@@ -217,7 +212,7 @@ export function ListingCard({
 
       <div className="flex flex-1 flex-col gap-1 p-3">
         <div className="flex items-start justify-between gap-2">
-          <h3 className="line-clamp-2 font-display text-sm font-semibold leading-tight text-ink">
+          <h3 className="min-w-0 line-clamp-2 font-display text-sm font-semibold leading-tight text-ink">
             {listing.title}
           </h3>
           {listing.price != null && (
@@ -227,12 +222,8 @@ export function ListingCard({
           )}
         </div>
 
-        {stylePoints != null && (
-          <p className="text-[11px] font-medium text-ink-soft">+{stylePoints} Style Points</p>
-        )}
-
         {(listing.brand || listing.category || listing.size) && (
-          <p className="text-[11px] text-muted">
+          <p className="text-[11px] text-ink-soft">
             {[listing.brand, listing.category, listing.size].filter(Boolean).join(" · ")}
           </p>
         )}
@@ -250,3 +241,12 @@ export function ListingCard({
     </div>
   );
 }
+
+// Pre-submission perf fix — DiscoverView's infinite-scroll appends
+// (setListings((current) => [...current, ...more])) and sort-dropdown
+// changes both create a new listings array reference, which without this
+// re-renders every already-loaded card in the grid, not just the new ones.
+// Props here are stable per-item primitives/references, so memoizing
+// cleanly skips that redundant work for a grid that can grow past 100
+// cards across a scroll session.
+export const ListingCard = memo(ListingCardImpl);

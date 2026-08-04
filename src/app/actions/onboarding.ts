@@ -3,6 +3,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { mergeDislikedStyleSignals, type DislikedStyles } from "@/lib/disliked-styles";
 import { generateAndSaveStyleEmbedding } from "@/lib/style-embedding";
+import { MIN_BRANDS_REQUIRED } from "@/lib/onboarding-data";
 
 export interface OnboardingPayload {
   aesthetics: string[];
@@ -31,6 +32,16 @@ export async function saveOnboarding(
 
   if (userError || !user) {
     return { error: "You must be signed in to save your style profile." };
+  }
+
+  // P0 first-60-seconds fix (item 9) — "user must choose at least five
+  // brands." StepBrands.tsx/OnboardingFlow.tsx already block the client
+  // from reaching this call with fewer, but this is the real, load-
+  // bearing enforcement (a disabled Continue button is a UX nicety, not
+  // a guarantee — a request built by hand or with JS disabled could
+  // still reach this action directly).
+  if (payload.brands.length < MIN_BRANDS_REQUIRED) {
+    return { error: `Please choose at least ${MIN_BRANDS_REQUIRED} brands.` };
   }
 
   // Fashion preferences live on style_profiles, not profiles — keeps

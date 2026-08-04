@@ -85,7 +85,7 @@ export function ImageGallery({
                   type="button"
                   onClick={() => goTo(boundedIndex - 1)}
                   aria-label="Previous image"
-                  className="absolute left-2 top-1/2 z-10 flex h-8 w-8 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
+                  className="absolute left-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
                 >
                   <ChevronLeft className="h-4 w-4" strokeWidth={2.5} />
                 </button>
@@ -93,7 +93,7 @@ export function ImageGallery({
                   type="button"
                   onClick={() => goTo(boundedIndex + 1)}
                   aria-label="Next image"
-                  className="absolute right-2 top-1/2 z-10 flex h-8 w-8 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
+                  className="absolute right-2 top-1/2 z-10 flex h-10 w-10 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-darkgreen/45 text-white transition-colors hover:bg-oxblood"
                 >
                   <ChevronRight className="h-4 w-4" strokeWidth={2.5} />
                 </button>

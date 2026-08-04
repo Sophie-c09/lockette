@@ -28,8 +28,11 @@ const variantStyles: Record<Variant, string> = {
     "bg-highlight-cream text-highlight-cream-ink hover:bg-[#fef6d9]",
 };
 
+// Pre-launch polish fix (item 7) — py-2.5 put this at ~40px tall, just
+// under the 44px touch-target guideline; py-3 clears it without changing
+// the button's visual weight noticeably.
 const baseStyles =
-  "inline-flex items-center justify-center gap-2 rounded-pill px-5 py-2.5 text-sm font-semibold transition-all duration-200 ease-in-out disabled:opacity-50 disabled:pointer-events-none cursor-pointer";
+  "inline-flex items-center justify-center gap-2 rounded-pill px-5 py-3 text-sm font-semibold transition-all duration-200 ease-in-out disabled:opacity-50 disabled:pointer-events-none cursor-pointer";
 
 type CommonProps = {
   variant?: Variant;

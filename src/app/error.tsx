@@ -12,7 +12,7 @@
 // Supabase queries) fell through to Next's bare-minimum default — no
 // "try again," no on-brand messaging.
 import { useEffect } from "react";
-import { Button } from "@/components/ui/Button";
+import { Button, LinkButton } from "@/components/ui/Button";
 
 export default function ErrorBoundary({
   error,
@@ -36,12 +36,9 @@ export default function ErrorBoundary({
         <Button variant="primary" onClick={reset}>
           Try again
         </Button>
-        <a
-          href="/discover"
-          className="inline-flex items-center justify-center gap-2 rounded-pill border border-border-button px-5 py-2.5 text-sm font-semibold text-ink transition-all duration-200 ease-in-out hover:bg-inner"
-        >
+        <LinkButton href="/discover" variant="secondary">
           Go to Discover
-        </a>
+        </LinkButton>
       </div>
     </div>
   );

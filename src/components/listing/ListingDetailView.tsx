@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { ShoppingBag, Zap } from "lucide-react";
 import { Badge, tagVariantForIndex } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { PlatformBadge } from "@/components/ui/PlatformBadge";
 import { SaveButton } from "@/components/SaveButton";
 import { ImageGallery } from "@/components/listing/ImageGallery";
 import { SimilarListingsPanel } from "@/components/listing/SimilarListingsPanel";
@@ -134,9 +135,7 @@ export function ListingDetailView({
                 />
 
                 {listing.platform && (
-                  <span className="absolute bottom-3 right-3 z-20 rounded-pill bg-darkgreen/45 px-3 py-1.5 text-xs font-medium text-white">
-                    {listing.platform}
-                  </span>
+                  <PlatformBadge platform={listing.platform} size="md" className="absolute bottom-3 right-3 z-20" />
                 )}
               </>
             }

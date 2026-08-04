@@ -78,6 +78,7 @@ export function ImageCarousel({
                 key={src}
                 src={src}
                 alt={`${alt} — photo ${index + 1} of ${safeImages.length}`}
+                loading={index === 0 ? "eager" : "lazy"}
                 className="h-full w-full shrink-0 snap-center object-cover"
               />
             ))}
@@ -97,7 +98,7 @@ export function ImageCarousel({
                 type="button"
                 onClick={(event) => goTo(event, boundedIndex - 1)}
                 aria-label="Previous photo"
-                className="absolute left-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
+                className="absolute left-1.5 top-1/2 z-10 hidden h-9 w-9 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
               >
                 <ChevronLeft className="h-4 w-4" strokeWidth={2.5} />
               </button>
@@ -105,13 +106,16 @@ export function ImageCarousel({
                 type="button"
                 onClick={(event) => goTo(event, boundedIndex + 1)}
                 aria-label="Next photo"
-                className="absolute right-1.5 top-1/2 z-10 hidden h-7 w-7 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
+                className="absolute right-1.5 top-1/2 z-10 hidden h-9 w-9 -translate-y-1/2 cursor-pointer items-center justify-center rounded-full bg-surface/60 text-ink backdrop-blur-sm transition-colors hover:bg-surface/85 sm:flex"
               >
                 <ChevronRight className="h-4 w-4" strokeWidth={2.5} />
               </button>
 
-              {/* Position indicators — "● ○ ○ ○" style dots. */}
-              <div className="absolute bottom-2 left-1/2 z-10 flex -translate-x-1/2 items-center gap-1">
+              {/* Position indicators — "● ○ ○ ○" style dots. Each button's
+                  own tappable box is bigger than the visible dot (a
+                  centered inner span) so the touch target grows without
+                  the dots themselves looking oversized. */}
+              <div className="absolute bottom-2 left-1/2 z-10 flex -translate-x-1/2 items-center">
                 {safeImages.map((src, index) => (
                   <button
                     key={src}
@@ -119,10 +123,14 @@ export function ImageCarousel({
                     onClick={(event) => goTo(event, index)}
                     aria-label={`Go to photo ${index + 1}`}
                     aria-current={index === boundedIndex}
-                    className={`h-1.5 w-1.5 cursor-pointer rounded-full transition-colors ${
-                      index === boundedIndex ? "bg-white" : "bg-white/50"
-                    }`}
-                  />
+                    className="flex h-6 w-6 cursor-pointer items-center justify-center"
+                  >
+                    <span
+                      className={`h-1.5 w-1.5 rounded-full transition-colors ${
+                        index === boundedIndex ? "bg-white" : "bg-white/50"
+                      }`}
+                    />
+                  </button>
                 ))}
               </div>
             </>

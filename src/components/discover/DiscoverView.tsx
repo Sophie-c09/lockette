@@ -200,6 +200,15 @@ export function DiscoverView({
     loadingRef.current = true;
 
     try {
+      // P0 first-60-seconds fix (item 5) — the feed must NEVER show a
+      // terminal empty state once scrolling starts. See MatchView.tsx's
+      // identical fix for the full reasoning: once the current
+      // filter/sort's own pool is exhausted, wrap back to the top instead
+      // of permanently stopping — a genuinely empty catalog is guarded by
+      // consecutiveEmptyWraps rather than spinning forever.
+      let consecutiveEmptyWraps = 0;
+      const MAX_CONSECUTIVE_EMPTY_WRAPS = 2;
+
       while (hasMoreRef.current) {
         const result = await loadMoreDiscoverListings(
           offsetRef.current,
@@ -224,7 +233,19 @@ export function DiscoverView({
         }
 
         offsetRef.current += DISCOVER_BATCH_SIZE;
-        if (result.rawCount < DISCOVER_BATCH_SIZE) hasMoreRef.current = false;
+
+        if (result.rawCount < DISCOVER_BATCH_SIZE) {
+          offsetRef.current = 0;
+          if (result.rawCount === 0) {
+            consecutiveEmptyWraps += 1;
+            if (consecutiveEmptyWraps > MAX_CONSECUTIVE_EMPTY_WRAPS) {
+              hasMoreRef.current = false;
+              break;
+            }
+          } else {
+            consecutiveEmptyWraps = 0;
+          }
+        }
 
         if (result.listings.length > 0) {
           // Each page is fetched (and sorted) independently server-side,
@@ -351,7 +372,7 @@ export function DiscoverView({
           <span className="font-display text-xs font-semibold uppercase tracking-[0.25em] text-oxblood">
             Your Edit
           </span>
-          <h1 className="mt-1 font-display text-2xl font-semibold text-ink sm:text-3xl">
+          <h1 className="mt-1 font-display text-3xl font-semibold text-ink sm:text-4xl">
             {styleLabel ?? "Find your next favorite"}
           </h1>
           {styleDescription ? (
@@ -482,7 +503,6 @@ export function DiscoverView({
                   showSaveButton
                   initialSaved={savedListingIds.has(listing.id)}
                   matchScore={listing.matchPercent}
-                  stylePoints={listing.stylePoints}
                 />
               ))}
             </div>
@@ -516,8 +536,7 @@ export function DiscoverView({
               </>
             ) : (
               <p className="max-w-xs text-sm text-ink-soft">
-                No thrift finds yet — import listings to start building the
-                marketplace.
+                New finds are on the way — check back again shortly.
               </p>
             )}
           </div>

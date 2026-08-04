@@ -1,6 +1,10 @@
-// Landing point for Supabase Auth email action links — currently only
-// used by the forgot-password flow (see requestPasswordReset,
-// src/app/actions/auth.ts).
+// Landing point for Supabase Auth email action links AND OAuth (Google
+// sign-in) redirects — originally only used by the forgot-password flow
+// (see requestPasswordReset, src/app/actions/auth.ts), now shared by
+// signUp's email confirmation and signInWithGoogle too (same file), each
+// passing its own `next` (success destination) and `error_next` (failure
+// destination — see this file's own comment on why that's no longer
+// hardcoded to /forgot-password).
 //
 // ROOT CAUSE (found by reproducing the actual production failure —
 // https://www.lockette.org/forgot-password?error=invalid_link#error=access_denied&error_code=otp_expired):
@@ -36,22 +40,19 @@ export async function GET(request: Request) {
   const tokenHash = searchParams.get("token_hash");
   const type = searchParams.get("type") as EmailOtpType | null;
   const code = searchParams.get("code");
-  // Defaults to /reset-password since that's this app's only current
-  // caller, but reads the real query param rather than hardcoding it, so
-  // a future second email-link flow (e.g. email change) can reuse this
-  // same route by passing its own `next`.
+  // Defaults to /reset-password since that's this app's original caller,
+  // but reads the real query param rather than hardcoding it, so other
+  // email-link/OAuth flows (Google sign-in, signup email confirmation)
+  // can reuse this same route by passing their own `next`.
   const next = searchParams.get("next") ?? "/reset-password";
-
-  // Temporary diagnostics (never logs the actual token_hash/code value —
-  // only whether each was present) — lets a real failure in production
-  // logs show exactly which of the three shapes (token_hash/type, PKCE
-  // code, or neither/hash-fragment) an incoming link actually took.
-  console.log("[auth] /auth/confirm received:", {
-    hasTokenHash: Boolean(tokenHash),
-    type,
-    hasCode: Boolean(code),
-    next,
-  });
+  // P0 first-60-seconds fix — the two error redirects below used to be
+  // hardcoded to /forgot-password unconditionally, which was correct for
+  // THAT flow but wrong for every other caller of this route (a failed
+  // Google sign-in landing on the password-reset page, for instance, made
+  // no sense at all — a real "graceful failure state" bug). Each caller
+  // now passes its own error destination; defaults to /forgot-password
+  // only to keep that original flow's exact prior behavior unchanged.
+  const errorNext = searchParams.get("error_next") ?? "/forgot-password";
 
   const supabase = await createClient();
 
@@ -72,7 +73,7 @@ export async function GET(request: Request) {
     // case that really is "verification failed," unlike the fall-through
     // case below.
     logAuthError("verifyOtp", error);
-    redirect(`/forgot-password?error=${encodeURIComponent(error.code ?? "invalid_link")}`);
+    redirect(`${errorNext}?error=${encodeURIComponent(error.code ?? "invalid_link")}`);
   }
 
   if (code) {
@@ -83,7 +84,7 @@ export async function GET(request: Request) {
     }
 
     logAuthError("exchangeCodeForSession", error);
-    redirect(`/forgot-password?error=${encodeURIComponent(error.code ?? "invalid_link")}`);
+    redirect(`${errorNext}?error=${encodeURIComponent(error.code ?? "invalid_link")}`);
   }
 
   // Neither form was present in the query string — see this file's own
@@ -91,6 +92,5 @@ export async function GET(request: Request) {
   // and let its client-side hash-fragment bridge take over, since that's
   // the only place the actual outcome (GoTrue already encoded it in the
   // fragment) can be read at all.
-  console.log("[auth] /auth/confirm: no token_hash/code in query string — forwarding to", next, "for client-side hash-fragment handling");
   redirect(next);
 }

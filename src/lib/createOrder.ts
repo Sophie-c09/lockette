@@ -6,8 +6,6 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { createNotification } from "@/lib/notifications";
 import { reserveListings } from "@/lib/reservations";
 import { syncOrderStatus } from "@/lib/orderLifecycle";
-import { authorizePayment } from "@/lib/payment";
-import { retryPendingCaptures } from "@/lib/paymentRetry";
 import { calculateCartTotal } from "@/lib/pricing";
 
 // Turns whatever value a numeric DB column round-tripped as (PostgREST
@@ -38,56 +36,27 @@ export interface ShippingAddress {
   country: string;
 }
 
-// Best-effort — payment_status defaults to 'unpaid' at the DB level (see
-// supabase/schema.sql) once that migration is applied, so this stamp is
-// really just for the (unlikely) case a row was inserted before the
-// column existed. Never thrown: see both callers' comments for why this
-// has to be a separate write, not part of the orders insert itself.
-async function markOrderUnpaid(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- matching createClient()'s own untyped default (see supabase/server.ts)
-  supabase: SupabaseClient<any>,
-  orderId: string,
-): Promise<void> {
-  const { error } = await supabase.from("orders").update({ payment_status: "unpaid" }).eq("id", orderId);
-  if (error) {
-    console.error("[create-order] Failed to stamp payment_status:", error);
-  }
-}
-
-/**
- * Best-effort — immediately tries to authorize payment for a just-created
- * order (see authorizePayment in src/lib/payment.ts), so most orders
- * arrive already authorized by the time the customer reaches
- * /orders/[id]. Never allowed to block or fail checkout: authorizePayment
- * itself never throws, but this catch is defense-in-depth regardless.
- * Falls back to whatever markOrderUnpaid already set — payment_status
- * simply stays "unpaid" — if authorization doesn't succeed.
- */
-async function tryAuthorizePayment(orderId: string): Promise<void> {
-  try {
-    const result = await authorizePayment(orderId);
-    if (!result.success) {
-      console.error("[create-order] authorizePayment did not succeed, order remains unpaid:", result.paymentStatus);
+// Pre-submission fix — shippingAddress previously flowed straight from the
+// client into orders.shipping_address with no validation at all, front or
+// back (every other form in this app — auth.ts, profile.ts — validates
+// server-side via zod). A blank/whitespace-only name, address, or zip could
+// reach an order that's then paid for and never able to actually ship.
+// Non-blank is deliberately the whole check — postal formats vary too much
+// by country to validate more strictly without risking false rejections.
+function validateShippingAddress(address: ShippingAddress): void {
+  const REQUIRED_FIELDS: Array<[keyof ShippingAddress, string]> = [
+    ["fullName", "full name"],
+    ["address", "street address"],
+    ["city", "city"],
+    ["zip", "ZIP/postal code"],
+    ["country", "country"],
+    ["state", "state/region"],
+  ];
+  for (const [field, label] of REQUIRED_FIELDS) {
+    if (!address[field]?.trim()) {
+      throw new Error(`Please enter your ${label} before placing your order.`);
     }
-  } catch (error) {
-    console.error("[create-order] authorizePayment threw unexpectedly:", error);
   }
-}
-
-// Fire-and-forget — nudges the payment-capture retry sweep (see
-// src/lib/paymentRetry.ts) to run as a side effect of ordinary checkout
-// traffic, so orders whose auto-capture failed still get retried even
-// when no admin has opened the fulfillment dashboard in a while (there's
-// no cron/background job in this app). Deliberately NOT awaited: this
-// order has already fully committed by the time either caller reaches
-// this line, and nothing about checkout should ever wait on — or be able
-// to fail because of — some *other* order's payment retry. The
-// `.catch(...)` only guards against an unhandled promise rejection;
-// retryPendingCaptures itself is already written to never throw.
-function nudgeCaptureRetrySweep(): void {
-  retryPendingCaptures().catch((error) => {
-    console.error("[create-order] retryPendingCaptures failed:", error);
-  });
 }
 
 interface InsertedOrderItem {
@@ -264,10 +233,13 @@ async function findActiveOrdersForListings(
  * regardless of what's passed in here.
  *
  * No charge ever happens here — every order is created straight into
- * "pending_purchase" (see supabase/schema.sql's orders/order_items
- * comment). It does immediately try to *authorize* payment (a hold, via
- * tryAuthorizePayment below) so most orders arrive already authorized;
- * that's best-effort and never blocks checkout if it fails.
+ * "pending_purchase" (fulfillment status) / "pending" (payment status).
+ * Actually collecting payment is a deliberately separate step
+ * (createOrReusePaymentIntent, src/lib/payment.ts) that CheckoutView calls
+ * right after this one returns an order id — creating the order and
+ * charging a card are two different actions with two different failure
+ * modes, and conflating them was exactly how the old fake-payment flow
+ * ended up blindly marking orders "paid" with no real charge behind them.
  *
  * Listings that already have an active order elsewhere are skipped
  * (never double-ordered) rather than failing checkout — if every cart
@@ -281,6 +253,10 @@ export async function createOrder(
   userId: string,
   shippingAddress?: ShippingAddress | null,
 ): Promise<string> {
+  if (shippingAddress) {
+    validateShippingAddress(shippingAddress);
+  }
+
   const supabase = await createClient();
 
   const { data: cartItems, error: cartError } = await supabase
@@ -354,7 +330,9 @@ export async function createOrder(
   // Fee applies ONCE to the combined subtotal (see calculateCartTotal),
   // not once per item — the same shared calculation Cart/Checkout use for
   // display, so what the customer saw before placing the order matches
-  // what's actually authorized/charged (see tryAuthorizePayment below).
+  // what createOrReusePaymentIntent (src/lib/payment.ts) independently
+  // recomputes and actually charges — that function never trusts this
+  // total_amount value, it's display/legacy-compatibility only.
   const shippingTotal = orderItems.reduce((sum, item) => sum + item.shipping_cost, 0);
   const { total: subtotalWithFee } = calculateCartTotal(orderItems);
   const totalAmount = subtotalWithFee + shippingTotal;
@@ -365,6 +343,7 @@ export async function createOrder(
       user_id: userId,
       total_amount: toSafeNumber(totalAmount),
       status: "pending_purchase",
+      payment_status: "pending",
       shipping_address: shippingAddress ?? null,
     })
     .select("id")
@@ -374,14 +353,6 @@ export async function createOrder(
     console.error("[create-order] Failed to create order:", orderError);
     throw new Error("Could not place your order. Please try again.");
   }
-
-  // Separate, best-effort write — deliberately not folded into the insert
-  // above. payment_status is new (this task's payment infrastructure) and
-  // may not exist on the live DB yet; including it directly in the insert
-  // would fail the *entire* order creation the moment that column is
-  // missing, which is a far worse outcome than an order that's simply
-  // missing its (still-unused) payment_status stamp.
-  await markOrderUnpaid(supabase, order.id);
 
   const { data: insertedItems, error: itemsError } = await supabase
     .from("order_items")
@@ -408,13 +379,6 @@ export async function createOrder(
   if (unavailableListingIds.length > 0) {
     await failUnavailableOrderItems(order.id, userId, insertedItems ?? [], unavailableListingIds);
   }
-
-  // Immediately try to put a payment hold on this order (see
-  // tryAuthorizePayment above) — never blocks checkout if it fails. Only
-  // reached after the availability check above, so an already-sold
-  // listing's order_item (and the order's own total_amount) are already
-  // corrected before any authorization attempt.
-  await tryAuthorizePayment(order.id);
 
   // The whole original cart is cleared, not just newListingIds — the
   // skipped (duplicate) ones are already tracked by their existing order,
@@ -446,8 +410,6 @@ export async function createOrder(
     console.error("[create-order] Failed to create order_created notification:", notifyError);
   }
 
-  nudgeCaptureRetrySweep();
-
   return order.id;
 }
 
@@ -473,6 +435,10 @@ export async function createOrderForListing(
   listingId: string,
   shippingAddress?: ShippingAddress | null,
 ): Promise<string> {
+  if (shippingAddress) {
+    validateShippingAddress(shippingAddress);
+  }
+
   const supabase = await createClient();
 
   const existingOrderByListing = await findActiveOrdersForListings(supabase, userId, [listingId]);
@@ -511,6 +477,7 @@ export async function createOrderForListing(
       user_id: userId,
       total_amount: toSafeNumber(totalAmount),
       status: "pending_purchase",
+      payment_status: "pending",
       shipping_address: shippingAddress ?? null,
     })
     .select("id")
@@ -520,10 +487,6 @@ export async function createOrderForListing(
     console.error("[create-order] Failed to create order:", orderError);
     throw new Error("Could not place your order. Please try again.");
   }
-
-  // Separate, best-effort write — see createOrder's identical comment
-  // above for why this can't be folded into the insert.
-  await markOrderUnpaid(supabase, order.id);
 
   const { data: insertedItem, error: itemError } = await supabase
     .from("order_items")
@@ -554,12 +517,6 @@ export async function createOrderForListing(
     await failUnavailableOrderItems(order.id, userId, [insertedItem], [listingId]);
   }
 
-  // Immediately try to put a payment hold on this order (see
-  // tryAuthorizePayment above) — never blocks checkout if it fails. Only
-  // reached after the availability check above — see createOrder's
-  // identical comment.
-  await tryAuthorizePayment(order.id);
-
   const { error: notifyError } = await createNotification({
     userId,
     orderId: order.id,
@@ -571,8 +528,6 @@ export async function createOrderForListing(
   if (notifyError) {
     console.error("[create-order] Failed to create order_created notification:", notifyError);
   }
-
-  nudgeCaptureRetrySweep();
 
   return order.id;
 }

@@ -12,6 +12,8 @@
   },
   "dependencies": {
     "@sparticuz/chromium": "^149.0.0",
+    "@stripe/react-stripe-js": "^6.8.0",
+    "@stripe/stripe-js": "^9.12.1",
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "^2.58.0",
     "cheerio": "^1.2.0",

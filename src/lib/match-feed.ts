@@ -7,6 +7,8 @@ import { createClient } from "@/lib/supabase/server";
 import { getTopTags, sortByTagAffinity, attachMatchPercent } from "@/lib/match-scoring";
 import { buildAvailabilityFilter, releaseExpiredReservations } from "@/lib/reservations";
 import { getHardExcludedStyleKeys, type DislikedStyles } from "@/lib/disliked-styles";
+import { computeFashionQualityScore } from "@/lib/discover-personalization";
+import { normalizeMatchPercentForDisplay } from "@/lib/match-percent-display";
 import type { MatchListing, ScoredMatchListing } from "@/components/match/MatchView";
 
 export { MATCH_BATCH_SIZE } from "@/lib/pagination-constants";
@@ -212,5 +214,49 @@ export async function fetchMatchBatch(offset: number, limit: number): Promise<Ma
   });
   debugLog(`Matches after scoring: ${resultsWithScore.length}`);
 
-  return { listings: resultsWithScore, rawCount: listings.length, error: null };
+  // P0 pre-launch polish fix (item 1) — same "staged recommendation
+  // strategy" already applied to Discover (src/lib/discover-feed.ts): a
+  // brand-new user has no likes/passes and no onboarding brand/style
+  // signal for scoreListingMatch to work with, so every candidate gets
+  // the same flat neutral score and the "personalized" ranking above is
+  // really just recency order wearing a match-percent badge. Below the
+  // same meaningful-interaction threshold, re-rank by fashionQualityScore
+  // (visually attractive/complete metadata/high-quality photos — same
+  // composite Discover uses, with a deterministic fallback when this
+  // database has no quality_score/inventory_quality_score columns yet, so
+  // this never risks a missing-column query failure) instead of the
+  // meaningless personalization order, and substitute it into the
+  // displayed matchPercent too so a cold-start badge reflects something
+  // real rather than an identical number on every card.
+  const MIN_INTERACTIONS_FOR_PERSONALIZATION = 3;
+  const interactionSignalCount = likedIds.length + dislikedIds.length;
+  const hasOnboardingSignal = favoriteBrands.length > 0 || stylePreferences.length > 0;
+  const isColdStart = interactionSignalCount < MIN_INTERACTIONS_FOR_PERSONALIZATION && !hasOnboardingSignal;
+
+  if (!isColdStart) {
+    return { listings: resultsWithScore, rawCount: listings.length, error: null };
+  }
+
+  const qualityRanked = resultsWithScore
+    .map((listing) => ({
+      listing,
+      fashionQuality: computeFashionQualityScore({
+        images: undefined,
+        imageUrl: listing.image_url,
+        title: listing.title,
+        aestheticTags: listing.aesthetic_tags,
+        brand: listing.brand,
+        category: listing.category,
+        price: listing.price,
+        qualityScore: null,
+        inventoryQualityScore: null,
+      }),
+    }))
+    .sort((a, b) => b.fashionQuality.score - a.fashionQuality.score)
+    .map(({ listing, fashionQuality }) => ({
+      ...listing,
+      matchPercent: normalizeMatchPercentForDisplay(fashionQuality.score),
+    }));
+
+  return { listings: qualityRanked, rawCount: listings.length, error: null };
 }

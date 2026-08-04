@@ -39,8 +39,15 @@
 // contributes zero results, logged clearly either way (see the
 // per-provider logging in searchMarketplaceItems below) so a genuine
 // "found nothing" is never confused with "this source isn't wired up."
-import { createClient } from "@/lib/supabase/server";
-import { categorizeListing } from "@/lib/bulk-import";
+import { createAdminClient } from "@/lib/supabase/admin";
+// Imported directly from the dependency-free category-bucket.ts, NOT from
+// "@/lib/bulk-import" (which merely re-exports the same function) — that
+// module transitively imports @/lib/listing-extraction -> Playwright at
+// module scope, which would otherwise contaminate every real-time caller
+// of this file (Recreate This Outfit, Style Bundle generation) with the
+// exact "native-binary package in a user-facing request path" crash class
+// already fixed once for Discover (see next.config.ts's own comment).
+import { categorizeListing } from "@/lib/category-bucket";
 import type { ExtractedListing } from "@/lib/extraction/normalize-listing";
 import type { GarmentCategory } from "@/lib/garment-detection";
 import type { Listing } from "@/lib/supabase/listings.types";
@@ -89,7 +96,27 @@ function toRewornCandidate(listing: Listing, category: GarmentCategory): Scorabl
 const rewornProvider: MarketplaceSearchProvider = {
   source: "reworn",
   async search(query) {
-    const supabase = await createClient();
+    // Root cause of the Style Bundle "Try again" failure — this used to
+    // call the request-scoped, cookie-based createClient() (@/lib/supabase/
+    // server.ts), which throws ("`cookies` was called outside a request
+    // scope") the instant it's invoked from anywhere that isn't an active
+    // HTTP request. searchMarketplaceItems is called both synchronously
+    // within a real request (Recreate This Outfit; the admin bundle-
+    // preview flow) AND from runBundleGenerationAsync, which itself runs
+    // via after() (src/app/actions/style-requests.ts) — genuinely
+    // detached from the request by the time it gets here, several
+    // `await`s (vision analysis, embeddings) and Promise.allSettled
+    // layers deep. Every async-generated bundle's reworn search was
+    // throwing here, caught by this file's own try/catch, and silently
+    // returning zero results — meaning findBestMatchForItem could NEVER
+    // find a Lockette-inventory match for ANY item, for EVERY async
+    // bundle generation, which is the actual "Couldn't find enough
+    // matching items" failure. createAdminClient() (service-role) works
+    // identically in both contexts and is safe here regardless: `listings`
+    // already grants public, unauthenticated SELECT (Discover/Match read
+    // it the same way with no session at all), so this changes nothing
+    // about what this query is allowed to see.
+    const supabase = createAdminClient();
 
     // ACTIVE only — sold/unavailable/pending/rejected/removed listings
     // are excluded at the query level, before anything else happens
@@ -112,9 +139,22 @@ const rewornProvider: MarketplaceSearchProvider = {
   },
 };
 
+// Pre-submission fix — rewornProvider (Lockette's own inventory, defined
+// just above) was never actually added here despite this file's own
+// header/doc comments explicitly stating it's searched "as one ADDITIONAL
+// source, never the only one": Lockette's own listings were silently never
+// surfaced in Recreate This Outfit / Style Bundle marketplace search
+// results. poshmarkProvider/mercariProvider are real, intentional
+// no-API stubs (see their own files) already listed in
+// SOURCE_DISPLAY_NAMES below — including them costs nothing (they always
+// return [] and log why) and matches the roster this file was always
+// meant to search.
 const PROVIDERS = [
+  rewornProvider,
   depopProvider,
   vintedProvider,
+  poshmarkProvider,
+  mercariProvider,
   ebayProvider,
 ];
 

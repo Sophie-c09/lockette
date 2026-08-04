@@ -178,7 +178,7 @@ function FloatingItem({
       type="button"
       disabled={!clickable}
       onClick={() => onClick?.(item.id)}
-      aria-label={clickable ? `${item.title}${item.price != null ? ` — $${item.price.toFixed(2)}` : ""}` : item.title}
+      aria-label={clickable ? `${item.title}${item.price != null ? ` — $${Number(item.price).toFixed(2)}` : ""}` : item.title}
       className={`absolute flex items-center justify-center bg-transparent p-0 ${clickable ? "cursor-pointer" : "cursor-default"}`}
       style={{
         top: `${placement.top}%`,

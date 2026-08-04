@@ -94,28 +94,6 @@ export async function markNotificationRead(notificationId: string): Promise<{ er
   return {};
 }
 
-export async function getUnreadNotificationCount(): Promise<number> {
-  const supabase = await createClient();
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
-
-  if (!user) return 0;
-
-  const { count, error } = await supabase
-    .from("notifications")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", user.id)
-    .eq("read", false);
-
-  if (error) {
-    console.error("[get-unread-notification-count-error]", error);
-    return 0;
-  }
-
-  return count ?? 0;
-}
-
 // PostgrestError's own fields (message/details/hint/code) are what actually
 // carry the diagnostic info — logging the raw object can print as `{}` in
 // some console/runtime setups (e.g. its properties round-tripping through a
@@ -143,40 +121,52 @@ function describeSupabaseError(error: unknown): string {
   return String(error);
 }
 
-// Not one of the three functions named in spec, but the navbar dropdown
-// (spec's UI section) can't show a list of notifications without one.
-// Notifications are a "nice to have" everywhere they're read from (the
-// navbar, rendered on every page including /admin/import) — this must
-// never throw, since Nav.tsx/layout.tsx don't wrap this call in a
-// try/catch and an uncaught rejection here would take down the whole page,
-// not just the bell icon. The try/catch below is the real backstop; the
-// column list matches the live `notifications` table exactly (see
-// createNotification's own comment above) — no style_request_id fallback
-// needed since that column is never selected in the first place.
-export async function getRecentNotifications(limit = 20): Promise<Notification[]> {
+// Every real caller (the navbar's initial SSR render, NotificationBell's
+// 30s poll, and its on-open refresh) always needs the recent-notifications
+// list and the unread count together — this used to be two separate
+// functions, each running its own auth.getUser() + notifications query, so
+// every call site paid for two round trips instead of one. Must never
+// throw, since Nav.tsx/layout.tsx don't wrap this call in a try/catch and
+// an uncaught rejection here would take down the whole page, not just the
+// bell icon — the try/catch below is the real backstop. Column list
+// matches the live `notifications` table exactly (see createNotification's
+// own comment above) — no style_request_id fallback needed since that
+// column is never selected in the first place.
+export async function getNotificationsWithUnreadCount(
+  limit = 20,
+): Promise<{ notifications: Notification[]; unreadCount: number }> {
   try {
     const supabase = await createClient();
     const {
       data: { user },
     } = await supabase.auth.getUser();
 
-    if (!user) return [];
+    if (!user) return { notifications: [], unreadCount: 0 };
 
-    const { data, error } = await supabase
-      .from("notifications")
-      .select("id, order_id, order_item_id, type, title, message, read, created_at")
-      .eq("user_id", user.id)
-      .order("created_at", { ascending: false })
-      .limit(limit);
+    const [{ data, error }, { count, error: countError }] = await Promise.all([
+      supabase
+        .from("notifications")
+        .select("id, order_id, order_item_id, type, title, message, read, created_at")
+        .eq("user_id", user.id)
+        .order("created_at", { ascending: false })
+        .limit(limit),
+      supabase
+        .from("notifications")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.id)
+        .eq("read", false),
+    ]);
 
     if (error) {
       console.error("[get-recent-notifications-error]", describeSupabaseError(error));
-      return [];
+    }
+    if (countError) {
+      console.error("[get-unread-notification-count-error]", describeSupabaseError(countError));
     }
 
-    return data ?? [];
+    return { notifications: data ?? [], unreadCount: count ?? 0 };
   } catch (err) {
-    console.error("[get-recent-notifications-error]", describeSupabaseError(err));
-    return [];
+    console.error("[get-notifications-with-unread-count-error]", describeSupabaseError(err));
+    return { notifications: [], unreadCount: 0 };
   }
 }

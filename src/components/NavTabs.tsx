@@ -97,7 +97,7 @@ export function NavTabs({ isSignedIn }: { isSignedIn: boolean }) {
             key={tab.href}
             href={tab.href}
             ref={registerTabRef(tab.href)}
-            className={`${TAB_CLASS} ${isActive ? "font-semibold text-ink" : "text-teal"}`}
+            className={`${TAB_CLASS} ${isActive ? "font-semibold text-ink" : "text-ink-soft"}`}
           >
             {tab.label}
           </Link>
@@ -122,7 +122,7 @@ export function NavTabs({ isSignedIn }: { isSignedIn: boolean }) {
         // would otherwise still see the previous user's cart items until a
         // hard refresh.
         <form action={signOut} onSubmit={() => clearCart()}>
-          <button type="submit" className={`${TAB_CLASS} text-teal`}>
+          <button type="submit" className={`${TAB_CLASS} text-ink-soft`}>
             Log out
           </button>
         </form>
