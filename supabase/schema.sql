@@ -410,6 +410,16 @@ alter table public.scraper_jobs add constraint scraper_jobs_status_check
 -- comment) — this line makes sure completed_at exists here going
 -- forward, and the columns below make a fresh install match what's
 -- already live rather than schema.sql silently omitting them.
+--
+-- This documentation alone was never actually applied to the live
+-- database — schema.sql is this repo's reference document, not something
+-- anything runs automatically (see the observability-columns migration's
+-- own header comment for that same distinction). completed_at's absence
+-- went undetected until it broke Inventory Growth's startup outright
+-- (createLargeScaleScraperJob writes it in every fallback tier, with no
+-- narrower tier beneath it — see src/lib/scraper-jobs.ts) — fixed for
+-- real via supabase/migrations/20260803000000_add_scraper_jobs_completed_at.sql,
+-- which is what a live database actually needs run.
 alter table public.scraper_jobs add column if not exists completed_at timestamptz;
 alter table public.scraper_jobs add column if not exists updated_at timestamptz;
 alter table public.scraper_jobs add column if not exists last_heartbeat timestamptz;

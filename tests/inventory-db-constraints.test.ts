@@ -50,6 +50,12 @@ test("scraper_jobs batch-lease migration exists and adds both columns claimBatch
   assert.match(sql, /add column if not exists batch_lease_expires_at timestamptz/);
 });
 
+test("scraper_jobs completed_at migration exists, is nullable, and idempotent (the Inventory Growth startup fix)", () => {
+  const sql = readMigration("20260803000000_add_scraper_jobs_completed_at.sql");
+  assert.match(sql, /add column if not exists completed_at timestamptz;/);
+  assert.doesNotMatch(sql, /completed_at[^;]*not null/);
+});
+
 test("saved_items unique-constraint migration dedupes existing rows before adding the constraint", () => {
   const sql = readMigration("20260801000300_add_saved_items_listing_unique_constraint.sql");
   const deleteIndex = sql.indexOf("delete from public.saved_items");

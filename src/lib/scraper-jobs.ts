@@ -22,6 +22,15 @@
 // created by something other than this repo's own supabase/schema.sql.
 // Every write below now degrades gracefully instead of assuming the
 // schema this file expects and the live table's actual columns agree.
+//
+// SECOND completed_at REGRESSION (Inventory Growth startup fix): the same
+// missing column later broke createLargeScaleScraperJob outright —
+// "Failed to start inventory growth: Could not find the 'completed_at'
+// column of 'scraper_jobs' in the schema cache" — because that function's
+// bottom fallback tier still included completed_at, unlike every other
+// write here. Fixed by adding a true bare-minimum tier beneath it (see
+// that function's own comment) and, for real, by
+// supabase/migrations/20260803000000_add_scraper_jobs_completed_at.sql.
 import { createAdminClient } from "@/lib/supabase/admin";
 import type { ScraperJobRow, ScraperJobsDatabase } from "@/lib/supabase/scraper-jobs.types";
 import { STALE_JOB_RECOVERY_THRESHOLD_MS } from "@/lib/scraper-config";
@@ -358,28 +367,42 @@ export async function createLargeScaleScraperJob(
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();
 
-  // Three tiers, each a STRICT superset of the one below it, so a column
+  // Four tiers, each a STRICT superset of the one below it, so a column
   // missing from one tier can never take down a column that's actually
   // writable — the bug this replaces bundled target_count (which the live
   // table already had) together with total_batches/mode (which it didn't),
   // so the whole insert failed and the fallback dropped target_count too
   // even though nothing was wrong with that column.
   //
-  // completed_at/error_message are explicitly cleared here (requirement 1:
-  // "Starting Inventory Growth must always create... into a runnable
-  // state") even though this is a brand-new row that could never have had
-  // either set — cheap insurance against a future change that starts this
-  // job from an existing row instead. last_heartbeat/updated_at are set to
-  // NOW at creation time, in the SAME tier as target_count/current_round
-  // (the exact group of columns this file's own header comment confirms
-  // arrived together on the live table) — this is what closes the window
-  // where recoverStaleLargeScaleJob could otherwise see a job with no
-  // heartbeat at all yet and fall back to created_at alone; a fresh job
-  // now always has a real, current heartbeat the instant it exists,
-  // independent of when/whether the follow-up checkpoint write lands.
-  const corePayload = {
+  // bareMinimumPayload is the true floor — ROOT CAUSE REGRESSION FIX: this
+  // used to be `corePayload` (requested_count/status PLUS completed_at/
+  // error_message), which put completed_at in every single tier with
+  // nothing narrower beneath it. On a database missing completed_at
+  // (confirmed live — see supabase/migrations/
+  // 20260803000000_add_scraper_jobs_completed_at.sql), every tier failed
+  // at once and Inventory Growth could never start at all — the one write
+  // path in this file that DIDN'T already degrade gracefully the way
+  // completeScraperJob/failScraperJob/markScraperJobRunning all do below.
+  //
+  // completed_at/error_message are explicitly cleared in corePayload
+  // (requirement 1: "Starting Inventory Growth must always create... into
+  // a runnable state") even though this is a brand-new row that could
+  // never have had either set — cheap insurance against a future change
+  // that starts this job from an existing row instead. last_heartbeat/
+  // updated_at are set to NOW at creation time, in the SAME tier as
+  // target_count/current_round (the exact group of columns this file's
+  // own header comment confirms arrived together on the live table) —
+  // this is what closes the window where recoverStaleLargeScaleJob could
+  // otherwise see a job with no heartbeat at all yet and fall back to
+  // created_at alone; a fresh job now always has a real, current
+  // heartbeat the instant it exists, independent of when/whether the
+  // follow-up checkpoint write lands.
+  const bareMinimumPayload = {
     requested_count: targetCount,
     status: "pending" as const,
+  };
+  const corePayload = {
+    ...bareMinimumPayload,
     completed_at: null,
     error_message: null,
   };
@@ -408,10 +431,20 @@ export async function createLargeScaleScraperJob(
   if (error && isMissingColumnError(error)) {
     console.warn(
       `[scraper-jobs] Large-scale job create: tracked tier ALSO failed (${error.message}) — ` +
-        "falling back to requested_count + status only.",
+        "falling back to requested_count + status + completed_at/error_message only.",
     );
-    wrote = "core only (requested_count + status — target_count/current_round column(s) missing)";
+    wrote = "core only (requested_count + status + completed_at/error_message — target_count/current_round column(s) missing)";
     ({ data, error } = await supabase.from("scraper_jobs").insert(corePayload).select().single());
+  }
+
+  if (error && isMissingColumnError(error)) {
+    console.warn(
+      `[scraper-jobs] Large-scale job create: core tier ALSO failed (${error.message}) — ` +
+        "completed_at/error_message not found on this database yet, falling back to requested_count + status only. " +
+        "Run supabase/migrations/20260803000000_add_scraper_jobs_completed_at.sql to fix this properly.",
+    );
+    wrote = "bare minimum (requested_count + status only — completed_at/error_message column(s) missing)";
+    ({ data, error } = await supabase.from("scraper_jobs").insert(bareMinimumPayload).select().single());
   }
 
   if (error || !data) {
