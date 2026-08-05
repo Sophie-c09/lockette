@@ -1,0 +1,44 @@
+# Render Background Worker image for Inventory Growth's dedicated scraper
+# process (src/workers/inventory-growth-worker.ts) — see that file's own
+# header comment for why this exists as a separate, continuously-running
+# process instead of a Vercel serverless Function. This builds ONLY the
+# worker; the Next.js web app/admin dashboard keep deploying to Vercel as
+# before (see render.yaml — there is no web service defined here).
+#
+# Uses the OFFICIAL Playwright Docker image rather than @sparticuz/chromium
+# (that package's bundled binary + serverless-shaped launch args exist for
+# Vercel/Lambda's restricted, ephemeral filesystem; Render is a normal
+# long-running container, so a real Playwright browser install is the
+# correct, supported choice — see src/lib/browser-launch-options.ts's own
+# comment on how the two environments stay isolated from each other).
+#
+# IMPORTANT: the tag below must match this repo's installed `playwright`
+# version (package.json) — Playwright requires its Node package version
+# and the browser build baked into this image to agree exactly. Check with
+# `npx playwright --version` locally and update the tag (then redeploy)
+# whenever package.json's playwright dependency is bumped. The official
+# image already includes: the matching Chromium executable, every required
+# Linux shared library, and a compatible Node runtime — nothing further to
+# install for browser support.
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
+
+WORKDIR /app
+
+# package*.json first for Docker layer caching — dependencies rarely
+# change between deploys, so this layer stays cached across most builds.
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+COPY . .
+
+ENV NODE_ENV=production
+
+# tsx runs the worker's TypeScript directly, the same tool this repo
+# already uses for every other operator script (see package.json's own
+# "backfill:embeddings" script) — no separate compile step, no dist/
+# artifact to keep in sync. Does NOT read a --env-file (that file never
+# ships in this image, and never should — see this repo's own
+# .gitignore); every environment variable comes from Render's own
+# dashboard (see render.yaml and docs/inventory-growth-worker.md for the
+# exact required names).
+CMD ["npx", "tsx", "src/workers/inventory-growth-worker.ts"]

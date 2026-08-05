@@ -514,6 +514,35 @@ alter table public.scraper_jobs add column if not exists batch_lease_id uuid;
 alter table public.scraper_jobs add column if not exists batch_lease_expires_at timestamptz;
 create index if not exists scraper_jobs_batch_lease_expires_at_idx on public.scraper_jobs (batch_lease_expires_at);
 
+-- Render-worker migration (src/workers/inventory-growth-worker.ts) —
+-- batch_worker_id is purely observational (WHICH worker process currently
+-- holds a batch lease); the lease mutex itself is unchanged. See
+-- supabase/migrations/20260805000000_add_inventory_worker_support.sql for
+-- the full rationale, and inventory_worker_status below for the separate
+-- GLOBAL worker-health table (independent of any one job's lease).
+alter table public.scraper_jobs add column if not exists batch_worker_id text;
+
+create table if not exists public.inventory_worker_status (
+  worker_id text primary key,
+  started_at timestamptz not null default now(),
+  last_heartbeat timestamptz not null default now(),
+  current_job_id uuid,
+  current_stage text,
+  active_browser_count integer not null default 0,
+  last_successful_unit_at timestamptz,
+  last_successful_unit text,
+  last_error text,
+  app_version text,
+  updated_at timestamptz not null default now()
+);
+
+alter table public.inventory_worker_status enable row level security;
+
+drop policy if exists "Worker status is viewable by admins" on public.inventory_worker_status;
+create policy "Worker status is viewable by admins"
+  on public.inventory_worker_status for select
+  using (public.is_admin());
+
 -- Full Style Learning System (src/lib/rejection-learning.ts,
 -- src/lib/positive-learning.ts) — negative-learning signal fields added
 -- to the table already populated by removeListing() rather than a

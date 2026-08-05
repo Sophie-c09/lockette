@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "eslint",
     "test": "tsx --test tests/**/*.test.ts",
-    "backfill:embeddings": "tsx --env-file=.env.local scripts/backfill-image-embeddings.ts"
+    "backfill:embeddings": "tsx --env-file=.env.local scripts/backfill-image-embeddings.ts",
+    "worker:inventory-growth": "tsx --env-file=.env.local src/workers/inventory-growth-worker.ts",
+    "worker:inventory-growth:prod": "tsx src/workers/inventory-growth-worker.ts"
   },
   "dependencies": {
     "@sparticuz/chromium": "^149.0.0",

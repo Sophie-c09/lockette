@@ -106,6 +106,18 @@ export function releaseBrowserSlotOnLaunchFailure(): void {
  * concurrency guard), so any browser open at the moment a batch watchdog
  * fires almost certainly belongs to that same abandoned attempt.
  */
+/**
+ * Read-only observability hook for the Render worker's own health
+ * reporting (src/lib/worker/worker-health.ts) — the actual COMBINED count
+ * of fallback (activeBrowsers) and pooled (pooledBrowsers) browsers
+ * currently open, real OS processes either way. Never used for any
+ * concurrency decision itself (that's reservedSlots/waitQueue above); this
+ * is purely "what should an admin be told right now."
+ */
+export function getActiveBrowserCount(): number {
+  return activeBrowsers.size + pooledBrowsers.length;
+}
+
 export async function forceCloseAllTrackedBrowsers(reason: string): Promise<void> {
   const browsers = Array.from(activeBrowsers);
   if (browsers.length > 0) {

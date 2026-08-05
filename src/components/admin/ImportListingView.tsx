@@ -538,6 +538,12 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
     activeDiscoveryWorkers: number;
     activeExtractionWorkers: number;
     marketplaceHealth: { platform: string; attempts: number; successRate: number; timeoutRate: number; avgLatencyMs: number; enabled: boolean }[];
+    // Render-worker migration — best-effort; a database that hasn't run
+    // the inventory_worker_status migration yet just reports
+    // "not_configured" (see the metrics route's own comment).
+    inventoryWorkerMode?: "external" | "embedded";
+    workerStatus?: "online" | "stale" | "not_configured";
+    workers?: { workerId: string; currentJobId: string | null; currentStage: string | null; activeBrowserCount: number; lastHeartbeat: string; lastError: string | null; isStale: boolean }[];
   } | null>(null);
   const [largeScaleError, setLargeScaleError] = useState<string | null>(null);
   const [largeScalePausing, setLargeScalePausing] = useState(false);
@@ -1997,6 +2003,24 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                             {reason}: {count}
                           </span>
                         ))}
+                      </div>
+                    )}
+                    {largeScaleLiveMetrics?.inventoryWorkerMode === "external" && (
+                      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-2xl bg-inner/60 px-4 py-2 text-xs text-ink-soft">
+                        <span className="font-semibold text-ink">Render worker:</span>
+                        <span>
+                          {largeScaleLiveMetrics.workerStatus === "online"
+                            ? "online"
+                            : largeScaleLiveMetrics.workerStatus === "stale"
+                              ? "stale — last heartbeat is old, it may have crashed or be restarting"
+                              : "not configured — no worker has ever reported in"}
+                        </span>
+                        {largeScaleLiveMetrics.workers?.[0] && (
+                          <span>
+                            stage: {largeScaleLiveMetrics.workers[0].currentStage ?? "idle"}, browsers:{" "}
+                            {largeScaleLiveMetrics.workers[0].activeBrowserCount}
+                          </span>
+                        )}
                       </div>
                     )}
                     {largeScaleLiveMetrics && largeScaleLiveMetrics.marketplaceHealth.length > 0 && (

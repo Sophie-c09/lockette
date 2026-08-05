@@ -201,32 +201,69 @@ export async function updateScraperJobProgress(jobId: string, progress: ScraperJ
   }
 }
 
-export async function completeScraperJob(jobId: string, insertedCount: number): Promise<void> {
+// leaseId is optional (see updateLargeScaleScraperJobProgress's own
+// comment on why) — omitted by run/route.ts's Style-Aware Scraper caller
+// (no batch-lease concept exists there), passed by process-batch/route.ts
+// whenever this terminal transition is initiated BY a batch execution
+// itself, so a leaked/superseded execution can never flip a job to
+// 'completed' out from under a newer one.
+export async function completeScraperJob(
+  jobId: string,
+  insertedCount: number,
+  leaseId?: string,
+): Promise<LeaseGuardedWriteResult> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();
 
-  let { error } = await supabase
+  let query1 = supabase
     .from("scraper_jobs")
     .update({ status: "completed", inserted_count: insertedCount, completed_at: nowIso, updated_at: nowIso })
     .eq("id", jobId);
+  if (leaseId) query1 = query1.eq("batch_lease_id", leaseId);
+
+  let error: { code?: string; message: string } | null;
+  let staleRow = false;
+  if (leaseId) {
+    const { data, error: e } = await query1.select("id");
+    error = e;
+    if (!error) staleRow = (data?.length ?? 0) === 0;
+  } else {
+    ({ error } = await query1);
+  }
 
   if (error && isMissingColumnError(error)) {
     console.warn(
       "[scraper-jobs] completed_at/updated_at not found on this database's scraper_jobs table — " +
         "retrying with just status+inserted_count so the job doesn't get stuck at 'running' forever.",
     );
-    ({ error } = await supabase
-      .from("scraper_jobs")
-      .update({ status: "completed", inserted_count: insertedCount })
-      .eq("id", jobId));
+    let query2 = supabase.from("scraper_jobs").update({ status: "completed", inserted_count: insertedCount }).eq("id", jobId);
+    if (leaseId) query2 = query2.eq("batch_lease_id", leaseId);
+
+    if (leaseId) {
+      const { data, error: e } = await query2.select("id");
+      error = e;
+      if (!error) staleRow = (data?.length ?? 0) === 0;
+    } else {
+      ({ error } = await query2);
+    }
+  }
+
+  if (staleRow) {
+    console.warn(
+      `[scraper-jobs] Stale completeScraperJob blocked for job ${jobId} — leaseId ${leaseId} no longer owns ` +
+        "this job's batch lease.",
+    );
+    return { applied: false };
   }
 
   if (error) {
     console.error("[scraper-jobs] Failed to mark job completed:", jobId, error);
-  } else {
-    console.log(`[scraper-jobs] Job ${jobId} completed (inserted ${insertedCount})`);
-    logJobStatusTransition({ jobId, from: "running", to: "completed", reason: "target_reached", pauseRequested: false });
+    return { applied: false };
   }
+
+  console.log(`[scraper-jobs] Job ${jobId} completed (inserted ${insertedCount})`);
+  logJobStatusTransition({ jobId, from: "running", to: "completed", reason: "target_reached", pauseRequested: false });
+  return { applied: true };
 }
 
 // ---------------------------------------------------------------------------
@@ -493,6 +530,16 @@ export interface LargeScaleJobProgressUpdate {
   // whichever key isn't included this time.
   seenUrls?: string[];
   checkpointOptions?: Record<string, unknown>;
+  // Zero-progress-watchdog fix (Inventory Growth investigation) — how many
+  // CONSECUTIVE process-batch calls in a row have contributed zero real
+  // progress (zero queries/pages/discovered URLs/extraction attempts/
+  // valid/rejected/duplicate outcomes) for this job. Stored inside
+  // `checkpoint` rather than as its own column specifically so this needs
+  // no migration — every existing large-scale job already has a writable
+  // checkpoint column. Only meaningful together with seenUrls (both are
+  // always written as one checkpoint object below); process-batch/route.ts
+  // is the only writer and reader.
+  consecutiveZeroProgressBatches?: number;
   // Discovery-scaling dashboard numbers (src/lib/inventory/
   // scaled-discovery.ts) — the newest, least-likely-to-exist-yet columns
   // of this whole update, so they get their own richest tier (see below)
@@ -535,7 +582,36 @@ export interface LargeScaleJobProgressUpdate {
  * of the DB value) — so status is left alone here entirely and only ever
  * changed by pauseScraperJobRow/completeScraperJob/failScraperJob.
  */
-export async function updateLargeScaleScraperJobProgress(jobId: string, progress: LargeScaleJobProgressUpdate): Promise<void> {
+// Concurrency/cancellation fix — a leaked process-batch execution (the
+// outer watchdog fired and the request already returned, but the
+// underlying discovery/extraction promise keeps running in the
+// background — it cannot be cancelled from outside, see admin-scraper.ts's
+// withBatchWatchdog) must never be able to write this job's progress
+// after a NEWER execution has taken over. `leaseId`, when passed, is
+// chained onto every tier's own `.eq("id", jobId)` as an ADDITIONAL
+// `.eq("batch_lease_id", leaseId)` condition — Postgres applies an UPDATE
+// atomically per row, so once a newer claimBatchLease call has moved
+// batch_lease_id off this leaseId, this write's WHERE clause simply
+// matches zero rows (never an error — a stale write is not a failure,
+// it's correctly a no-op). `.select("id")` on each attempt is what lets
+// the caller tell "0 rows matched because of a genuinely missing column"
+// (tiered fallback below already handles that) apart from "0 rows
+// matched because this leaseId no longer owns the job" (returned as
+// `applied: false` — the caller must stop, not retry, not fall back to a
+// narrower payload, since a lease mismatch is an ownership problem, not a
+// schema one). Omitting `leaseId` entirely (every non-batch caller, e.g.
+// the large-scale start route's own one-time initial checkpoint write,
+// which runs before any batch lease exists) preserves the exact old,
+// always-best-effort behavior.
+export interface LeaseGuardedWriteResult {
+  applied: boolean;
+}
+
+export async function updateLargeScaleScraperJobProgress(
+  jobId: string,
+  progress: LargeScaleJobProgressUpdate,
+  leaseId?: string,
+): Promise<LeaseGuardedWriteResult> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();
 
@@ -550,7 +626,13 @@ export async function updateLargeScaleScraperJobProgress(jobId: string, progress
     // safe in this tier rather than needing the richer one below.
     ...(progress.scrapedCount != null ? { scraped_count: progress.scrapedCount } : {}),
     ...(progress.seenUrls
-      ? { checkpoint: { seenUrls: progress.seenUrls, options: progress.checkpointOptions } }
+      ? {
+          checkpoint: {
+            seenUrls: progress.seenUrls,
+            options: progress.checkpointOptions,
+            consecutiveZeroProgressBatches: progress.consecutiveZeroProgressBatches ?? 0,
+          },
+        }
       : {}),
   };
   const trackedHeartbeatPayload = { ...trackedPayload, updated_at: nowIso, last_heartbeat: nowIso };
@@ -586,13 +668,34 @@ export async function updateLargeScaleScraperJobProgress(jobId: string, progress
 
   let error: { code?: string; message: string } | null = null;
   let tierUsed: string | null = null;
+  let stale = false;
 
   for (const tier of tiers) {
-    ({ error } = await supabase.from("scraper_jobs").update(tier.payload).eq("id", jobId));
+    let query = supabase.from("scraper_jobs").update(tier.payload).eq("id", jobId);
+    if (leaseId) query = query.eq("batch_lease_id", leaseId);
 
-    if (!error) {
-      tierUsed = tier.name;
-      break;
+    if (leaseId) {
+      const { data, error: tierError } = await query.select("id");
+      error = tierError;
+      if (!error) {
+        if ((data?.length ?? 0) === 0) {
+          // Zero rows matched with no error — this leaseId no longer owns
+          // the job's batch lease (superseded by a newer execution, or the
+          // job was paused/failed/completed out from under this one).
+          // Never a schema issue, so no lower tier could possibly help —
+          // stop immediately rather than silently trying a narrower payload.
+          stale = true;
+          break;
+        }
+        tierUsed = tier.name;
+        break;
+      }
+    } else {
+      ({ error } = await query);
+      if (!error) {
+        tierUsed = tier.name;
+        break;
+      }
     }
 
     if (!isMissingColumnError(error)) break; // Not a schema issue — retrying a narrower payload won't help.
@@ -607,21 +710,31 @@ export async function updateLargeScaleScraperJobProgress(jobId: string, progress
     );
   }
 
+  if (stale) {
+    console.warn(
+      `[scraper-jobs] Stale write blocked for job ${jobId} — leaseId ${leaseId} no longer owns this job's ` +
+        "batch lease (superseded or the job left an active state). Progress not written.",
+    );
+    return { applied: false };
+  }
+
   if (error) {
     console.error(
       `[scraper-jobs] Failed to update large-scale job progress for ${jobId} — every tier failed.\n` +
         `  Last attempted payload: ${JSON.stringify(tiers[tiers.length - 1].payload)}\n` +
         `  Supabase error: ${JSON.stringify(error)}`,
     );
-  } else {
-    console.log(`[scraper-jobs] Large-scale progress write succeeded at tier: ${tierUsed}`);
-    console.log(
-      `[scraper-jobs] Large-scale job ${jobId} batch ${progress.currentBatch} — ` +
-        `valid ${progress.validCount}, duplicate ${progress.duplicateCount}, rejected ${progress.rejectedCount}, ` +
-        `insert failed ${progress.insertFailedCount ?? 0}, inserted ${progress.insertedCount}, ` +
-        `extracted ok ${progress.extractedSuccessfullyCount ?? 0}`,
-    );
+    return { applied: false };
   }
+
+  console.log(`[scraper-jobs] Large-scale progress write succeeded at tier: ${tierUsed}`);
+  console.log(
+    `[scraper-jobs] Large-scale job ${jobId} batch ${progress.currentBatch} — ` +
+      `valid ${progress.validCount}, duplicate ${progress.duplicateCount}, rejected ${progress.rejectedCount}, ` +
+      `insert failed ${progress.insertFailedCount ?? 0}, inserted ${progress.insertedCount}, ` +
+      `extracted ok ${progress.extractedSuccessfullyCount ?? 0}`,
+  );
+  return { applied: true };
 }
 
 /** Full row fetch — used by runLargeScaleAdminScraper to check, before
@@ -758,21 +871,46 @@ const BATCH_LEASE_DURATION_MS = 90_000; // comfortably longer than SINGLE_BATCH_
  * gets `claimed: false` back, telling it not to run a batch at all this
  * poll tick — the exact same "lose the race, do nothing" shape
  * claimJobForResume already established for resume requests.
+ *
+ * `workerId`, when passed (Render-worker migration — see
+ * src/workers/inventory-growth-worker.ts), is stamped into the purely
+ * observational batch_worker_id column in the SAME update as the lease
+ * itself — never part of the mutex condition, so a database missing that
+ * column (or this call omitting workerId entirely, e.g. process-batch/
+ * route.ts's own Vercel-side claim) degrades to the exact same lease
+ * behavior as before, just without recording who holds it.
  */
-export async function claimBatchLease(jobId: string): Promise<{ claimed: boolean; leaseId: string | null }> {
+export async function claimBatchLease(
+  jobId: string,
+  workerId?: string,
+): Promise<{ claimed: boolean; leaseId: string | null }> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();
   const leaseId = crypto.randomUUID();
   const expiresAt = new Date(Date.now() + BATCH_LEASE_DURATION_MS).toISOString();
 
-  const { data, error } = await supabase
-    .from("scraper_jobs")
-    .update({ batch_lease_id: leaseId, batch_lease_expires_at: expiresAt })
-    .eq("id", jobId)
-    .in("status", ["pending", "running"])
-    .or(`batch_lease_id.is.null,batch_lease_expires_at.lt.${nowIso}`)
-    .select("id")
-    .maybeSingle();
+  async function attemptClaim(withWorkerId: boolean) {
+    return supabase
+      .from("scraper_jobs")
+      .update({
+        batch_lease_id: leaseId,
+        batch_lease_expires_at: expiresAt,
+        ...(withWorkerId && workerId ? { batch_worker_id: workerId } : {}),
+      })
+      .eq("id", jobId)
+      .in("status", ["pending", "running"])
+      .or(`batch_lease_id.is.null,batch_lease_expires_at.lt.${nowIso}`)
+      .select("id")
+      .maybeSingle();
+  }
+
+  let { data, error } = await attemptClaim(true);
+
+  if (error && workerId && isMissingColumnError(error)) {
+    // batch_worker_id not migrated yet on this database — retry without it
+    // so the actual lease/mutex (unaffected by this column) still works.
+    ({ data, error } = await attemptClaim(false));
+  }
 
   if (error) {
     if (isMissingColumnError(error)) {
@@ -788,6 +926,40 @@ export async function claimBatchLease(jobId: string): Promise<{ claimed: boolean
   }
 
   return { claimed: Boolean(data), leaseId: data ? leaseId : null };
+}
+
+/**
+ * Extends an already-held lease's expiry — the Render-worker's own
+ * "renew periodically while processing" requirement (a single worker unit
+ * can legitimately run far longer than BATCH_LEASE_DURATION_MS; without
+ * this, a long-running unit's lease would expire mid-flight and let a
+ * second execution reclaim the SAME job while this one is still actively
+ * mutating it). Guarded by leaseId, not just jobId — the same "a call
+ * whose lease was already superseded can never act on the new holder's
+ * lease" posture as releaseBatchLease below. Returns `renewed: false` when
+ * this leaseId no longer owns the job's lease (superseded, or the job left
+ * an active state) — the caller (the worker's own renewal timer) must
+ * treat that as "stop working on this job immediately," not retry.
+ */
+export async function renewBatchLease(jobId: string, leaseId: string): Promise<{ renewed: boolean }> {
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+  const expiresAt = new Date(Date.now() + BATCH_LEASE_DURATION_MS).toISOString();
+
+  const { data, error } = await supabase
+    .from("scraper_jobs")
+    .update({ batch_lease_expires_at: expiresAt })
+    .eq("id", jobId)
+    .eq("batch_lease_id", leaseId)
+    .select("id")
+    .maybeSingle();
+
+  if (error) {
+    if (isMissingColumnError(error)) return { renewed: true }; // Same fail-open posture as claimBatchLease.
+    console.error("[scraper-jobs] Failed to renew batch lease:", jobId, error);
+    return { renewed: false };
+  }
+
+  return { renewed: Boolean(data) };
 }
 
 /**
@@ -812,38 +984,72 @@ export async function releaseBatchLease(jobId: string, leaseId: string | null): 
   }
 }
 
-export async function failScraperJob(jobId: string, errorMessage: string): Promise<void> {
+// leaseId is optional — see completeScraperJob's own comment on why
+// (omitted by non-batch callers, passed by process-batch/route.ts for
+// every fail transition IT initiates).
+export async function failScraperJob(
+  jobId: string,
+  errorMessage: string,
+  leaseId?: string,
+): Promise<LeaseGuardedWriteResult> {
   const supabase = createAdminClient<ScraperJobsDatabase>();
   const nowIso = new Date().toISOString();
 
-  let { error } = await supabase
+  let query1 = supabase
     .from("scraper_jobs")
     .update({ status: "failed", error_message: errorMessage, completed_at: nowIso, updated_at: nowIso })
     .eq("id", jobId);
+  if (leaseId) query1 = query1.eq("batch_lease_id", leaseId);
+
+  let error: { code?: string; message: string } | null;
+  let staleRow = false;
+  if (leaseId) {
+    const { data, error: e } = await query1.select("id");
+    error = e;
+    if (!error) staleRow = (data?.length ?? 0) === 0;
+  } else {
+    ({ error } = await query1);
+  }
 
   if (error && isMissingColumnError(error)) {
     console.warn(
       "[scraper-jobs] completed_at/updated_at not found on this database's scraper_jobs table — " +
         "retrying with just status+error_message so the job doesn't get stuck at 'running' forever.",
     );
-    ({ error } = await supabase
-      .from("scraper_jobs")
-      .update({ status: "failed", error_message: errorMessage })
-      .eq("id", jobId));
+    let query2 = supabase.from("scraper_jobs").update({ status: "failed", error_message: errorMessage }).eq("id", jobId);
+    if (leaseId) query2 = query2.eq("batch_lease_id", leaseId);
+
+    if (leaseId) {
+      const { data, error: e } = await query2.select("id");
+      error = e;
+      if (!error) staleRow = (data?.length ?? 0) === 0;
+    } else {
+      ({ error } = await query2);
+    }
+  }
+
+  if (staleRow) {
+    console.warn(
+      `[scraper-jobs] Stale failScraperJob blocked for job ${jobId} — leaseId ${leaseId} no longer owns this ` +
+        "job's batch lease.",
+    );
+    return { applied: false };
   }
 
   if (error) {
     console.error("[scraper-jobs] Failed to mark job failed:", jobId, error);
-  } else {
-    console.log(`[scraper-jobs] Job ${jobId} failed: ${errorMessage}`);
-    // Requirement 7 — resource/startup failures (missing browser, memory
-    // guard, a Supabase error, an uncaught exception) MUST surface as a
-    // real 'failed' status with last_error populated, never be left to
-    // silently decay into 'paused' 20 minutes later via
-    // recoverStaleLargeScaleJob's stale-heartbeat check. Every caller of
-    // this function (process-batch/route.ts's catch block, the large-scale
-    // start route's own catch block, the batch-retry-ceiling check) is
-    // exactly one of those cases.
-    logJobStatusTransition({ jobId, from: "running", to: "failed", reason: errorMessage, pauseRequested: false });
+    return { applied: false };
   }
+
+  console.log(`[scraper-jobs] Job ${jobId} failed: ${errorMessage}`);
+  // Requirement 7 — resource/startup failures (missing browser, memory
+  // guard, a Supabase error, an uncaught exception) MUST surface as a
+  // real 'failed' status with last_error populated, never be left to
+  // silently decay into 'paused' 20 minutes later via
+  // recoverStaleLargeScaleJob's stale-heartbeat check. Every caller of
+  // this function (process-batch/route.ts's catch block, the large-scale
+  // start route's own catch block, the batch-retry-ceiling check) is
+  // exactly one of those cases.
+  logJobStatusTransition({ jobId, from: "running", to: "failed", reason: errorMessage, pauseRequested: false });
+  return { applied: true };
 }

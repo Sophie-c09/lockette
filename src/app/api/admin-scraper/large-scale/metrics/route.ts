@@ -31,7 +31,8 @@ import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
 import { getUrlQueueStats } from "@/lib/inventory/url-queue";
 import { getAllMarketplaceHealth } from "@/lib/inventory/marketplace-health";
-import { DISCOVERY_CONCURRENCY, MAX_EXTRACTION_CONCURRENCY, OVERNIGHT_AGGRESSIVE_CONFIG } from "@/lib/scraper-config";
+import { DISCOVERY_CONCURRENCY, MAX_EXTRACTION_CONCURRENCY, OVERNIGHT_AGGRESSIVE_CONFIG, INVENTORY_WORKER_MODE } from "@/lib/scraper-config";
+import { getWorkerHealthSummary } from "@/lib/worker/worker-health";
 
 function sanitizedErrorResponse(details: string, status: number) {
   return NextResponse.json(
@@ -55,8 +56,23 @@ export async function GET(request: Request) {
 
     const aggressive = new URL(request.url).searchParams.get("aggressive") === "true";
     const queueStats = await getUrlQueueStats();
+    // Render-worker migration — best-effort; a database missing the
+    // inventory_worker_status migration degrades to "not_configured"
+    // rather than an error (see getWorkerHealthSummary's own comment).
+    const workerHealth = await getWorkerHealthSummary();
 
     return NextResponse.json({
+      inventoryWorkerMode: INVENTORY_WORKER_MODE,
+      workerStatus: workerHealth.classification,
+      workers: workerHealth.workers.map((w) => ({
+        workerId: w.worker_id,
+        currentJobId: w.current_job_id,
+        currentStage: w.current_stage,
+        activeBrowserCount: w.active_browser_count,
+        lastHeartbeat: w.last_heartbeat,
+        lastError: w.last_error,
+        isStale: w.isStale,
+      })),
       extractionQueueDepth: queueStats.pending,
       extractionQueueClaimed: queueStats.claimed,
       // P0 launch-readiness dashboard fix — queueStats.failed (terminal,

@@ -81,6 +81,11 @@ export interface ScraperJobsDatabase {
           // same "stale claims recover" posture as scraper_url_queue.
           batch_lease_id?: string | null;
           batch_lease_expires_at?: string | null;
+          // Render-worker migration — purely observational, see
+          // supabase/migrations/20260805000000_add_inventory_worker_support.sql.
+          // WHICH worker process currently holds batch_lease_id; the lease
+          // mutex itself is unaffected by this column's presence/absence.
+          batch_worker_id?: string | null;
         };
         Insert: {
           id?: string;
@@ -122,6 +127,7 @@ export interface ScraperJobsDatabase {
           // same "stale claims recover" posture as scraper_url_queue.
           batch_lease_id?: string | null;
           batch_lease_expires_at?: string | null;
+          batch_worker_id?: string | null;
         };
         Update: {
           id?: string;
@@ -163,6 +169,7 @@ export interface ScraperJobsDatabase {
           // same "stale claims recover" posture as scraper_url_queue.
           batch_lease_id?: string | null;
           batch_lease_expires_at?: string | null;
+          batch_worker_id?: string | null;
         };
         Relationships: [];
       };

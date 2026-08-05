@@ -41,6 +41,21 @@ import type { LaunchOptions } from "playwright";
 // on disk and should be used as-is, not replaced with the serverless one.
 const IS_VERCEL_SERVERLESS = process.env.VERCEL === "1";
 
+// Render-worker migration — RENDER is set automatically by Render's own
+// runtime environment on every service it runs (documented platform env
+// var, not something this repo sets). Used here ONLY to add Chromium's
+// standard Docker shared-memory workaround: Render's container platform
+// gives no way to raise /dev/shm size the way a plain `docker run
+// --shm-size` would, and the default 64MB is well known to crash Chromium
+// under real concurrent-tab load. `--disable-dev-shm-usage` makes Chromium
+// use /tmp instead, sidestepping the limit entirely regardless of host
+// configuration. Deliberately NOT @sparticuz/chromium (Section 8 of this
+// migration's own spec: that package's bundled binary + serverless-shaped
+// args exist for Vercel/Lambda's restricted filesystem, not a normal
+// long-running container — the Render worker's Dockerfile installs a real
+// Playwright browser directly, see Dockerfile.worker).
+const IS_RENDER = process.env.RENDER === "true";
+
 // Inflating the bundled binary is expensive — do it at most once per
 // warm Function instance, not once per browser launch.
 let cachedExecutablePath: Promise<string> | null = null;
@@ -48,11 +63,15 @@ let cachedExecutablePath: Promise<string> | null = null;
 /**
  * Merges @sparticuz/chromium's serverless-safe executablePath/args into a
  * caller's own chromium.launch() options — but ONLY on a real Vercel
- * deployment. Everywhere else (local dev, a plain Node server), returns
- * `base` completely unchanged, so this can never affect local development
- * or a non-Vercel production deployment.
+ * deployment. On Render, adds just the shared-memory launch flag (see
+ * IS_RENDER's own comment) on top of the caller's own options. Everywhere
+ * else (local dev), returns `base` completely unchanged.
  */
 export async function resolveBrowserLaunchOptions(base: LaunchOptions): Promise<LaunchOptions> {
+  if (IS_RENDER) {
+    return { ...base, args: [...(base.args ?? []), "--disable-dev-shm-usage"] };
+  }
+
   if (!IS_VERCEL_SERVERLESS) return base;
 
   if (!cachedExecutablePath) {

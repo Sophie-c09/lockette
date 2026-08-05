@@ -1,0 +1,61 @@
+# Render Blueprint for Inventory Growth's dedicated background worker
+# (src/workers/inventory-growth-worker.ts) — see Dockerfile.worker's own
+# header comment. This defines ONLY the worker; the Next.js web app/admin
+# dashboard/auth/job-creation stay on Vercel exactly as before — there is
+# no web service here.
+#
+# Deploy: `render blueprint launch` (or connect this repo in the Render
+# dashboard and it will auto-detect this file). See
+# docs/inventory-growth-worker.md for the full step-by-step deployment
+# guide and the required environment variables (secret VALUES are
+# intentionally never listed here or in that doc — every `sync: false`
+# var below must be entered directly in the Render dashboard).
+services:
+  - type: worker
+    name: inventory-growth-worker
+    runtime: docker
+    dockerfilePath: ./Dockerfile.worker
+    plan: starter
+    autoDeploy: false
+    envVars:
+      # Supabase — server-only credentials, never exposed to any client
+      # bundle (this worker never serves HTTP, so there is no bundle at
+      # all, but the values themselves are still real secrets).
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # AI enrichment (quality-mode scoring/classification during a batch).
+      - key: OPENAI_API_KEY
+        sync: false
+      # Marks this worker as the sole batch executor — Vercel's
+      # process-batch route reads this same name and, when it's set to
+      # "external" there too, stops running Playwright itself. Set to
+      # "external" here unconditionally; this value has no effect on the
+      # worker's own behavior (it always processes jobs), it only needs to
+      # match what's configured on the Vercel side.
+      - key: INVENTORY_WORKER_MODE
+        value: external
+      # Optional — a fixed identity across restarts on this same Render
+      # instance; if unset, the worker generates one at startup (see
+      # inventory-growth-worker.ts's own WORKER_ID).
+      - key: WORKER_ID
+        sync: false
+      # Optional tuning — see scraper-config.ts's own comments for what
+      # each one controls and its default if left unset.
+      - key: WORKER_IDLE_POLL_INTERVAL_MS
+        sync: false
+      - key: WORKER_LEASE_RENEWAL_INTERVAL_MS
+        sync: false
+      - key: WORKER_BATCH_TIMEOUT_MS
+        sync: false
+      - key: WORKER_SHUTDOWN_GRACE_MS
+        sync: false
+      - key: WORKER_HEARTBEAT_INTERVAL_MS
+        sync: false
+      - key: MAX_ACTIVE_BROWSERS
+        sync: false
+      - key: MAX_EXTRACTION_CONCURRENCY
+        sync: false
+      - key: DISCOVERY_CONCURRENCY
+        sync: false

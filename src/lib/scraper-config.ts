@@ -198,11 +198,21 @@ export const STALE_JOB_RECOVERY_THRESHOLD_MS = 20 * 60 * 1000; // 20 minutes
 // too; the next poll tick already provides one. So this caller gets a
 // single attempt, watchdogged well inside its own maxDuration.
 export const SINGLE_BATCH_CALL_MAX_ATTEMPTS = 1;
-// 45s, not 60s — leaves real margin for this route's own fixed overhead
+// 50s, not 60s — leaves real margin for this route's own fixed overhead
 // (admin auth check, the job-row read, the final progress write, response
 // marshaling) so the watchdog reliably resolves and gets its result
-// persisted BEFORE Vercel's platform-level kill could ever preempt it.
-export const SINGLE_BATCH_CALL_TIMEOUT_MS = 45 * 1000;
+// persisted BEFORE Vercel's platform-level kill could ever preempt it
+// (tests/inventory-growth-architecture.test.ts enforces a minimum 10s of
+// that margin — 52s once left only 8s and correctly failed that guard).
+// Raised from 45s (Inventory Growth zero-progress investigation — see
+// COMBINATIONS_PER_CALL's own comment in scaled-discovery.ts for why 45s
+// left a real discovery+extraction round no realistic chance to
+// complete at all, not just an occasional slow one) — the actual fix is
+// giving one round LESS work to do; this is just the matching bit of
+// margin so a genuinely-progressing round that runs a little long still
+// gets to finish and be credited instead of being cut off right at the
+// old boundary.
+export const SINGLE_BATCH_CALL_TIMEOUT_MS = 50 * 1000;
 
 // ---------------------------------------------------------------------------
 // Dashboard-only concurrency numbers — moved here (Inventory Growth
@@ -227,3 +237,56 @@ export const SINGLE_BATCH_CALL_TIMEOUT_MS = 45 * 1000;
 // so every existing internal caller keeps working unchanged.
 export const MAX_EXTRACTION_CONCURRENCY = Number(process.env.MAX_EXTRACTION_CONCURRENCY) || 10;
 export const DISCOVERY_CONCURRENCY = Number(process.env.DISCOVERY_CONCURRENCY) || 5;
+
+// ---------------------------------------------------------------------------
+// Render background worker (src/workers/inventory-growth-worker.ts) — moves
+// batch execution out of Vercel's request-bounded process-batch route into
+// one dedicated, continuously-running process, specifically because a real
+// production batch has been observed taking ~268s end to end — longer than
+// process-batch's own SINGLE_BATCH_CALL_TIMEOUT_MS (50s) can ever
+// accommodate no matter how it's tuned. Every constant below is
+// configurable via env var since a real Render dyno's resource profile and
+// network path to each marketplace differ from local dev/Vercel, and there
+// is no way to test-drive the exact right value ahead of a real deployment.
+// ---------------------------------------------------------------------------
+
+// Reads INVENTORY_WORKER_MODE — "external" means the Vercel process-batch
+// route must NEVER execute Playwright scraping itself (the dedicated
+// worker owns that exclusively, preventing a competing execution); any
+// other value (unset, "embedded") preserves the existing manual/
+// Vercel-driven path unchanged. See process-batch/route.ts's own header
+// comment.
+export const INVENTORY_WORKER_MODE: "external" | "embedded" =
+  process.env.INVENTORY_WORKER_MODE === "external" ? "external" : "embedded";
+
+// How long the worker sleeps between polls when no eligible job exists —
+// deliberately NOT busy-polling (this feature's own explicit requirement).
+export const WORKER_IDLE_POLL_INTERVAL_MS = Number(process.env.WORKER_IDLE_POLL_INTERVAL_MS) || 10_000;
+
+// How often the worker renews its held batch lease WHILE processing a job —
+// comfortably under BATCH_LEASE_DURATION_MS (scraper-jobs.ts, 90s) so a
+// healthy worker's lease never naturally expires out from under it, even
+// across a single unit that runs far longer than that duration.
+export const WORKER_LEASE_RENEWAL_INTERVAL_MS = Number(process.env.WORKER_LEASE_RENEWAL_INTERVAL_MS) || 30_000;
+
+// Per-unit hang-detection watchdog for the worker's own calls into the
+// shared batch-unit pipeline (src/lib/inventory/batch-unit.ts) — unlike
+// process-batch/route.ts's SINGLE_BATCH_CALL_TIMEOUT_MS (bounded by
+// Vercel's own maxDuration), the worker is a real long-running process
+// with no request lifetime to fit inside; this exists purely to detect a
+// genuinely hung attempt (same role PER_BATCH_MAX_RUNTIME_MS already plays
+// for a standalone run), not to cut off legitimately slow-but-progressing
+// work. Defaults to that same constant.
+export const WORKER_BATCH_TIMEOUT_MS = Number(process.env.WORKER_BATCH_TIMEOUT_MS) || PER_BATCH_MAX_RUNTIME_MS;
+
+// Bounded grace period on SIGTERM/SIGINT — the worker aborts its in-flight
+// unit immediately, then waits up to this long for that abort to actually
+// be confirmed (same "watchdog + grace period" shape as WATCHDOG_GRACE_MS
+// in admin-scraper.ts) before forcing browser cleanup and exiting anyway.
+export const WORKER_SHUTDOWN_GRACE_MS = Number(process.env.WORKER_SHUTDOWN_GRACE_MS) || 30_000;
+
+// How often the worker's own global health row (inventory_worker_status)
+// is upserted — independent of lease renewal above (that's per-job; this
+// is "is the worker process itself alive," true even while idle with no
+// job claimed at all).
+export const WORKER_HEARTBEAT_INTERVAL_MS = Number(process.env.WORKER_HEARTBEAT_INTERVAL_MS) || 20_000;

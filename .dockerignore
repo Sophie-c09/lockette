@@ -1,0 +1,18 @@
+# Worker image build context — see Dockerfile.worker's own header comment.
+# Mirrors .gitignore's env-file exclusions (secrets must never be baked
+# into the image; Render injects them at runtime) plus build artifacts
+# that the worker image never needs (it doesn't run `next build`).
+node_modules
+.next
+out
+build
+.git
+.env
+.env*.local
+.env.local
+.env.production
+.env*
+!.env.local.example
+*.log
+npm-debug.log*
+.DS_Store
