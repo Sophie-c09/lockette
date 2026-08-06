@@ -142,6 +142,7 @@ import {
   type ScraperMode,
 } from "@/lib/scraper-config";
 import { forceCloseAllTrackedBrowsers } from "@/lib/browser-concurrency";
+import { getCurrentInventoryCount } from "@/lib/inventory/inventory-count";
 
 // Same "is this a not-yet-migrated column" detection as
 // /api/import-listing/route.ts and src/lib/bulk-import.ts — duplicated
@@ -771,10 +772,10 @@ const QUEUE_EXTRACTION_IDLE_CUTOFF_MS = 5_000;
  * its own extraction call starts, so there is nothing to backpressure
  * against there — see that call site's own [FUNNEL][QUEUE] log instead.
  */
-async function waitForQueueCapacity(context: { discovered: number; queued: number }): Promise<void> {
+async function waitForQueueCapacity(context: { discovered: number; queued: number }, jobId?: string): Promise<void> {
   let waited = false;
   for (;;) {
-    const shouldContinue = await logQueueFunnelAndCheckDepth(context);
+    const shouldContinue = await logQueueFunnelAndCheckDepth(context, jobId);
     if (shouldContinue) return;
     if (!waited) {
       console.warn(
@@ -796,8 +797,8 @@ async function waitForQueueCapacity(context: { discovered: number; queued: numbe
  * UrlQueueStatus union — reusing the existing 4 states per this task's
  * Step 4, not inventing a mismatched 5th/6th status column).
  */
-async function logQueueFunnelAndCheckDepth(context: { discovered: number; queued: number }): Promise<boolean> {
-  const stats = await getUrlQueueStats();
+async function logQueueFunnelAndCheckDepth(context: { discovered: number; queued: number }, jobId?: string): Promise<boolean> {
+  const stats = await getUrlQueueStats(jobId);
   console.log("[FUNNEL][QUEUE]", {
     discovered: context.discovered,
     queued: context.queued,
@@ -944,6 +945,9 @@ interface QueueDrivenExtractionOptions {
   funnel: PipelineFunnel;
   // Cancellation fix — see runAdminScraper's own comment.
   signal?: AbortSignal;
+  // Job-scoped queue ownership (final Inventory Growth stabilization
+  // pass) — see url-queue.ts's claimNextUrls for what this scopes.
+  jobId?: string;
 }
 
 /**
@@ -989,7 +993,7 @@ async function runQueueDrivenExtraction(opts: QueueDrivenExtractionOptions): Pro
     batchSize: opts.batchSize,
     concurrency: opts.concurrency,
     signal: opts.signal,
-    claim: () => claimNextUrls(opts.batchSize),
+    claim: () => claimNextUrls(opts.batchSize, opts.jobId),
     run: async (row) => {
       opts.counters.onUrlStarted(row.url);
       console.log("[EXTRACTION WORKER] attempt", {
@@ -1075,6 +1079,12 @@ async function runAggressiveRound(
   onDiscoveryStats: (stats: { queriesCompleted: number; pagesSearched: number; uniqueUrlsDiscovered: number }) => void,
   // Cancellation fix — see runAdminScraper's own comment.
   signal?: AbortSignal,
+  // Job-scoped queue ownership (final Inventory Growth stabilization
+  // pass) — see url-queue.ts's claimNextUrls/enqueueUrls for what this
+  // scopes; undefined for every non-Inventory-Growth caller (Style-Aware
+  // Scraper, Continuous Import), which keeps the exact original global
+  // behavior.
+  jobId?: string,
 ): Promise<AggressiveRoundResult> {
   let discoveryDone = false;
   let enqueuedThisRound = 0;
@@ -1091,7 +1101,7 @@ async function runAggressiveRound(
         options.allowedSources,
       );
       if (urls.length === 0) return;
-      await waitForQueueCapacity({ discovered: enqueuedThisRound, queued: enqueuedThisRound });
+      await waitForQueueCapacity({ discovered: enqueuedThisRound, queued: enqueuedThisRound }, jobId);
       for (const url of urls) seenUrls.add(url);
       enqueuedThisRound += urls.length;
       await enqueueUrls(
@@ -1101,6 +1111,7 @@ async function runAggressiveRound(
           query: "large-scale",
           page: 1,
         })),
+        jobId,
       );
     },
     signal,
@@ -1132,6 +1143,7 @@ async function runAggressiveRound(
     counters,
     funnel,
     signal,
+    jobId,
   });
 
   return { extracted, enqueuedThisRound };
@@ -1177,6 +1189,8 @@ async function runNonAggressiveStreamingRound(
   funnel: PipelineFunnel,
   // Cancellation fix — see runAdminScraper's own comment.
   signal?: AbortSignal,
+  // Job-scoped queue ownership — see runAggressiveRound's own comment.
+  jobId?: string,
 ): Promise<StreamingScaledRoundResult> {
   let discoveryDone = false;
   let queuedThisRound = 0;
@@ -1207,12 +1221,13 @@ async function runNonAggressiveStreamingRound(
           query: "large-scale",
           page: 1,
         })),
+        jobId,
       );
       // Step 7 visibility — logged (not gated on) so [FUNNEL][QUEUE] shows
       // queue depth fluctuating WHILE discovery is still running, without
       // this call ever blocking discovery the way waitForQueueCapacity
       // does for aggressive mode (Step 6: no backpressure here).
-      await logQueueFunnelAndCheckDepth({ discovered: queuedThisRound, queued: queuedThisRound });
+      await logQueueFunnelAndCheckDepth({ discovered: queuedThisRound, queued: queuedThisRound }, jobId);
     },
     signal,
   ).finally(() => {
@@ -1232,6 +1247,7 @@ async function runNonAggressiveStreamingRound(
     counters: extractionCounters,
     funnel,
     signal,
+    jobId,
   });
 
   const [discoveryResult, extractionResult] = await Promise.all([discoveryPromise, extractionPromise]);
@@ -1602,6 +1618,11 @@ export async function runAdminScraper(
   // starting new discovery/extraction work) and threaded into
   // useScaledDiscovery's own round functions.
   signal?: AbortSignal,
+  // Job-scoped queue ownership (final Inventory Growth stabilization
+  // pass) — only ever set by runLargeScaleAdminScraper's own Inventory
+  // Growth caller; every other caller omits it and keeps the exact
+  // original global-queue behavior.
+  jobId?: string,
 ): Promise<AdminScraperResult> {
   const startedAt = Date.now();
   const elapsed = () => Date.now() - startedAt;
@@ -1788,6 +1809,7 @@ export async function runAdminScraper(
             uniqueUrlsDiscovered += stats.uniqueUrlsDiscovered;
           },
           signal,
+          jobId,
         );
         extracted = roundResult.extracted;
 
@@ -1808,7 +1830,7 @@ export async function runAdminScraper(
         // runNonAggressiveStreamingRound's own comment for how this
         // differs from aggressive mode's overlap (no backpressure, and
         // this round still fully awaits discovery before moving on).
-        const roundResult = await runNonAggressiveStreamingRound(roundTarget, seenUrls, options, extractionCounters, funnel, signal);
+        const roundResult = await runNonAggressiveStreamingRound(roundTarget, seenUrls, options, extractionCounters, funnel, signal, jobId);
         extracted = roundResult.extracted;
         queriesCompleted += roundResult.queriesCompleted;
         pagesSearched += roundResult.pagesSearched;
@@ -2527,6 +2549,13 @@ export async function runContinuousAdminScraper(
 
 export interface LargeScaleAdminScraperOptions extends AdminScraperFilterOptions {
   allowedSources: string[];
+  // Job-scoped queue ownership (final Inventory Growth stabilization
+  // pass) — set by batch-unit.ts to this job's own real UUID; threaded
+  // down into every discovery/extraction call this run makes so its
+  // enqueue/claim/metrics are scoped to THIS job, not the global queue
+  // (which mixes in other jobs' — and legacy, pre-migration — rows). See
+  // url-queue.ts's own header comment.
+  jobId?: string;
   targetInventorySize?: number;
   batchSize?: number;
   maxBatches?: number;
@@ -2701,15 +2730,6 @@ function triggerBackgroundEnrichment(): void {
     .finally(() => {
       indexerRunInFlight = false;
     });
-}
-
-async function getListingsInventoryCount(supabase: ReturnType<typeof createAdminClient<ListingsDatabase>>): Promise<number> {
-  const { count, error } = await supabase.from("listings").select("id", { count: "exact", head: true });
-  if (error) {
-    console.error("[admin-scraper] Failed to read current inventory count (treating as 0 for this check):", error);
-    return 0;
-  }
-  return count ?? 0;
 }
 
 // Reliability + cancellation watchdog — races ONE batch attempt against
@@ -2900,7 +2920,6 @@ export async function runLargeScaleAdminScraper(
   const mode = options.mode ?? DEFAULT_SCRAPER_MODE;
   const maxDiscoveryPagesPerQuery = options.maxDiscoveryPagesPerQuery ?? OVERNIGHT_MAX_PAGES_PER_QUERY;
 
-  const supabase = createAdminClient<ListingsDatabase>();
   const seenUrls = new Set(options.seenUrls ?? []);
 
   let totalImported = 0;
@@ -2943,7 +2962,7 @@ export async function runLargeScaleAdminScraper(
     marketplaceHealth: MarketplaceHealth[];
   }> {
     const elapsedMinutes = Math.max((Date.now() - startedAt) / 60_000, 1 / 60);
-    const queueStats = await getUrlQueueStats().catch(() => ({ pending: 0, claimed: 0, extracted: 0, failed: 0 }));
+    const queueStats = await getUrlQueueStats(options.jobId).catch(() => ({ pending: 0, claimed: 0, extracted: 0, failed: 0 }));
 
     return {
       urlsDiscoveredPerMinute: totalUniqueUrlsDiscovered / elapsedMinutes,
@@ -2964,7 +2983,7 @@ export async function runLargeScaleAdminScraper(
 
   for (let batch = 1; batch <= maxBatches; batch++) {
     console.info("[INVENTORY_GROWTH][BATCH_LOOP]", { batch, maxBatches, timestamp: new Date().toISOString() });
-    const inventoryNow = await getListingsInventoryCount(supabase);
+    const inventoryNow = await getCurrentInventoryCount();
     if (inventoryNow >= targetInventorySize) {
       console.log(`[admin-scraper] Large-scale target reached — inventory ${inventoryNow}/${targetInventorySize}.`);
       stopReason = "target_reached";
@@ -3090,7 +3109,7 @@ export async function runLargeScaleAdminScraper(
                 });
             }
           }
-        }, attemptAbortController.signal),
+        }, attemptAbortController.signal, options.jobId),
         { batch, attempt, requested: thisBatchLimit },
         perBatchTimeoutMs,
         attemptAbortController,

@@ -25,6 +25,12 @@ export interface UrlQueueDatabase {
           // reclaim. This is stamped fresh at the actual moment of claim
           // (see claimNextUrls in url-queue.ts) — null until first claimed.
           claimed_at: string | null;
+          // Final Inventory Growth stabilization pass — job-scoped queue
+          // ownership (supabase/migrations/
+          // 20260806000000_add_scraper_url_queue_job_id.sql). Null means
+          // either a legacy row (enqueued before this migration) or a
+          // non-job-scoped caller — both safe, both left unassigned.
+          job_id: string | null;
         };
         Insert: {
           id?: string;
@@ -37,6 +43,7 @@ export interface UrlQueueDatabase {
           created_at?: string;
           processed_at?: string | null;
           claimed_at?: string | null;
+          job_id?: string | null;
         };
         Update: {
           id?: string;
@@ -49,6 +56,7 @@ export interface UrlQueueDatabase {
           created_at?: string;
           processed_at?: string | null;
           claimed_at?: string | null;
+          job_id?: string | null;
         };
         Relationships: [];
       };

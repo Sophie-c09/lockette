@@ -73,6 +73,13 @@ export async function getInventoryIntelligenceStats(): Promise<{
     // awaiting flag review is still real acquired inventory, just not yet
     // visible) — 'pending' dropped from this union since no insert path
     // writes it anymore (see src/lib/inventory/listing-flagging.ts).
+    // MUST stay in sync with src/lib/inventory/inventory-count.ts's
+    // getCurrentInventoryCount() (job-start validation, the worker's own
+    // target-reached check) — kept as its own inline query here (rather
+    // than calling that helper directly) only to preserve this file's
+    // null-vs-zero "did the query itself fail" distinction below, which
+    // getCurrentInventoryCount() deliberately collapses to 0 for its own
+    // simpler callers.
     adminSupabase.from("listings").select("id", { count: "exact", head: true }).in("status", ["active", "flagged"]),
     adminSupabase.from("listings").select("id", { count: "exact", head: true }).not("visual_analysis", "is", null),
     adminSupabase.from("listings").select("id", { count: "exact", head: true }).gte("created_at", startOfToday.toISOString()),

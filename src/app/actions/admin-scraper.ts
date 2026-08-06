@@ -10,7 +10,7 @@
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
 import type { ScraperJobsDatabase } from "@/lib/supabase/scraper-jobs.types";
-import { pauseScraperJobRow, recoverStaleLargeScaleJob, type ScraperJobRow } from "@/lib/scraper-jobs";
+import { pauseScraperJobRow, recoverStaleLargeScaleJob, getMostRecentNonTerminalLargeScaleJob, type ScraperJobRow } from "@/lib/scraper-jobs";
 
 export async function getScraperJobStatus(jobId: string): Promise<{ job: ScraperJobRow | null; error?: string }> {
   const supabase = await createClient<ScraperJobsDatabase>();
@@ -42,6 +42,33 @@ export async function getScraperJobStatus(jobId: string): Promise<{ job: Scraper
 
   const recovered = await recoverStaleLargeScaleJob(data);
   return { job: recovered };
+}
+
+// Final Inventory Growth stabilization pass — "the admin UI must always
+// load the server-authoritative active job on page load... never depend
+// on the current browser having created it." Reuses getActiveLargeScaleJob
+// (already the same "is there a pending/running large-scale job" check
+// the Start route's own concurrency guard and the Render worker's own
+// idle-poll both rely on) so a job started from one browser/session is
+// immediately visible from any other, purely from server state — no
+// localStorage dependency.
+export async function getActiveLargeScaleJobStatus(): Promise<{ job: ScraperJobRow | null; error?: string }> {
+  const supabase = await createClient<ScraperJobsDatabase>();
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+
+  if (!user || !(await isCurrentUserAdmin(supabase, user.id))) {
+    return { job: null, error: "Not authorized." };
+  }
+
+  try {
+    const job = await getMostRecentNonTerminalLargeScaleJob();
+    return { job };
+  } catch (error) {
+    console.error("[get-active-large-scale-job-status] Failed to look up the active job:", error);
+    return { job: null, error: "Failed to look up the active job." };
+  }
 }
 
 /**

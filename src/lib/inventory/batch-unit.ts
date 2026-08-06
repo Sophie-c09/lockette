@@ -16,7 +16,8 @@
 // timer). This function only USES the passed-in leaseId to guard every
 // write it makes, exactly as before.
 import { runLargeScaleAdminScraper, type LargeScaleAdminScraperOptions, type LargeScaleProgress } from "@/lib/admin-scraper";
-import { SCRAPER_CONFIG } from "@/lib/scraper-config";
+import { SCRAPER_CONFIG, INVENTORY_STALL_THRESHOLD_MS } from "@/lib/scraper-config";
+import { getUrlQueueStats } from "@/lib/inventory/url-queue";
 import {
   getScraperJobRow,
   updateLargeScaleScraperJobProgress,
@@ -25,13 +26,30 @@ import {
   type ScraperJobRow,
 } from "@/lib/scraper-jobs";
 
-// Zero-progress-watchdog fix — same "small consecutive threshold, then
-// stop truthfully" shape as this codebase's other bounded-retry safety
-// nets (e.g. MAX_GENERATION_ATTEMPTS, LARGE_SCALE_MAX_CONSECUTIVE_BATCH_FAILURES).
-// 3 real, back-to-back zero-progress calls (each its own watchdog window)
-// is a strong enough signal that this isn't a marketplace just being
-// briefly slow between hits.
-const ZERO_PROGRESS_BATCH_THRESHOLD = 3;
+// Stall-detection rewrite (final Inventory Growth stabilization pass) —
+// REPLACES the old "3 consecutive batch CALLS" counter. That model was
+// designed around short Vercel HTTP requests, where 3 calls meant roughly
+// 3 x 50s of real wall-clock time. Once Inventory Growth moved to a
+// persistent Render worker, "one call" stopped meaning anything
+// consistent: a single worker unit can legitimately run for many minutes
+// (even hours, on a slow marketplace day), so 3 calls could represent
+// anywhere from a few minutes to a genuine timeout-driven stall spanning
+// much longer — and a call that merely timed out (cancellationConfirmed:
+// false) was ALREADY excluded from incrementing the old counter, yet
+// production still hit real false failures because 3 genuinely-settled
+// calls with zero delta could occur within minutes on any day the
+// marketplaces are slow, which is not evidence of a genuine stall.
+//
+// The new model asks a different, more honest question: "how long has it
+// actually been since anything trustworthy happened for this job" —
+// independent of how many worker-loop iterations or HTTP calls occurred
+// in between. lastProductiveProgressAt (persisted in checkpoint, no
+// migration needed) is updated to now() every time `progressedThisUnit`
+// is true (see below) — a job only fails for lack of progress once THAT
+// timestamp is older than INVENTORY_STALL_THRESHOLD_MS AND the current
+// attempt has genuinely settled (nothing still unwinding in the
+// background that could yet commit real work under the same lease).
+
 
 // Turns one runLargeScaleAdminScraper progress snapshot (cumulative WITHIN
 // this single call only — see LargeScaleProgress's own comment) into the
@@ -40,11 +58,35 @@ const ZERO_PROGRESS_BATCH_THRESHOLD = 3;
 // never re-fetched or re-accumulated between calls — so an interim write
 // (mid-attempt) and the final write (once the attempt finishes) always
 // agree on the same absolute totals regardless of which one physically
-// lands in Postgres last. currentBatch/seenUrls/checkpointOptions are
-// deliberately left at their PRE-this-attempt values (or omitted) here:
-// this batch hasn't actually completed yet, so current_round must not
-// advance and the checkpoint must not be rewritten until it does.
+// lands in Postgres last. currentBatch is always the PRE-this-attempt
+// value (current_round must not advance until the attempt genuinely
+// finishes); seenUrls/checkpointOptions stay at their pre-attempt values
+// too — included below ONLY as a vehicle to also persist
+// lastProductiveProgressAt/currentStage when this attempt has already
+// shown real progress (see madeProgressSoFarThisAttempt below), never
+// actually advanced early.
 function buildInterimProgressPayload(baseJob: ScraperJobRow, progress: LargeScaleProgress) {
+  // Live-proof-confirmed fix — progress.X here is CUMULATIVE WITHIN this
+  // one attempt (starts at 0), so any of these being positive means a
+  // trusted event has genuinely occurred, independent of whether this
+  // attempt's own FINAL write (in runBatchUnit, below) happens to compare
+  // against a snapshot taken before this exact interim commit landed.
+  // Without this, a real, live-observed gap: an attempt whose insert
+  // phase completes AFTER its own watchdog's final-write comparison point
+  // (but reports the real numbers here, moments later) would leave
+  // lastProductiveProgressAt stuck at its stale pre-attempt value —
+  // exactly the same class of false-stall risk this whole rewrite exists
+  // to close, just relocated to a new mechanism.
+  const madeProgressSoFarThisAttempt =
+    progress.insertedCount > 0 ||
+    progress.validCount > 0 ||
+    progress.duplicateCount > 0 ||
+    progress.rejectedCount > 0 ||
+    progress.extractedSuccessfullyCount > 0 ||
+    progress.queriesCompleted > 0 ||
+    progress.pagesSearched > 0 ||
+    progress.uniqueUrlsDiscovered > 0;
+
   return {
     insertedCount: baseJob.inserted_count + progress.insertedCount,
     validCount: (baseJob.valid_count ?? 0) + progress.validCount,
@@ -64,6 +106,22 @@ function buildInterimProgressPayload(baseJob: ScraperJobRow, progress: LargeScal
     queriesCompleted: (baseJob.queries_completed ?? 0) + progress.queriesCompleted,
     pagesSearched: (baseJob.pages_searched ?? 0) + progress.pagesSearched,
     uniqueUrlsDiscovered: (baseJob.unique_urls_discovered ?? 0) + progress.uniqueUrlsDiscovered,
+    // updateLargeScaleScraperJobProgress only writes the checkpoint column
+    // (where lastProductiveProgressAt/currentStage live) when seenUrls is
+    // present — an interim call otherwise omits seenUrls entirely (see
+    // this function's own header comment on why), which would silently
+    // drop these two fields. Supplying baseJob's OWN unchanged
+    // seenUrls/options here is what makes the checkpoint write actually
+    // fire, without advancing seenUrls itself before this attempt
+    // genuinely finishes.
+    ...(madeProgressSoFarThisAttempt
+      ? {
+          seenUrls: (baseJob.checkpoint as { seenUrls?: string[] } | null)?.seenUrls ?? [],
+          checkpointOptions: (baseJob.checkpoint as { options?: Record<string, unknown> } | null)?.options,
+          lastProductiveProgressAt: new Date().toISOString(),
+          currentStage: "discovering_and_extracting",
+        }
+      : {}),
   };
 }
 
@@ -130,6 +188,9 @@ export async function runBatchUnit(params: BatchUnitParams): Promise<BatchUnitRe
     // original Start request) still caps the TOTAL number of batches
     // across every call combined, checked below.
     maxBatches: 1,
+    // Job-scoped queue ownership — see LargeScaleAdminScraperOptions's
+    // own comment on jobId.
+    jobId,
   };
 
   const totalBatchesAllowed = savedOptions.maxBatches ?? Number.POSITIVE_INFINITY;
@@ -279,33 +340,55 @@ export async function runBatchUnit(params: BatchUnitParams): Promise<BatchUnitRe
     pagesSearched > (job.pages_searched ?? 0) ||
     uniqueUrlsDiscovered > (job.unique_urls_discovered ?? 0);
 
-  const previousZeroProgressStreak =
-    (job.checkpoint as { consecutiveZeroProgressBatches?: number } | null)?.consecutiveZeroProgressBatches ?? 0;
-
-  // Section 4 — only a genuinely SETTLED unit (cancellationConfirmed) with
-  // no committed progress increments the streak. An unconfirmed unit is
-  // still unwinding — it may yet commit real progress via a later interim
-  // write from the SAME leaked continuation — so its streak is left
-  // UNCHANGED (neither incremented nor reset) rather than assumed either
-  // way; the next call that actually settles is what decides.
-  const thisCallMadeZeroProgress =
-    result.cancellationConfirmed && result.stopReason === "max_batches_reached" && !progressedThisUnit;
-
-  const zeroProgressStreak = !result.cancellationConfirmed
-    ? previousZeroProgressStreak
+  const previousCheckpoint = (job.checkpoint ?? {}) as {
+    consecutiveZeroProgressBatches?: number;
+    lastProductiveProgressAt?: string;
+  };
+  // Diagnostic-only now (never gates the fail decision) — kept so the
+  // admin UI/logs can still show "N consecutive units without new
+  // committed progress" without implying that number alone ever fails
+  // the job.
+  const consecutiveZeroProgressBatches = !result.cancellationConfirmed
+    ? (previousCheckpoint.consecutiveZeroProgressBatches ?? 0)
     : progressedThisUnit
       ? 0
-      : previousZeroProgressStreak + 1;
+      : (previousCheckpoint.consecutiveZeroProgressBatches ?? 0) + 1;
 
-  if (thisCallMadeZeroProgress) {
-    console.error(`[${logPrefix}] Zero-progress batch for job ${jobId} (streak ${zeroProgressStreak}/${ZERO_PROGRESS_BATCH_THRESHOLD})`, {
-      lastBatchError: result.lastBatchError,
-    });
-  } else if (progressedThisUnit && previousZeroProgressStreak > 0) {
-    console.log(
-      `[${logPrefix}] Job ${jobId} made real committed progress this unit — resetting zero-progress streak ` +
-        `from ${previousZeroProgressStreak} to 0.`,
+  const nowIso = new Date().toISOString();
+  // Bootstrap for a job started before this fix (no lastProductiveProgressAt
+  // in its checkpoint yet) — seed from updated_at (this row's own last
+  // real write, the closest existing proxy for "last known activity"),
+  // never from an assumption that it's already been stalled forever.
+  const lastProductiveProgressAt = progressedThisUnit
+    ? nowIso
+    : previousCheckpoint.lastProductiveProgressAt ?? job.updated_at ?? job.created_at ?? nowIso;
+  const msSinceProductiveProgress = Date.now() - new Date(lastProductiveProgressAt).getTime();
+
+  // Time-based stall detection — REPLACES the old "3 consecutive batch
+  // calls" counter (see this file's own header comment for the full
+  // rationale). A job only fails for lack of progress when ALL of:
+  //   - this attempt has genuinely settled (cancellationConfirmed) — no
+  //     lease-held work from THIS unit could still be unwinding in the
+  //     background and commit real progress a moment later;
+  //   - this specific unit itself contributed nothing new;
+  //   - no trusted productive event has landed for this job in
+  //     INVENTORY_STALL_THRESHOLD_MS of real wall-clock time — not "3
+  //     iterations," however long or short those happened to take.
+  const isStalled =
+    result.cancellationConfirmed &&
+    result.stopReason === "max_batches_reached" &&
+    !progressedThisUnit &&
+    msSinceProductiveProgress >= INVENTORY_STALL_THRESHOLD_MS;
+
+  if (isStalled) {
+    console.error(
+      `[${logPrefix}] Job ${jobId} stalled — no productive event (insert/valid/duplicate/rejected/extracted/` +
+        `query/page/URL-discovered) in ${Math.round(msSinceProductiveProgress / 60_000)} minutes ` +
+        `(threshold ${Math.round(INVENTORY_STALL_THRESHOLD_MS / 60_000)}m).`,
+      { lastBatchError: result.lastBatchError },
     );
+  } else if (progressedThisUnit && (previousCheckpoint.consecutiveZeroProgressBatches ?? 0) > 0) {
+    console.log(`[${logPrefix}] Job ${jobId} made real committed progress this unit — clearing its stall clock.`);
   }
 
   const progressWrite = await updateLargeScaleScraperJobProgress(
@@ -325,7 +408,15 @@ export async function runBatchUnit(params: BatchUnitParams): Promise<BatchUnitRe
       queriesCompleted,
       pagesSearched,
       uniqueUrlsDiscovered,
-      consecutiveZeroProgressBatches: zeroProgressStreak,
+      consecutiveZeroProgressBatches,
+      lastProductiveProgressAt,
+      currentStage: isStalled
+        ? "stalled"
+        : !result.cancellationConfirmed
+          ? "cancellation_pending"
+          : result.stopReason === "paused"
+            ? "paused"
+            : "discovering_and_extracting",
     },
     leaseId,
   );
@@ -335,11 +426,13 @@ export async function runBatchUnit(params: BatchUnitParams): Promise<BatchUnitRe
     return { jobId, status: job.status as BatchUnitResult["status"], batchRan: false, shouldReleaseLease: false, cancellationConfirmed: result.cancellationConfirmed };
   }
 
-  if (zeroProgressStreak >= ZERO_PROGRESS_BATCH_THRESHOLD) {
+  if (isStalled) {
+    const queueStats = await getUrlQueueStats().catch(() => null);
     const reason =
-      `${zeroProgressStreak} consecutive batches produced no discovery/extraction progress ` +
-      `(zero queries, pages, discovered URLs, extraction attempts, and outcomes) — stopping instead of ` +
-      `continuing toward batch ${savedOptions.maxBatches ?? "?"}.` +
+      `No discovery/extraction progress (queries, pages, discovered URLs, extraction attempts, or outcomes) for ` +
+      `${Math.round(msSinceProductiveProgress / 60_000)} minutes (threshold ${Math.round(INVENTORY_STALL_THRESHOLD_MS / 60_000)}m) — ` +
+      `stopping instead of continuing toward batch ${savedOptions.maxBatches ?? "?"}.` +
+      (queueStats ? ` Queue at time of stall: ${queueStats.pending} pending, ${queueStats.claimed} claimed, ${queueStats.failed} failed.` : "") +
       (result.lastBatchError ? ` Last error: ${result.lastBatchError}` : "");
     console.error(`[${logPrefix}] ${reason}`);
     const failResult = await failScraperJob(jobId, reason, leaseId);

@@ -29,7 +29,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { isCurrentUserAdmin } from "@/lib/admin";
-import { getUrlQueueStats } from "@/lib/inventory/url-queue";
+import { getUrlQueueStats, getOldestPendingUrlAgeMs } from "@/lib/inventory/url-queue";
 import { getAllMarketplaceHealth } from "@/lib/inventory/marketplace-health";
 import { DISCOVERY_CONCURRENCY, MAX_EXTRACTION_CONCURRENCY, OVERNIGHT_AGGRESSIVE_CONFIG, INVENTORY_WORKER_MODE } from "@/lib/scraper-config";
 import { getWorkerHealthSummary } from "@/lib/worker/worker-health";
@@ -54,8 +54,16 @@ export async function GET(request: Request) {
       return NextResponse.json({ error: "Not authorized." }, { status: 401 });
     }
 
-    const aggressive = new URL(request.url).searchParams.get("aggressive") === "true";
-    const queueStats = await getUrlQueueStats();
+    const requestUrl = new URL(request.url);
+    const aggressive = requestUrl.searchParams.get("aggressive") === "true";
+    // Job-scoped queue ownership (final Inventory Growth stabilization
+    // pass) — when the caller names the job it's actively polling, every
+    // count below reflects THAT job's own queue, not the global table
+    // (which mixes in other jobs' — and legacy, pre-migration — rows).
+    // Omitting jobId preserves the original global view.
+    const jobId = requestUrl.searchParams.get("jobId") ?? undefined;
+    const queueStats = await getUrlQueueStats(jobId);
+    const oldestPendingUrlAgeMs = await getOldestPendingUrlAgeMs(jobId).catch(() => null);
     // Render-worker migration — best-effort; a database missing the
     // inventory_worker_status migration degrades to "not_configured"
     // rather than an error (see getWorkerHealthSummary's own comment).
@@ -80,6 +88,7 @@ export async function GET(request: Request) {
       // already computed here but never actually returned; the dashboard
       // requirement for a "permanently failed count" had nothing to read.
       permanentlyFailedUrlCount: queueStats.failed,
+      oldestPendingUrlAgeMs,
       // Reflects the real global cap now — scaled-discovery.ts's crawlPlatform
       // gates every individual page-search attempt through ONE process-wide
       // DISCOVERY_CONCURRENCY semaphore regardless of platform count, replacing

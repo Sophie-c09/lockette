@@ -92,7 +92,7 @@ test("the done card retains and keeps showing the last known valid total while a
 });
 
 test("the done card distinguishes this run's own target from the current live total, and flags when the target was already met", () => {
-  const doneBlock = slice(viewSource, 'largeScalePhase === "done" && largeScaleJob', 3000);
+  const doneBlock = slice(viewSource, 'largeScalePhase === "done" && largeScaleJob', 3800);
   assert.match(doneBlock, /Run target: /);
   assert.match(doneBlock, /already met by the existing inventory/);
 });

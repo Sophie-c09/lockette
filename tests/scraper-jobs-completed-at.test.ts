@@ -81,7 +81,11 @@ test("resuming a paused job (claimJobForResume) never sets or clears completed_a
 });
 
 test("pausing a job (pauseScraperJobRow) never touches completed_at", () => {
-  const body = fnBody(scraperJobsSource, "pauseScraperJobRow", "claimJobForResume");
+  // End marker is cancelScraperJob, not claimJobForResume — cancelScraperJob
+  // now sits directly after pauseScraperJobRow and legitimately sets
+  // completed_at for its own, different (deliberate-cancel) terminal
+  // transition, which must not leak into this assertion.
+  const body = fnBody(scraperJobsSource, "pauseScraperJobRow", "cancelScraperJob");
   assert.doesNotMatch(body, /completed_at/);
 });
 

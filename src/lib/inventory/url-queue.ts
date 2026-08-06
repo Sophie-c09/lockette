@@ -23,6 +23,15 @@ function isMissingTableError(error: { code?: string; message: string }): boolean
   );
 }
 
+// Job-scoped queue migration (supabase/migrations/
+// 20260806000000_add_scraper_url_queue_job_id.sql) may not be applied on
+// every database yet — same tiered-fallback posture as every other
+// possibly-missing column in this codebase (see scraper-jobs.ts's own
+// isMissingColumnError).
+function isMissingJobIdColumnError(error: { code?: string; message: string }): boolean {
+  return error.code === "PGRST204" || /column .* does not exist/i.test(error.message);
+}
+
 // Every function below already logged its own failures, but as a plain
 // console.error indistinguishable from a transient network blip — for the
 // actual live failure mode (scraper_url_queue not existing on this
@@ -57,20 +66,40 @@ export interface UrlQueueEntry {
  * this run's own in-memory discovery count is slightly ahead of what's
  * durably queued, not a correctness problem for the caller.
  */
-export async function enqueueUrls(entries: UrlQueueEntry[]): Promise<void> {
+// `jobId`, when passed (final Inventory Growth stabilization pass — see
+// this file's own header comment on job-scoped queue ownership), is
+// stamped onto every row in this batch. Applied ONLY on first insert —
+// `ignoreDuplicates: true` means a URL re-discovered by a DIFFERENT job
+// while still queued under an earlier job's ownership is correctly left
+// alone (job_id stays whatever it was first set to; a URL is a global
+// dedup key regardless of which job found it first, same posture
+// scraper_discovery_history already takes). Omitting jobId (any
+// non-job-scoped caller) leaves job_id null — a legacy/unassigned row,
+// safe and untouched by job-scoped claiming (see claimNextUrls).
+export async function enqueueUrls(entries: UrlQueueEntry[], jobId?: string): Promise<void> {
   if (entries.length === 0) return;
   const supabase = client();
 
-  const { error } = await supabase.from("scraper_url_queue").upsert(
-    entries.map((entry) => ({
-      url: entry.url,
-      platform: entry.platform,
-      query: entry.query,
-      page: entry.page,
-      status: "pending" as const,
-    })),
-    { onConflict: "url", ignoreDuplicates: true },
-  );
+  async function attemptEnqueue(withJobId: boolean) {
+    return supabase.from("scraper_url_queue").upsert(
+      entries.map((entry) => ({
+        url: entry.url,
+        platform: entry.platform,
+        query: entry.query,
+        page: entry.page,
+        status: "pending" as const,
+        ...(withJobId && jobId ? { job_id: jobId } : {}),
+      })),
+      { onConflict: "url", ignoreDuplicates: true },
+    );
+  }
+
+  let { error } = await attemptEnqueue(true);
+  if (error && jobId && isMissingJobIdColumnError(error)) {
+    // job_id migration not applied yet on this database — fall back to
+    // the exact pre-migration behavior rather than failing every enqueue.
+    ({ error } = await attemptEnqueue(false));
+  }
 
   if (error) {
     console.error("[url-queue] Failed to enqueue URLs:", error);
@@ -133,17 +162,28 @@ const STALE_CLAIM_THRESHOLD_MS = 10 * 60 * 1000;
  *    actually won, rather than trusting the ids collected a moment
  *    earlier.
  */
-export async function claimNextUrls(batchSize: number): Promise<UrlQueueRow[]> {
+// `jobId`, when passed, scopes both the SELECT and the claiming UPDATE to
+// `job_id = jobId` — this worker/route only ever claims rows it discovered
+// itself, never a different job's (or a legacy, unassigned) row. Omitting
+// jobId preserves the exact pre-migration, global-claim behavior (any
+// caller that hasn't been updated to pass one, or a database that hasn't
+// run the job_id migration yet — see isMissingJobIdColumnError's fallback
+// below).
+export async function claimNextUrls(batchSize: number, jobId?: string): Promise<UrlQueueRow[]> {
   const supabase = client();
   const staleCutoff = new Date(Date.now() - STALE_CLAIM_THRESHOLD_MS).toISOString();
   const claimableFilter = `status.eq.pending,and(status.eq.claimed,claimed_at.lt.${staleCutoff})`;
 
-  const { data: candidates, error: selectError } = await supabase
-    .from("scraper_url_queue")
-    .select("*")
-    .or(claimableFilter)
-    .order("created_at", { ascending: true })
-    .limit(batchSize);
+  async function selectCandidates(withJobId: boolean) {
+    let query = supabase.from("scraper_url_queue").select("*").or(claimableFilter);
+    if (withJobId && jobId) query = query.eq("job_id", jobId);
+    return query.order("created_at", { ascending: true }).limit(batchSize);
+  }
+
+  let { data: candidates, error: selectError } = await selectCandidates(true);
+  if (selectError && jobId && isMissingJobIdColumnError(selectError)) {
+    ({ data: candidates, error: selectError } = await selectCandidates(false));
+  }
 
   if (selectError || !candidates || candidates.length === 0) {
     if (selectError) {
@@ -255,14 +295,54 @@ export interface UrlQueueStats {
   failed: number;
 }
 
-export async function getUrlQueueStats(): Promise<UrlQueueStats> {
+// Diagnostics (final Inventory Growth stabilization pass) — "how long has
+// the oldest still-pending URL been waiting" is a much more direct signal
+// of a genuine discovery/extraction stall than raw counts alone (a queue
+// can sit at a healthy-looking depth while every row in it has been stuck
+// for hours because nothing is actually claiming them).
+export async function getOldestPendingUrlAgeMs(jobId?: string): Promise<number | null> {
   const supabase = client();
-  const [pending, claimed, extracted, failed] = await Promise.all([
-    supabase.from("scraper_url_queue").select("id", { count: "exact", head: true }).eq("status", "pending"),
-    supabase.from("scraper_url_queue").select("id", { count: "exact", head: true }).eq("status", "claimed"),
-    supabase.from("scraper_url_queue").select("id", { count: "exact", head: true }).eq("status", "extracted"),
-    supabase.from("scraper_url_queue").select("id", { count: "exact", head: true }).eq("status", "failed"),
+  let query = supabase.from("scraper_url_queue").select("created_at").eq("status", "pending").order("created_at", { ascending: true }).limit(1);
+  if (jobId) query = query.eq("job_id", jobId);
+  const { data, error } = await query;
+  if (error || !data || data.length === 0) return null;
+  return Date.now() - new Date(data[0].created_at).getTime();
+}
+
+// `jobId`, when passed, scopes every count to `job_id = jobId` — "current
+// workers active"/"extraction queue depth" etc. for a SPECIFIC job, not
+// the lifetime global queue (which mixes in other jobs' and legacy,
+// unassigned rows — confirmed live: 974+ historical failed rows from
+// jobs that no longer exist, which made a genuinely healthy new job's own
+// queue depth indistinguishable from a stuck one). Omitting jobId
+// preserves the original global view, still useful for admin-wide/
+// cross-job visibility.
+export async function getUrlQueueStats(jobId?: string): Promise<UrlQueueStats> {
+  const supabase = client();
+
+  async function countByStatus(status: "pending" | "claimed" | "extracted" | "failed", withJobId: boolean) {
+    let query = supabase.from("scraper_url_queue").select("id", { count: "exact", head: true }).eq("status", status);
+    if (withJobId && jobId) query = query.eq("job_id", jobId);
+    return query;
+  }
+
+  let [pending, claimed, extracted, failed] = await Promise.all([
+    countByStatus("pending", true),
+    countByStatus("claimed", true),
+    countByStatus("extracted", true),
+    countByStatus("failed", true),
   ]);
+
+  if (jobId && [pending, claimed, extracted, failed].some((result) => result.error && isMissingJobIdColumnError(result.error))) {
+    // job_id migration not applied yet — fall back to the global view
+    // rather than reporting every count as an error.
+    [pending, claimed, extracted, failed] = await Promise.all([
+      countByStatus("pending", false),
+      countByStatus("claimed", false),
+      countByStatus("extracted", false),
+      countByStatus("failed", false),
+    ]);
+  }
 
   // Previously silent — a missing table made every count in the returned
   // stats look like a genuinely empty (0/0/0/0) queue, indistinguishable

@@ -15,7 +15,14 @@
 // 'pending'/'paused' (added for runLargeScaleAdminScraper — see
 // supabase/schema.sql's own comment on scraper_jobs_status_check) sit
 // alongside the original 'queued'/'running'/'completed'/'failed'.
-export type ScraperJobStatus = "pending" | "queued" | "running" | "paused" | "completed" | "failed";
+// 'canceled' (final Inventory Growth stabilization pass — see
+// cancelScraperJob in scraper-jobs.ts) requires
+// supabase/migrations/20260806000000_add_scraper_jobs_canceled_status.sql;
+// on a database that hasn't run it yet, cancelScraperJob itself falls
+// back to 'failed' with a CANCELED_BY_ADMIN_PREFIX-tagged error_message —
+// this type reflects the DESIRED end state, not a guarantee every
+// database already accepts it.
+export type ScraperJobStatus = "pending" | "queued" | "running" | "paused" | "completed" | "failed" | "canceled";
 
 // checkpoint's shape for a large-scale ingestion job: seenUrls is enough
 // for a resumed run not to immediately re-discover/re-try candidates a
@@ -25,6 +32,14 @@ export type ScraperJobStatus = "pending" | "queued" | "running" | "paused" | "co
 export interface LargeScaleScraperCheckpoint {
   seenUrls?: string[];
   options?: Record<string, unknown>;
+  // Diagnostic-only counter — never gates job failure (see batch-unit.ts's
+  // own header comment on the time-based stall model that replaced it).
+  consecutiveZeroProgressBatches?: number;
+  // Time-based stall detection (final Inventory Growth stabilization
+  // pass) — ISO timestamp of the most recent trusted productive event,
+  // and a coarse, truthful current-stage label for the admin UI.
+  lastProductiveProgressAt?: string;
+  currentStage?: string;
 }
 
 export interface ScraperJobsDatabase {

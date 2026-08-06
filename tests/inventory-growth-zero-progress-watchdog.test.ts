@@ -84,35 +84,39 @@ test("ZERO-PROGRESS WATCHDOG: a batch that produced zero queries/pages/URLs/extr
   ]) {
     assert.ok(body.includes(field), `expected productive-progress check to include: ${field}`);
   }
-  const predicateBody = slice(batchUnitSource, "const thisCallMadeZeroProgress =", 300);
+  const predicateBody = slice(batchUnitSource, "const isStalled =", 300);
   assert.match(predicateBody, /!progressedThisUnit/);
 });
 
-test("ZERO-PROGRESS WATCHDOG: the consecutive-zero-progress streak is tracked in the job's own checkpoint, needing no migration", () => {
-  assert.match(batchUnitSource, /previousZeroProgressStreak/);
-  assert.match(batchUnitSource, /consecutiveZeroProgressBatches: zeroProgressStreak/);
-  const checkpointField = slice(scraperJobsSource, "consecutiveZeroProgressBatches?: number", 100);
+test("ZERO-PROGRESS WATCHDOG (now time-based, see final stabilization pass): lastProductiveProgressAt and the diagnostic streak are both tracked in the job's own checkpoint, needing no migration", () => {
+  assert.match(batchUnitSource, /previousCheckpoint\.consecutiveZeroProgressBatches/);
+  assert.match(batchUnitSource, /lastProductiveProgressAt,/);
+  const checkpointField = slice(scraperJobsSource, "lastProductiveProgressAt?: string", 100);
   assert.ok(checkpointField.length > 0);
 });
 
-test("ZERO-PROGRESS WATCHDOG: after a small consecutive threshold the job fails truthfully instead of continuing toward maxBatches", () => {
-  assert.match(batchUnitSource, /const ZERO_PROGRESS_BATCH_THRESHOLD = 3;/);
-  const body = slice(batchUnitSource, "if (zeroProgressStreak >= ZERO_PROGRESS_BATCH_THRESHOLD)", 800);
+test("ZERO-PROGRESS WATCHDOG: after the stall threshold elapses with no progress, the job fails truthfully instead of continuing toward maxBatches", () => {
+  // Superseded the old 3-consecutive-CALLS threshold with a time-based
+  // one — see batch-unit.ts's own header comment and
+  // tests/inventory-growth-zero-progress-false-failure.test.ts for full
+  // coverage of why.
+  assert.match(scraperConfigSource, /export const INVENTORY_STALL_THRESHOLD_MS = Number\(process\.env\.INVENTORY_STALL_THRESHOLD_MS\) \|\| 25 \* 60 \* 1000;/);
+  const body = slice(batchUnitSource, "if (isStalled) {\n    const queueStats", 1000);
   assert.match(body, /await failScraperJob\(jobId, reason, leaseId\)/);
   assert.match(body, /status: "failed"/);
   assert.doesNotMatch(body, /status: "completed"/);
 });
 
-test("ZERO-PROGRESS WATCHDOG: a batch that DID make real progress resets the streak (does not fail a healthy run)", () => {
+test("ZERO-PROGRESS WATCHDOG: a batch that DID make real progress is never judged stalled (does not fail a healthy run)", () => {
   // False-zero-progress fix — superseded the old `thisCallMadeZeroProgress
   // ? +1 : 0` ternary (which trusted only result.totalX) with a
-  // DB-delta-based `progressedThisUnit` check that also correctly resets
-  // the streak when a unit's in-memory result was zeroed by a late
+  // DB-delta-based `progressedThisUnit` check that also correctly avoids
+  // judging a unit stalled when its in-memory result was zeroed by a late
   // watchdog settle despite real progress already being committed — see
   // tests/inventory-growth-zero-progress-false-failure.test.ts for the
   // full coverage of that fix.
-  const body = slice(batchUnitSource, "const zeroProgressStreak =", 200);
-  assert.match(body, /progressedThisUnit\s*\n\s*\? 0/);
+  const body = slice(batchUnitSource, "const isStalled =", 300);
+  assert.match(body, /!progressedThisUnit &&/);
 });
 
 test("DISCOVERY EXCEPTION SURFACING: the last batch attempt's own failure reason is threaded out through the result, not left only in a server log", () => {
@@ -136,15 +140,15 @@ test("stale claims (crashed extraction workers) are recovered by claimNextUrls u
   assert.match(fnBody, /claimed_at\.lt\.\$\{staleCutoff\}/);
 });
 
-test("QUEUE METRICS LIMITATION (documented, not fixed this pass): scraper_url_queue has no per-job ownership — getUrlQueueStats and claimNextUrls are necessarily global, not job-scoped", () => {
-  // This test documents a real, confirmed-live finding rather than a fix:
-  // 974 of the queue's 'failed' rows are dated 2026-07-29/30, days before
-  // the job the dashboard attributes them to. Adding job_id ownership
-  // would need a migration this investigation's author has no way to
-  // apply to production (see the Inventory Growth startup task's own
-  // report) — deferred, not silently ignored.
+test("QUEUE METRICS LIMITATION RESOLVED (final Inventory Growth stabilization pass): getUrlQueueStats and claimNextUrls are now job-scoped, closing the previously-documented ambiguity", () => {
+  // Was previously documented as a deferred limitation (974+ historical
+  // failed rows from jobs that no longer exist made a healthy new job's
+  // own queue depth indistinguishable from stale noise). See
+  // tests/inventory-growth-job-scoped-queue.test.ts for full coverage of
+  // the fix itself; this test just confirms the old limitation's own
+  // negative assertion has been superseded, not silently left stale.
   const fnBody = slice(urlQueueSource, "export async function getUrlQueueStats", 800);
-  assert.doesNotMatch(fnBody, /job_id/);
+  assert.match(fnBody, /jobId/);
 });
 
 test("PROCESS-BATCH LEASE: the lease is only released via finally when cancellation was confirmed (superseded by the concurrency/cancellation fix — see scraper-jobs-batch-lease.test.ts for the current, conditional-release contract)", () => {

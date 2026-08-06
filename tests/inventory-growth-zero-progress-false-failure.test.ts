@@ -27,6 +27,7 @@ const recoverRouteSource = readFileSync(
   "utf-8",
 );
 const adminScraperSource = readFileSync(join(__dirname, "..", "src", "lib", "admin-scraper.ts"), "utf-8");
+const scraperConfigSource = readFileSync(join(__dirname, "..", "src", "lib", "scraper-config.ts"), "utf-8");
 
 function slice(source: string, marker: string, length = 2000): string {
   const start = source.indexOf(marker);
@@ -73,37 +74,46 @@ test("discovery-only delta (queries/pages/unique URLs, with zero inserts) means 
   }
 });
 
-test("a still-unwinding (cancellation NOT confirmed) unit neither increments nor resets the streak", () => {
-  const body = slice(batchUnitSource, "const zeroProgressStreak = !result.cancellationConfirmed", 300);
-  assert.match(body, /\? previousZeroProgressStreak\s*\n\s*: progressedThisUnit/);
+// Final Inventory Growth stabilization pass — the 3-consecutive-batch
+// counter (thisCallMadeZeroProgress/zeroProgressStreak/
+// ZERO_PROGRESS_BATCH_THRESHOLD) was itself REPLACED by a time-based
+// stall model (isStalled/msSinceProductiveProgress/
+// INVENTORY_STALL_THRESHOLD_MS) — see batch-unit.ts's own header comment
+// on why "3 batch CALLS" stopped being a meaningful unit once a single
+// worker unit can legitimately run for many minutes. The tests below
+// cover the NEW model; still-relevant coverage from the old model
+// (productive-progress delta detection, lease-guarding) is unchanged and
+// covered separately above.
+
+test("a still-unwinding (cancellation NOT confirmed) unit neither increments nor resets the diagnostic streak, and cannot be judged stalled yet", () => {
+  const streakBody = slice(batchUnitSource, "const consecutiveZeroProgressBatches = !result.cancellationConfirmed", 300);
+  assert.match(streakBody, /\? \(previousCheckpoint\.consecutiveZeroProgressBatches \?\? 0\)\s*\n\s*: progressedThisUnit/);
+  const stalledBody = slice(batchUnitSource, "const isStalled =", 300);
+  assert.match(stalledBody, /result\.cancellationConfirmed &&/);
 });
 
-test("a settled unit with real committed progress resets the streak to 0, even if result.totalX itself was zeroed by a late watchdog settle", () => {
-  const body = slice(batchUnitSource, "const zeroProgressStreak = !result.cancellationConfirmed", 300);
-  assert.match(body, /progressedThisUnit\s*\n\s*\? 0/);
+test("a settled unit with real committed progress is never judged stalled, even if result.totalX itself was zeroed by a late watchdog settle", () => {
+  const body = slice(batchUnitSource, "const isStalled =", 300);
+  assert.match(body, /!progressedThisUnit &&/);
 });
 
-test("a truly settled zero-work unit still increments the streak (real failure detection is preserved)", () => {
-  const body = slice(batchUnitSource, "const zeroProgressStreak = !result.cancellationConfirmed", 300);
-  assert.match(body, /: previousZeroProgressStreak \+ 1;/);
-  // thisCallMadeZeroProgress still requires a genuinely settled attempt
-  // that made no progress AND stopped via max_batches_reached (not
-  // paused/target_reached/consecutive_failures, which are handled by
-  // their own distinct status transitions).
-  const predicateBody = slice(batchUnitSource, "const thisCallMadeZeroProgress =", 300);
-  assert.match(predicateBody, /result\.cancellationConfirmed && result\.stopReason === "max_batches_reached" && !progressedThisUnit/);
+test("a truly settled zero-work unit only becomes stalled once no productive event has landed for INVENTORY_STALL_THRESHOLD_MS — not merely 3 calls (real failure detection is preserved, just time-based)", () => {
+  const body = slice(batchUnitSource, "const isStalled =", 300);
+  assert.match(body, /result\.cancellationConfirmed &&\s*\n\s*result\.stopReason === "max_batches_reached" &&\s*\n\s*!progressedThisUnit &&\s*\n\s*msSinceProductiveProgress >= INVENTORY_STALL_THRESHOLD_MS/);
 });
 
-test("three genuine zero-work units still fail the job (the watchdog is not disabled)", () => {
-  assert.match(batchUnitSource, /const ZERO_PROGRESS_BATCH_THRESHOLD = 3;/);
-  const body = slice(batchUnitSource, "if (zeroProgressStreak >= ZERO_PROGRESS_BATCH_THRESHOLD)", 800);
+test("three (or any number of) genuine zero-work units still eventually fail the job once the stall threshold elapses (the watchdog is not disabled, only re-timed)", () => {
+  assert.match(scraperConfigSource, /export const INVENTORY_STALL_THRESHOLD_MS = Number\(process\.env\.INVENTORY_STALL_THRESHOLD_MS\) \|\| 25 \* 60 \* 1000;/);
+  const body = slice(batchUnitSource, "if (isStalled) {\n    const queueStats", 800);
   assert.match(body, /await failScraperJob\(jobId, reason, leaseId\)/);
 });
 
-test("the final progress write (including the zero-progress streak) remains lease-guarded", () => {
-  const body = slice(batchUnitSource, "const progressWrite = await updateLargeScaleScraperJobProgress(", 700);
+test("the final progress write persists both the diagnostic streak and lastProductiveProgressAt/currentStage, remains lease-guarded", () => {
+  const body = slice(batchUnitSource, "const progressWrite = await updateLargeScaleScraperJobProgress(", 1100);
   assert.match(body, /leaseId,/);
-  assert.match(body, /consecutiveZeroProgressBatches: zeroProgressStreak/);
+  assert.match(body, /consecutiveZeroProgressBatches,/);
+  assert.match(body, /lastProductiveProgressAt,/);
+  assert.match(body, /currentStage:/);
 });
 
 test("a stale lease (superseded execution) cannot reset or fail the job — the write is refused entirely, not retried unguarded", () => {

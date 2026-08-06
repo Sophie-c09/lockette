@@ -9,7 +9,7 @@ import type { CategoryCounts, PriceMode } from "@/lib/bulk-import";
 import { SELECTED_CATEGORY_OPTIONS, type SelectedCategory } from "@/lib/selected-categories";
 import { SELECTED_BRAND_OPTIONS } from "@/lib/selected-brands";
 import { SCRAPER_CONFIG, TARGET_INVENTORY_SIZE, BATCH_SIZE, type ScraperMode } from "@/lib/scraper-config";
-import { getScraperJobStatus, pauseScraperJob } from "@/app/actions/admin-scraper";
+import { getScraperJobStatus, pauseScraperJob, getActiveLargeScaleJobStatus } from "@/app/actions/admin-scraper";
 import { getInventoryIntelligenceStats, type InventoryIntelligenceStats } from "@/app/actions/inventory-dashboard";
 import type { ScraperJobRow } from "@/lib/scraper-jobs";
 import { parseApiResponse } from "@/lib/api-response";
@@ -50,6 +50,16 @@ const STALE_JOB_THRESHOLD_MS = 5 * 60 * 1000;
 function isJobStale(job: ScraperJobRow): boolean {
   const lastSignal = job.last_heartbeat ?? job.updated_at ?? job.created_at;
   return Date.now() - new Date(lastSignal).getTime() > STALE_JOB_THRESHOLD_MS;
+}
+
+// Final Inventory Growth stabilization pass — a deliberate admin cancel
+// must never read as a genuine failure. Real 'canceled' status (once
+// supabase/migrations/20260806000000_add_scraper_jobs_canceled_status.sql
+// is applied) and the pre-migration fallback (status 'failed' with a
+// CANCELED_BY_ADMIN_PREFIX-tagged error_message — see cancelScraperJob in
+// scraper-jobs.ts) both count as "canceled," never "failed."
+function isLargeScaleJobCanceled(job: ScraperJobRow): boolean {
+  return job.status === "canceled" || (job.status === "failed" && (job.error_message ?? "").startsWith("Canceled by admin:"));
 }
 
 // Persisted so a page refresh (or reopening the tab) resumes watching the
@@ -535,6 +545,10 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
     // read into this dashboard's own state before now.
     extractionQueueClaimed: number;
     permanentlyFailedUrlCount: number;
+    // Final Inventory Growth stabilization pass — job-scoped diagnostic:
+    // how long the oldest still-pending URL for THIS job has been
+    // waiting, a much more direct stall signal than raw queue depth.
+    oldestPendingUrlAgeMs?: number | null;
     activeDiscoveryWorkers: number;
     activeExtractionWorkers: number;
     marketplaceHealth: { platform: string; attempts: number; successRate: number; timeoutRate: number; avgLatencyMs: number; enabled: boolean }[];
@@ -548,6 +562,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   const [largeScaleError, setLargeScaleError] = useState<string | null>(null);
   const [largeScalePausing, setLargeScalePausing] = useState(false);
   const [largeScaleResuming, setLargeScaleResuming] = useState(false);
+  const [largeScaleCanceling, setLargeScaleCanceling] = useState(false);
   const largeScalePollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const largeScalePollFailuresRef = useRef(0);
   // Guards against overlapping process-batch calls — a batch can take up
@@ -656,7 +671,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
     largeScalePollFailuresRef.current = 0;
     setLargeScaleJob(job);
 
-    if (job.status === "completed" || job.status === "failed") {
+    if (job.status === "completed" || job.status === "failed" || job.status === "canceled") {
       stopLargeScalePolling();
       largeScaleActiveJobIdRef.current = null;
       setLargeScalePhase("done");
@@ -681,7 +696,7 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
     try {
       const metricsResponse = await fetch(
-        `/api/admin-scraper/large-scale/metrics?aggressive=${largeScaleAggressiveMode}`,
+        `/api/admin-scraper/large-scale/metrics?aggressive=${largeScaleAggressiveMode}&jobId=${encodeURIComponent(jobId)}`,
       );
       if (metricsResponse.ok) setLargeScaleLiveMetrics(await metricsResponse.json());
     } catch {
@@ -698,12 +713,32 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
   }
 
   useEffect(() => {
-    const storedJobId = window.localStorage.getItem(LARGE_SCALE_JOB_STORAGE_KEY);
-    if (!storedJobId) return;
+    let cancelled = false;
 
-    const timeoutId = setTimeout(() => startLargeScalePolling(storedJobId), 0);
+    async function bootstrapActiveJob() {
+      const storedJobId = window.localStorage.getItem(LARGE_SCALE_JOB_STORAGE_KEY);
+      if (storedJobId) {
+        startLargeScalePolling(storedJobId);
+        return;
+      }
+
+      // Final Inventory Growth stabilization pass — "the admin UI must
+      // always load the server-authoritative active job... never depend
+      // on the current browser having created it." A fresh page load (or
+      // a different browser/session entirely) has no localStorage entry
+      // at all; without this, an actively running or paused job started
+      // elsewhere was completely invisible here until someone happened to
+      // reopen the exact browser that started it.
+      const { job } = await getActiveLargeScaleJobStatus();
+      if (cancelled || !job) return;
+      window.localStorage.setItem(LARGE_SCALE_JOB_STORAGE_KEY, job.id);
+      startLargeScalePolling(job.id);
+    }
+
+    const timeoutId = setTimeout(bootstrapActiveJob, 0);
 
     return () => {
+      cancelled = true;
       clearTimeout(timeoutId);
       stopLargeScalePolling();
     };
@@ -811,6 +846,33 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
       setLargeScaleError(err instanceof Error ? err.message : "Failed to resume large-scale ingestion.");
     } finally {
       setLargeScaleResuming(false);
+    }
+  }
+
+  async function handleCancelLargeScale() {
+    if (!largeScaleJob) return;
+    if (!window.confirm("Cancel this Inventory Growth run? Already-inserted listings are kept — this only stops the run itself.")) {
+      return;
+    }
+    setLargeScaleCanceling(true);
+    setLargeScaleError(null);
+
+    try {
+      const response = await fetch("/api/admin-scraper/large-scale/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jobId: largeScaleJob.id }),
+      });
+      await parseApiResponse(response, "Inventory Growth");
+      stopLargeScalePolling();
+      largeScaleActiveJobIdRef.current = null;
+      setLargeScalePhase("done");
+      window.localStorage.removeItem(LARGE_SCALE_JOB_STORAGE_KEY);
+      refreshStats();
+    } catch (err) {
+      setLargeScaleError(err instanceof Error ? err.message : "Failed to cancel this run.");
+    } finally {
+      setLargeScaleCanceling(false);
     }
   }
 
@@ -1941,6 +2003,24 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                         <span className="font-semibold">{duplicateRate == null ? "—" : `${duplicateRate}%`}</span>
                       </span>
                       <span>
+                        Stage:{" "}
+                        <span className="font-semibold">
+                          {(largeScaleJob.checkpoint as { currentStage?: string } | null)?.currentStage ?? "running"}
+                        </span>
+                      </span>
+                      <span>
+                        Last progress:{" "}
+                        <span className="font-semibold">
+                          {(() => {
+                            const lastProgress = (largeScaleJob.checkpoint as { lastProductiveProgressAt?: string } | null)
+                              ?.lastProductiveProgressAt;
+                            if (!lastProgress) return "—";
+                            const minutesAgo = Math.round((Date.now() - new Date(lastProgress).getTime()) / 60_000);
+                            return minutesAgo <= 0 ? "just now" : `${minutesAgo}m ago`;
+                          })()}
+                        </span>
+                      </span>
+                      <span>
                         Queries completed: <span className="font-semibold">{largeScaleJob.queries_completed ?? 0}</span>
                       </span>
                       <span>
@@ -1967,6 +2047,14 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
                       <span>
                         Permanently failed URLs:{" "}
                         <span className="font-semibold">{largeScaleLiveMetrics?.permanentlyFailedUrlCount ?? "—"}</span>
+                      </span>
+                      <span>
+                        Oldest pending URL:{" "}
+                        <span className="font-semibold">
+                          {largeScaleLiveMetrics?.oldestPendingUrlAgeMs == null
+                            ? "—"
+                            : `${Math.round(largeScaleLiveMetrics.oldestPendingUrlAgeMs / 60_000)}m`}
+                        </span>
                       </span>
                       {largeScaleAggressiveMode && (
                         <span>
@@ -2039,9 +2127,14 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
 
               {largeScalePhase === "running" ? (
                 <>
-                  <Button type="button" variant="secondary" onClick={handlePauseLargeScale} disabled={largeScalePausing} className="w-fit">
-                    {largeScalePausing ? "Pausing..." : "Pause"}
-                  </Button>
+                  <div className="flex gap-2">
+                    <Button type="button" variant="secondary" onClick={handlePauseLargeScale} disabled={largeScalePausing} className="w-fit">
+                      {largeScalePausing ? "Pausing..." : "Pause"}
+                    </Button>
+                    <Button type="button" variant="secondary" onClick={handleCancelLargeScale} disabled={largeScaleCanceling} className="w-fit">
+                      {largeScaleCanceling ? "Canceling..." : "Cancel run"}
+                    </Button>
+                  </div>
                   <p className="max-w-sm text-center text-xs text-ink-soft">
                     Feel free to leave this page — it keeps running in the background; come back
                     anytime to check progress.
@@ -2050,9 +2143,21 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
               ) : (
                 <>
                   <p className="text-sm font-medium text-ink">Paused</p>
-                  <Button type="button" onClick={handleResumeLargeScale} disabled={largeScaleResuming} className="w-fit">
-                    {largeScaleResuming ? "Resuming..." : "Resume"}
-                  </Button>
+                  {isJobStale(largeScaleJob) && (
+                    <p className="max-w-sm text-center text-xs text-ink-soft">
+                      Auto-paused after no worker heartbeat for a while — this can happen if the Render worker
+                      restarted or crashed. Your progress is safe; click Resume to pick up where it left off, or
+                      Cancel run if you&apos;d rather stop here.
+                    </p>
+                  )}
+                  <div className="flex gap-2">
+                    <Button type="button" onClick={handleResumeLargeScale} disabled={largeScaleResuming} className="w-fit">
+                      {largeScaleResuming ? "Resuming..." : "Resume"}
+                    </Button>
+                    <Button type="button" variant="secondary" onClick={handleCancelLargeScale} disabled={largeScaleCanceling} className="w-fit">
+                      {largeScaleCanceling ? "Canceling..." : "Cancel run"}
+                    </Button>
+                  </div>
                 </>
               )}
             </div>
@@ -2061,14 +2166,16 @@ export function ImportListingView({ initialStats }: { initialStats: ImportDashbo
           {largeScalePhase === "done" && largeScaleJob && (
             <div className="flex w-full flex-col items-center gap-2">
               <p className="font-display text-base font-semibold text-ink">
-                {largeScaleJob.status === "failed"
+                {largeScaleJob.status === "failed" && !isLargeScaleJobCanceled(largeScaleJob)
                   ? "Inventory growth run failed"
-                  : `This run added ${largeScaleJob.inserted_count.toLocaleString()} new listing${largeScaleJob.inserted_count === 1 ? "" : "s"}`}
+                  : isLargeScaleJobCanceled(largeScaleJob)
+                    ? `Run canceled — ${largeScaleJob.inserted_count.toLocaleString()} listing${largeScaleJob.inserted_count === 1 ? "" : "s"} kept from this run`
+                    : `This run added ${largeScaleJob.inserted_count.toLocaleString()} new listing${largeScaleJob.inserted_count === 1 ? "" : "s"}`}
               </p>
-              {largeScaleJob.status === "failed" && largeScaleJob.error_message && (
+              {largeScaleJob.status === "failed" && !isLargeScaleJobCanceled(largeScaleJob) && largeScaleJob.error_message && (
                 <p className="max-w-sm text-center text-xs text-ink-soft">{largeScaleJob.error_message}</p>
               )}
-              {largeScaleJob.status !== "failed" && (
+              {(largeScaleJob.status !== "failed" || isLargeScaleJobCanceled(largeScaleJob)) && (
                 <>
                   {/* Inventory count display fix — ROOT CAUSE REGRESSION:
                       this used to render `inventoryStats.totalInventory`

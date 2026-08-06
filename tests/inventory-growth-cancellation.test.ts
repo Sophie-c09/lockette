@@ -222,8 +222,12 @@ test("stale checkpoint cannot overwrite newer: the lease guard covers the SAME u
 
 // --- 9. Timed-out batch does not increment current_round / advance status ---
 
-test("timed-out batch does not increment current_round: zero-progress detection itself requires cancellationConfirmed", () => {
-  const fnBody = slice(batchUnitSource, "const thisCallMadeZeroProgress =", 500);
+test("timed-out batch does not increment current_round: stall detection itself requires cancellationConfirmed", () => {
+  // False-zero-progress fix (later pass) renamed thisCallMadeZeroProgress
+  // to isStalled and moved from a 3-batch counter to a time-based
+  // threshold — see tests/inventory-growth-zero-progress-false-failure.test.ts
+  // for full coverage; this still requires cancellationConfirmed.
+  const fnBody = slice(batchUnitSource, "const isStalled =", 500);
   assert.match(fnBody, /result\.cancellationConfirmed &&/);
 });
 
@@ -248,7 +252,7 @@ test("partial committed work remains counted: the interim onProgress write persi
 });
 
 test("partial committed work remains counted: buildInterimProgressPayload is purely additive against the fixed pre-attempt job snapshot", () => {
-  const fnBody = slice(batchUnitSource, "function buildInterimProgressPayload", 900);
+  const fnBody = slice(batchUnitSource, "function buildInterimProgressPayload", 1700);
   assert.match(fnBody, /insertedCount: baseJob\.inserted_count \+ progress\.insertedCount/);
 });
 

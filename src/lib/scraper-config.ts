@@ -290,3 +290,16 @@ export const WORKER_SHUTDOWN_GRACE_MS = Number(process.env.WORKER_SHUTDOWN_GRACE
 // is "is the worker process itself alive," true even while idle with no
 // job claimed at all).
 export const WORKER_HEARTBEAT_INTERVAL_MS = Number(process.env.WORKER_HEARTBEAT_INTERVAL_MS) || 20_000;
+
+// ---------------------------------------------------------------------------
+// Final Inventory Growth stabilization pass — time-based stall detection
+// (src/lib/inventory/batch-unit.ts) REPLACES the old "3 consecutive batch
+// calls" zero-progress counter, which was sized around short Vercel HTTP
+// requests and kept producing real false failures once batches started
+// running on a persistent Render worker (a single unit can legitimately
+// run many minutes on a slow marketplace day). 25 minutes is long enough
+// that a handful of genuinely slow/blocked rounds in a row is never
+// mistaken for a permanent stall, while still bounding how long a truly
+// dead run can sit before an admin is told the truth.
+// ---------------------------------------------------------------------------
+export const INVENTORY_STALL_THRESHOLD_MS = Number(process.env.INVENTORY_STALL_THRESHOLD_MS) || 25 * 60 * 1000;

@@ -95,26 +95,40 @@ export async function POST(request: Request) {
       return NextResponse.json({ success: true, jobId, status: job.status, batchRan: false });
     }
 
-    // External worker mode — see this file's own header comment. Report
-    // status only; NEVER claim the lease or invoke the scraper here, so
-    // this route can never compete with the dedicated worker for the same
-    // job. The dashboard's poll loop keeps calling this route unchanged —
-    // it just gets a "queued for worker" response instead of a batch
-    // result, plus a truthful heads-up if no worker has ever checked in or
-    // its heartbeat has gone stale.
-    if (INVENTORY_WORKER_MODE === "external") {
-      const health = await getWorkerHealthSummary();
+    // External worker mode, OR auto-detected healthy worker — see this
+    // file's own header comment. Report status only; NEVER claim the
+    // lease or invoke the scraper here, so this route can never compete
+    // with the dedicated worker for the same job. The dashboard's poll
+    // loop keeps calling this route unchanged — it just gets a "queued
+    // for worker" response instead of a batch result.
+    //
+    // Final Inventory Growth stabilization pass — root-cause finding:
+    // production had a real, deployed, healthy Render worker
+    // (render-worker-1, alive with a fresh heartbeat) sitting permanently
+    // idle, because INVENTORY_WORKER_MODE was never actually set to
+    // "external" on Vercel — this route's own dashboard poll (every ~2s)
+    // won the batch-lease race against the worker's own slower poll
+    // interval on every single job, every time, so Vercel kept running
+    // every batch itself via the OLD short-HTTP-window path this whole
+    // migration exists to get away from. Checking worker health directly
+    // — regardless of the env var — means the system self-configures
+    // correctly the moment a real worker is alive, with no Vercel
+    // redeploy or env var required. INVENTORY_WORKER_MODE=external is
+    // still honored as an explicit override (e.g. to force this behavior
+    // even before a worker's first heartbeat lands).
+    const workerHealth = await getWorkerHealthSummary();
+    if (INVENTORY_WORKER_MODE === "external" || workerHealth.classification === "online") {
       return NextResponse.json({
         success: true,
         jobId,
         status: job.status,
         batchRan: false,
         queuedForWorker: true,
-        workerStatus: health.classification,
-        ...(health.classification !== "online"
+        workerStatus: workerHealth.classification,
+        ...(workerHealth.classification !== "online"
           ? {
               warning:
-                health.classification === "not_configured"
+                workerHealth.classification === "not_configured"
                   ? "No Inventory Growth worker has ever reported in — this job is queued but nothing is currently " +
                     "processing it. Deploy and start the Render worker (npm run worker:inventory-growth)."
                   : "The Inventory Growth worker's last heartbeat is stale — it may have crashed or be restarting. " +
@@ -124,7 +138,8 @@ export async function POST(request: Request) {
       });
     }
 
-    // --- Embedded/local mode — original behavior, unchanged below -----
+    // --- Embedded/local mode — no healthy worker detected, and no explicit
+    // external-mode override; original behavior, unchanged below --------
     // P0 launch-readiness fix — the status check above does NOT prevent
     // two concurrent process-batch calls for the SAME job from both
     // reaching here (status stays "running" across many sequential calls

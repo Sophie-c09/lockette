@@ -128,7 +128,7 @@ test("10b. shutdown does not force-close browsers when the main loop finished cl
 });
 
 test("11. external worker mode prevents Vercel process-batch from ever calling claimBatchLease/runBatchUnit for the same job", () => {
-  const body = slice(processBatchRouteSource, 'if (job.status !== "pending" && job.status !== "running")', 2200);
+  const body = slice(processBatchRouteSource, 'if (job.status !== "pending" && job.status !== "running")', 3600);
   const externalBranchIndex = body.indexOf('INVENTORY_WORKER_MODE === "external"');
   const claimIndex = body.indexOf("claimBatchLease(jobId)");
   assert.ok(externalBranchIndex > -1, "expected an INVENTORY_WORKER_MODE external-mode branch");

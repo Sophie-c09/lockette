@@ -43,7 +43,6 @@
 // job is active and the dashboard stays open.
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createAdminClient } from "@/lib/supabase/admin";
 import { isCurrentUserAdmin } from "@/lib/admin";
 import {
   SCRAPER_CONFIG,
@@ -63,7 +62,7 @@ import {
   getScraperJobRow,
   failScraperJob,
 } from "@/lib/scraper-jobs";
-import type { ListingsDatabase } from "@/lib/supabase/listings.types";
+import { getCurrentInventoryCount } from "@/lib/inventory/inventory-count";
 
 export const maxDuration = 30;
 
@@ -77,15 +76,10 @@ function parseStringArray(value: unknown): string[] | null {
   return strings.length > 0 ? strings : null;
 }
 
-async function currentListingsCount(): Promise<number> {
-  const supabase = createAdminClient<ListingsDatabase>();
-  const { count, error } = await supabase.from("listings").select("id", { count: "exact", head: true });
-  if (error) {
-    console.error("[admin-scraper-large-scale] Failed to read current inventory count:", error);
-    return 0;
-  }
-  return count ?? 0;
-}
+// Final Inventory Growth stabilization pass — was its own, DIFFERENT
+// (no-status-filter) count from the dashboard's; now the same shared
+// helper both use — see inventory-count.ts's own header comment.
+const currentListingsCount = getCurrentInventoryCount;
 
 // Sanitized shape requested for this feature: never the raw internal
 // error, just a stable code + a short, safe details string. The full

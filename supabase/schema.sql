@@ -389,9 +389,14 @@ create table if not exists public.scraper_jobs (
 -- status before starting each batch and stops cleanly, leaving status
 -- 'paused' rather than flipping to 'running'/'completed', the moment an
 -- admin has paused it.
+-- 'canceled' (final Inventory Growth stabilization pass — see
+-- supabase/migrations/20260806000100_add_scraper_jobs_canceled_status.sql)
+-- added for a deliberate admin cancel — a real, distinct terminal state
+-- rather than overloading 'paused' (implies resumable) or 'failed'
+-- (implies a genuine error).
 alter table public.scraper_jobs drop constraint if exists scraper_jobs_status_check;
 alter table public.scraper_jobs add constraint scraper_jobs_status_check
-  check (status in ('pending', 'queued', 'running', 'paused', 'completed', 'failed'));
+  check (status in ('pending', 'queued', 'running', 'paused', 'completed', 'failed', 'canceled'));
 
 -- Investigating a "scraper stuck at running forever, zero results" report
 -- found the LIVE scraper_jobs table missing `completed_at` (this file's
@@ -1785,6 +1790,14 @@ create index if not exists scraper_url_queue_status_idx on public.scraper_url_qu
 -- stamped fresh at the actual moment of claim instead.
 alter table public.scraper_url_queue add column if not exists claimed_at timestamptz;
 create index if not exists scraper_url_queue_status_claimed_at_idx on public.scraper_url_queue (status, claimed_at);
+
+-- Job-scoped queue ownership (final Inventory Growth stabilization pass —
+-- see supabase/migrations/20260806000000_add_scraper_url_queue_job_id.sql).
+-- Nullable, never backfilled — every row enqueued before this migration
+-- (and every non-job-scoped caller) stays a safe, unassigned legacy row.
+alter table public.scraper_url_queue add column if not exists job_id uuid;
+create index if not exists scraper_url_queue_job_id_status_idx on public.scraper_url_queue (job_id, status);
+create index if not exists scraper_url_queue_job_id_created_at_idx on public.scraper_url_queue (job_id, created_at);
 
 alter table public.scraper_url_queue enable row level security;
 

@@ -32,7 +32,8 @@
 // that function's own comment) and, for real, by
 // supabase/migrations/20260803000000_add_scraper_jobs_completed_at.sql.
 import { createAdminClient } from "@/lib/supabase/admin";
-import type { ScraperJobRow, ScraperJobsDatabase } from "@/lib/supabase/scraper-jobs.types";
+import type { ScraperJobRow, ScraperJobsDatabase, ScraperJobStatus } from "@/lib/supabase/scraper-jobs.types";
+import type { UrlQueueDatabase } from "@/lib/supabase/url-queue.types";
 import { STALE_JOB_RECOVERY_THRESHOLD_MS } from "@/lib/scraper-config";
 
 export type { ScraperJobRow };
@@ -396,6 +397,40 @@ export async function getActiveLargeScaleJob(): Promise<ScraperJobRow | null> {
   return recovered.status === "paused" ? null : recovered;
 }
 
+/**
+ * Final Inventory Growth stabilization pass — "the admin UI must always
+ * load the server-authoritative active job... never depend on the
+ * current browser having created it." Deliberately SEPARATE from
+ * getActiveLargeScaleJob above (which excludes 'paused' on purpose — a
+ * paused job is exactly the state a fresh Start OR a Resume click is
+ * allowed to act on, so the concurrency guard that calls that function
+ * must never treat 'paused' as "already running"). This function is for
+ * UI visibility only: an admin opening the dashboard from any browser
+ * should immediately see whatever job is pending, running, OR paused —
+ * never just whichever job happened to create their localStorage entry.
+ */
+export async function getMostRecentNonTerminalLargeScaleJob(): Promise<ScraperJobRow | null> {
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+
+  const { data, error } = await supabase
+    .from("scraper_jobs")
+    .select("*")
+    .not("target_count", "is", null)
+    .in("status", ["pending", "running", "paused"])
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    console.error("[scraper-jobs] Failed to look up the most recent non-terminal large-scale job:", error);
+    return null;
+  }
+  if (!data) return null;
+
+  if (data.status === "paused") return data;
+  return recoverStaleLargeScaleJob(data);
+}
+
 export async function createLargeScaleScraperJob(
   targetCount: number,
   totalBatches: number,
@@ -540,6 +575,18 @@ export interface LargeScaleJobProgressUpdate {
   // always written as one checkpoint object below); process-batch/route.ts
   // is the only writer and reader.
   consecutiveZeroProgressBatches?: number;
+  // Final Inventory Growth stabilization pass — replaces the old
+  // consecutiveZeroProgressBatches-based failure trigger with a
+  // time-based one (see batch-unit.ts's own header comment on why).
+  // lastProductiveProgressAt is the ISO timestamp of the most recent
+  // trusted productive event for this job (inserted/valid/duplicate/
+  // rejected/extracted/queries/pages/URLs increasing); currentStage is a
+  // coarse, truthful label the admin UI can display without depending on
+  // any one browser's local state. Both stored in `checkpoint` for the
+  // same "needs no migration" reason consecutiveZeroProgressBatches
+  // already is.
+  lastProductiveProgressAt?: string;
+  currentStage?: string;
   // Discovery-scaling dashboard numbers (src/lib/inventory/
   // scaled-discovery.ts) — the newest, least-likely-to-exist-yet columns
   // of this whole update, so they get their own richest tier (see below)
@@ -631,6 +678,8 @@ export async function updateLargeScaleScraperJobProgress(
             seenUrls: progress.seenUrls,
             options: progress.checkpointOptions,
             consecutiveZeroProgressBatches: progress.consecutiveZeroProgressBatches ?? 0,
+            ...(progress.lastProductiveProgressAt ? { lastProductiveProgressAt: progress.lastProductiveProgressAt } : {}),
+            ...(progress.currentStage ? { currentStage: progress.currentStage } : {}),
           },
         }
       : {}),
@@ -781,6 +830,115 @@ export async function pauseScraperJobRow(jobId: string): Promise<{ error?: strin
     logJobStatusTransition({ jobId, from: "running", to: "paused", reason: "user_pause_request", pauseRequested: true });
   }
   return {};
+}
+
+// Cancel prefix — used both to WRITE a truthful cancel reason on a
+// database that hasn't run the 'canceled' status migration yet (falls
+// back to 'failed' with this prefix) and to RECOGNIZE that fallback later
+// (e.g. an admin glancing at error_message, or a future migration that
+// wants to backfill real 'canceled' rows from it). Never used to auto-
+// resume anything — unlike resumeFalselyFailedZeroProgressJob's own
+// signature match, a cancel is a deliberate admin action, not a bug.
+export const CANCELED_BY_ADMIN_PREFIX = "Canceled by admin:";
+
+/**
+ * Final Inventory Growth stabilization pass — truthful, safe cancellation
+ * from a non-terminal state (pending/queued/running/paused). Unlike
+ * pauseScraperJobRow (resumable) or failScraperJob (a real error), this is
+ * a deliberate admin action with its own terminal state.
+ *
+ * Tries the real 'canceled' status first (supabase/migrations/
+ * 20260806000000_add_scraper_jobs_canceled_status.sql); on a database that
+ * hasn't run that migration yet (a check-constraint violation, Postgres
+ * 23514), falls back to 'failed' with CANCELED_BY_ADMIN_PREFIX so it stays
+ * clearly distinguishable from a genuine failure without ever requiring
+ * the migration to be applied first.
+ *
+ * Clears batch_lease_id/batch_lease_expires_at unconditionally — any
+ * still-unwinding execution's OWN writes remain lease-guarded against its
+ * old leaseId (see updateLargeScaleScraperJobProgress's own comment), so
+ * clearing the row's lease here immediately makes every one of that
+ * execution's future writes a safe no-op, exactly the same mechanism a
+ * superseding claim already relies on. Releases only THIS job's own
+ * claimed-but-unprocessed queue rows back to 'pending' (job-scoped — see
+ * url-queue.ts) — never touches a different job's or legacy rows, and
+ * never touches already-inserted listings.
+ */
+export async function cancelScraperJob(jobId: string): Promise<{ canceled: boolean; error?: string }> {
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+  const nowIso = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("scraper_jobs")
+    .update({
+      status: "canceled" as ScraperJobStatus,
+      error_message: null,
+      completed_at: nowIso,
+      updated_at: nowIso,
+      batch_lease_id: null,
+      batch_lease_expires_at: null,
+    })
+    .eq("id", jobId)
+    .in("status", ["pending", "queued", "running", "paused"])
+    .select("id")
+    .maybeSingle();
+
+  let finalError = error;
+  let usedFallback = false;
+
+  if (error && isCheckConstraintViolation(error)) {
+    usedFallback = true;
+    const fallback = await supabase
+      .from("scraper_jobs")
+      .update({
+        status: "failed" as ScraperJobStatus,
+        error_message: `${CANCELED_BY_ADMIN_PREFIX} run stopped by admin request.`,
+        completed_at: nowIso,
+        updated_at: nowIso,
+        batch_lease_id: null,
+        batch_lease_expires_at: null,
+      })
+      .eq("id", jobId)
+      .in("status", ["pending", "queued", "running", "paused"])
+      .select("id")
+      .maybeSingle();
+    finalError = fallback.error;
+    if (!fallback.error && !fallback.data) {
+      return { canceled: false, error: "Job is already in a terminal state — nothing to cancel." };
+    }
+  } else if (!error && !data) {
+    return { canceled: false, error: "Job is already in a terminal state — nothing to cancel." };
+  }
+
+  if (finalError) {
+    console.error("[scraper-jobs] Failed to cancel job:", jobId, finalError);
+    return { canceled: false, error: finalError.message };
+  }
+
+  // Job-scoped release — only THIS job's own claimed rows, never a
+  // different job's or a legacy/unassigned one (see url-queue.ts's own
+  // claimNextUrls/job_id comment). Best-effort: a failure here doesn't
+  // undo the cancellation itself; those rows simply expire via
+  // STALE_CLAIM_THRESHOLD_MS the same way a crashed worker's claims
+  // already do. Separate admin client (scraper_url_queue isn't part of
+  // ScraperJobsDatabase's own typed table set).
+  const urlQueueSupabase = createAdminClient<UrlQueueDatabase>();
+  const { error: releaseError } = await urlQueueSupabase
+    .from("scraper_url_queue")
+    .update({ status: "pending" })
+    .eq("job_id", jobId)
+    .eq("status", "claimed");
+  if (releaseError && !isMissingColumnError(releaseError)) {
+    console.error("[scraper-jobs] Cancel: failed to release this job's claimed queue rows (non-fatal):", jobId, releaseError);
+  }
+
+  console.log(`[scraper-jobs] Job ${jobId} canceled by admin${usedFallback ? " (fell back to 'failed' — 'canceled' status migration not applied yet)" : ""}.`);
+  logJobStatusTransition({ jobId, from: "running", to: usedFallback ? "failed" : "canceled", reason: "user_cancel_request", pauseRequested: false });
+  return { canceled: true };
+}
+
+function isCheckConstraintViolation(error: { code?: string; message: string }): boolean {
+  return error.code === "23514" || /violates check constraint/i.test(error.message);
 }
 
 /**
