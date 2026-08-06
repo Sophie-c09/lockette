@@ -211,44 +211,101 @@ export async function runBatchUnit(params: BatchUnitParams): Promise<BatchUnitRe
     );
   }
 
-  const insertedCount = job.inserted_count + result.totalImported;
-  const validCount = (job.valid_count ?? 0) + result.totalValid;
-  const duplicateCount = (job.duplicate_count ?? 0) + result.totalDuplicates;
-  const rejectedCount = (job.rejected_count ?? 0) + result.totalRejected;
-  const insertFailedCount = (job.insert_failed_count ?? 0) + result.totalInsertFailed;
-  const scrapedCount = (job.scraped_count ?? 0) + result.totalScraped;
-  const extractedSuccessfullyCount = (job.extracted_successfully_count ?? 0) + result.totalExtractedSuccessfully;
+  // False-zero-progress fix — withBatchWatchdog's own "settled within the
+  // grace period, but via an error rather than a real result" branch (see
+  // admin-scraper.ts) returns a hardcoded zeroResult() with EVERY total set
+  // to 0, even when this same attempt's own interim onProgress callback
+  // (above) already committed real, lease-guarded progress to the DB
+  // moments earlier. result.totalX therefore cannot be trusted on its own
+  // to mean "nothing happened this unit" — it can just mean "the FINAL
+  // return value was zeroed out after the real work was already
+  // persisted." Re-reading the job row right now (reflecting every interim
+  // write made during this very attempt, whatever result.totalX claims)
+  // and taking the larger of that vs. the naive job.X + result.totalX sum
+  // is what actually answers "did anything real land in the database this
+  // unit" — and, as a direct side effect, also closes a latent
+  // monotonicity gap where this final write could otherwise regress a
+  // counter an interim write had already advanced past what result.totalX
+  // alone would compute.
+  const latestPersisted = await getScraperJobRow(jobId);
+  function committed(base: number, delta: number, latest: number | null | undefined): number {
+    return Math.max(base + delta, latest ?? 0);
+  }
+
+  const insertedCount = committed(job.inserted_count, result.totalImported, latestPersisted?.inserted_count);
+  const validCount = committed(job.valid_count ?? 0, result.totalValid, latestPersisted?.valid_count);
+  const duplicateCount = committed(job.duplicate_count ?? 0, result.totalDuplicates, latestPersisted?.duplicate_count);
+  const rejectedCount = committed(job.rejected_count ?? 0, result.totalRejected, latestPersisted?.rejected_count);
+  const insertFailedCount = committed(job.insert_failed_count ?? 0, result.totalInsertFailed, latestPersisted?.insert_failed_count);
+  const scrapedCount = committed(job.scraped_count ?? 0, result.totalScraped, latestPersisted?.scraped_count);
+  const extractedSuccessfullyCount = committed(
+    job.extracted_successfully_count ?? 0,
+    result.totalExtractedSuccessfully,
+    latestPersisted?.extracted_successfully_count,
+  );
   const extractionFailuresByReason = { ...(job.extraction_failures_by_reason ?? {}) };
   for (const [reason, count] of Object.entries(result.extractionFailuresByReason)) {
     extractionFailuresByReason[reason] = (extractionFailuresByReason[reason] ?? 0) + count;
   }
-  const queriesCompleted = (job.queries_completed ?? 0) + result.totalQueriesCompleted;
-  const pagesSearched = (job.pages_searched ?? 0) + result.totalPagesSearched;
-  const uniqueUrlsDiscovered = (job.unique_urls_discovered ?? 0) + result.totalUniqueUrlsDiscovered;
+  const queriesCompleted = committed(job.queries_completed ?? 0, result.totalQueriesCompleted, latestPersisted?.queries_completed);
+  const pagesSearched = committed(job.pages_searched ?? 0, result.totalPagesSearched, latestPersisted?.pages_searched);
+  const uniqueUrlsDiscovered = committed(
+    job.unique_urls_discovered ?? 0,
+    result.totalUniqueUrlsDiscovered,
+    latestPersisted?.unique_urls_discovered,
+  );
   // Concurrency fix — current_round only ever advances once the batch's
   // cancellation is confirmed (a genuinely finished, one-way-or-another
   // attempt); an unconfirmed attempt might still be running and must not
   // let this call's poll advance the round counter out from under it.
   const currentRound = (job.current_round ?? 0) + (result.cancellationConfirmed ? result.batchesRun : 0);
 
-  const thisCallMadeZeroProgress =
-    result.cancellationConfirmed &&
-    result.stopReason === "max_batches_reached" &&
-    result.totalQueriesCompleted === 0 &&
-    result.totalPagesSearched === 0 &&
-    result.totalUniqueUrlsDiscovered === 0 &&
-    result.totalExtractedSuccessfully === 0 &&
-    result.totalImported === 0 &&
-    result.totalDuplicates === 0 &&
-    result.totalRejected === 0;
+  // Productive-progress predicate — Section 3 of the false-zero-progress
+  // fix: ANY trusted, actually-committed counter increasing over its
+  // PRE-unit value (job.X, the fixed snapshot from before this attempt
+  // started) means real work happened this unit, regardless of what
+  // result.totalX alone claims. Compares the values ABOVE (already
+  // reconciled against the live DB), not result.totalX directly — this is
+  // what correctly credits a unit whose interim writes committed real
+  // listings before its final result got zeroed out by a late/aborted
+  // settle (see `committed()`'s own comment).
+  const progressedThisUnit =
+    insertedCount > job.inserted_count ||
+    validCount > (job.valid_count ?? 0) ||
+    duplicateCount > (job.duplicate_count ?? 0) ||
+    rejectedCount > (job.rejected_count ?? 0) ||
+    extractedSuccessfullyCount > (job.extracted_successfully_count ?? 0) ||
+    queriesCompleted > (job.queries_completed ?? 0) ||
+    pagesSearched > (job.pages_searched ?? 0) ||
+    uniqueUrlsDiscovered > (job.unique_urls_discovered ?? 0);
+
   const previousZeroProgressStreak =
     (job.checkpoint as { consecutiveZeroProgressBatches?: number } | null)?.consecutiveZeroProgressBatches ?? 0;
-  const zeroProgressStreak = thisCallMadeZeroProgress ? previousZeroProgressStreak + 1 : 0;
+
+  // Section 4 — only a genuinely SETTLED unit (cancellationConfirmed) with
+  // no committed progress increments the streak. An unconfirmed unit is
+  // still unwinding — it may yet commit real progress via a later interim
+  // write from the SAME leaked continuation — so its streak is left
+  // UNCHANGED (neither incremented nor reset) rather than assumed either
+  // way; the next call that actually settles is what decides.
+  const thisCallMadeZeroProgress =
+    result.cancellationConfirmed && result.stopReason === "max_batches_reached" && !progressedThisUnit;
+
+  const zeroProgressStreak = !result.cancellationConfirmed
+    ? previousZeroProgressStreak
+    : progressedThisUnit
+      ? 0
+      : previousZeroProgressStreak + 1;
 
   if (thisCallMadeZeroProgress) {
     console.error(`[${logPrefix}] Zero-progress batch for job ${jobId} (streak ${zeroProgressStreak}/${ZERO_PROGRESS_BATCH_THRESHOLD})`, {
       lastBatchError: result.lastBatchError,
     });
+  } else if (progressedThisUnit && previousZeroProgressStreak > 0) {
+    console.log(
+      `[${logPrefix}] Job ${jobId} made real committed progress this unit — resetting zero-progress streak ` +
+        `from ${previousZeroProgressStreak} to 0.`,
+    );
   }
 
   const progressWrite = await updateLargeScaleScraperJobProgress(

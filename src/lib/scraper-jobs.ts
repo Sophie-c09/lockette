@@ -852,6 +852,115 @@ export async function claimJobForResume(jobId: string): Promise<{ claimed: boole
   return { claimed: Boolean(data), job: data };
 }
 
+// Zero-progress false-failure recovery — the zero-progress watchdog
+// (src/lib/inventory/batch-unit.ts) could, before its own fix, fail a job
+// that had genuinely productive committed progress (real inserted/valid/
+// duplicate/rejected counts already in this very row) because its
+// predicate only trusted a per-call in-memory result that a late-settling
+// watchdog attempt can zero out even after real interim writes already
+// landed. A job failed by THAT exact bug has done nothing wrong — its
+// checkpoint, counters, and every already-inserted listing are all
+// genuinely valid; only the terminal status/error_message are false. This
+// recovery is deliberately narrow: it only ever resumes a job whose OWN
+// error_message matches that exact watchdog wording (never a job that
+// failed for a real reason, e.g. a genuine exception or too many
+// consecutive attempt failures) — same guard batch-unit.ts's own
+// zero-progress `reason` string must stay in sync with.
+//
+// Guarded by `.eq("status", "failed")` for the same optimistic-concurrency
+// safety claimJobForResume already uses (a double-click can only ever
+// claim the row once). Preserves inserted_count/valid_count/duplicate_count/
+// rejected_count/every other counter and seenUrls/options exactly as they
+// are — nothing about already-committed progress or already-inserted
+// listings is touched. Resets checkpoint.consecutiveZeroProgressBatches to
+// 0 so the next unit starts with a clean streak, and clears
+// batch_lease_id/batch_lease_expires_at (already null on a failed job, but
+// explicit here in case a future caller changes that) so the very next
+// claim attempt (Vercel route or worker) acquires a genuinely fresh lease.
+const ZERO_PROGRESS_ERROR_SIGNATURE = "consecutive batches produced no discovery/extraction progress";
+
+export async function resumeFalselyFailedZeroProgressJob(
+  jobId: string,
+): Promise<{ resumed: boolean; job: ScraperJobRow | null; error?: string }> {
+  const supabase = createAdminClient<ScraperJobsDatabase>();
+
+  const existing = await getScraperJobRow(jobId);
+  if (!existing) {
+    return { resumed: false, job: null, error: "Job not found." };
+  }
+  if (existing.status !== "failed") {
+    return { resumed: false, job: existing, error: `Job is '${existing.status}', not 'failed' — nothing to recover.` };
+  }
+  if (!existing.error_message || !existing.error_message.includes(ZERO_PROGRESS_ERROR_SIGNATURE)) {
+    return {
+      resumed: false,
+      job: existing,
+      error: "This job's failure reason does not match the zero-progress watchdog's exact wording — refusing to " +
+        "auto-resume a job that may have failed for a genuine reason.",
+    };
+  }
+
+  const existingCheckpoint = (existing.checkpoint ?? {}) as { seenUrls?: string[]; options?: Record<string, unknown> };
+  const nowIso = new Date().toISOString();
+
+  const richPayload = {
+    status: "running" as const,
+    error_message: null,
+    completed_at: null,
+    last_heartbeat: nowIso,
+    updated_at: nowIso,
+    batch_lease_id: null,
+    batch_lease_expires_at: null,
+    checkpoint: {
+      seenUrls: existingCheckpoint.seenUrls ?? [],
+      options: existingCheckpoint.options,
+      consecutiveZeroProgressBatches: 0,
+    },
+  };
+
+  let { data, error } = await supabase
+    .from("scraper_jobs")
+    .update(richPayload)
+    .eq("id", jobId)
+    .eq("status", "failed")
+    .select()
+    .maybeSingle();
+
+  if (error && isMissingColumnError(error)) {
+    ({ data, error } = await supabase
+      .from("scraper_jobs")
+      .update({ status: "running" as const, error_message: null })
+      .eq("id", jobId)
+      .eq("status", "failed")
+      .select()
+      .maybeSingle());
+  }
+
+  if (error) {
+    console.error("[scraper-jobs] Failed to recover falsely-failed zero-progress job:", jobId, error);
+    return { resumed: false, job: null, error: error.message };
+  }
+
+  if (!data) {
+    return { resumed: false, job: null, error: "Job status changed before this recovery could claim it — nothing to do." };
+  }
+
+  logJobStatusTransition({
+    jobId,
+    from: "failed",
+    to: "running",
+    reason: "zero_progress_false_failure_recovery",
+    pauseRequested: false,
+  });
+  console.log(
+    `[scraper-jobs] Job ${jobId} recovered from a false zero-progress failure — preserved inserted_count=` +
+      `${existing.inserted_count}, valid_count=${existing.valid_count ?? 0}, checkpoint seenUrls (` +
+      `${existingCheckpoint.seenUrls?.length ?? 0} URLs).`,
+  );
+
+  return { resumed: true, job: data };
+}
+
 // P0 launch-readiness fix — process-batch/route.ts's own status check
 // (`job.status === "pending" || "running"`) does NOT prevent two
 // concurrent calls for the SAME job from both passing it and both calling

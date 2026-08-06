@@ -71,7 +71,12 @@ test("completed_at is set on terminal failure via failScraperJob — 'failed' is
 });
 
 test("resuming a paused job (claimJobForResume) never sets or clears completed_at — a paused job never had it set in the first place", () => {
-  const body = fnBody(scraperJobsSource, "claimJobForResume", "claimBatchLease");
+  // End marker is resumeFalselyFailedZeroProgressJob, not claimBatchLease —
+  // the zero-progress false-failure recovery function now sits between
+  // the two (it legitimately clears completed_at for a DIFFERENT,
+  // 'failed'-status recovery case, which must not leak into this
+  // assertion about claimJobForResume's own body).
+  const body = fnBody(scraperJobsSource, "claimJobForResume", "resumeFalselyFailedZeroProgressJob");
   assert.doesNotMatch(body, /completed_at/);
 });
 

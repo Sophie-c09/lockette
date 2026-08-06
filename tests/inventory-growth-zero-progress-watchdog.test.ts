@@ -64,18 +64,28 @@ test("ROOT CAUSE REGRESSION: the extraction round's own drain cap fits inside th
 });
 
 test("ZERO-PROGRESS WATCHDOG: a batch that produced zero queries/pages/URLs/extraction/valid/duplicate/rejected outcomes is detected as zero-progress", () => {
-  const body = slice(batchUnitSource, "const thisCallMadeZeroProgress =", 600);
+  // False-zero-progress fix — superseded checking result.totalX === 0
+  // directly (which a late watchdog settle can zero out even after real
+  // progress was already committed — see
+  // tests/inventory-growth-zero-progress-false-failure.test.ts) with a
+  // DB-delta-based progressedThisUnit check covering the same signals
+  // (queries/pages/unique URLs/extraction/inserted/duplicate/rejected),
+  // compared against the live job row instead of the in-memory result.
+  const body = slice(batchUnitSource, "const progressedThisUnit =", 700);
   for (const field of [
-    "result.totalQueriesCompleted === 0",
-    "result.totalPagesSearched === 0",
-    "result.totalUniqueUrlsDiscovered === 0",
-    "result.totalExtractedSuccessfully === 0",
-    "result.totalImported === 0",
-    "result.totalDuplicates === 0",
-    "result.totalRejected === 0",
+    "insertedCount > job.inserted_count",
+    "validCount > (job.valid_count ?? 0)",
+    "duplicateCount > (job.duplicate_count ?? 0)",
+    "rejectedCount > (job.rejected_count ?? 0)",
+    "extractedSuccessfullyCount > (job.extracted_successfully_count ?? 0)",
+    "queriesCompleted > (job.queries_completed ?? 0)",
+    "pagesSearched > (job.pages_searched ?? 0)",
+    "uniqueUrlsDiscovered > (job.unique_urls_discovered ?? 0)",
   ]) {
-    assert.ok(body.includes(field), `expected zero-progress check to include: ${field}`);
+    assert.ok(body.includes(field), `expected productive-progress check to include: ${field}`);
   }
+  const predicateBody = slice(batchUnitSource, "const thisCallMadeZeroProgress =", 300);
+  assert.match(predicateBody, /!progressedThisUnit/);
 });
 
 test("ZERO-PROGRESS WATCHDOG: the consecutive-zero-progress streak is tracked in the job's own checkpoint, needing no migration", () => {
@@ -94,8 +104,15 @@ test("ZERO-PROGRESS WATCHDOG: after a small consecutive threshold the job fails 
 });
 
 test("ZERO-PROGRESS WATCHDOG: a batch that DID make real progress resets the streak (does not fail a healthy run)", () => {
+  // False-zero-progress fix — superseded the old `thisCallMadeZeroProgress
+  // ? +1 : 0` ternary (which trusted only result.totalX) with a
+  // DB-delta-based `progressedThisUnit` check that also correctly resets
+  // the streak when a unit's in-memory result was zeroed by a late
+  // watchdog settle despite real progress already being committed — see
+  // tests/inventory-growth-zero-progress-false-failure.test.ts for the
+  // full coverage of that fix.
   const body = slice(batchUnitSource, "const zeroProgressStreak =", 200);
-  assert.match(body, /thisCallMadeZeroProgress \? previousZeroProgressStreak \+ 1 : 0/);
+  assert.match(body, /progressedThisUnit\s*\n\s*\? 0/);
 });
 
 test("DISCOVERY EXCEPTION SURFACING: the last batch attempt's own failure reason is threaded out through the result, not left only in a server log", () => {

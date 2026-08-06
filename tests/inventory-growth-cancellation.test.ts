@@ -196,10 +196,17 @@ test("non-batch callers (run/route.ts's Style-Aware Scraper) keep working unguar
 
 // --- 8. Monotonic counters / stale checkpoint cannot overwrite newer --------
 
-test("monotonic counters: batch-unit.ts always computes new totals as job.X + thisCall'sDelta (additive), never overwriting with a smaller absolute value", () => {
-  const fnBody = slice(batchUnitSource, "const insertedCount = job.inserted_count", 1400);
-  assert.match(fnBody, /const insertedCount = job\.inserted_count \+ result\.totalImported;/);
-  assert.match(fnBody, /const queriesCompleted = \(job\.queries_completed \?\? 0\) \+ result\.totalQueriesCompleted;/);
+test("monotonic counters: batch-unit.ts always computes new totals as the larger of job.X + thisCall'sDelta or whatever's already live in the DB, never overwriting with a smaller absolute value", () => {
+  // False-zero-progress fix strengthened this guarantee: `committed()`
+  // takes Math.max(job.X + result.totalX, latestPersisted.X) instead of
+  // trusting job.X + result.totalX alone — see
+  // tests/inventory-growth-zero-progress-false-failure.test.ts for the
+  // full coverage of why (a late watchdog settle can zero out result.totalX
+  // even after real progress already landed via an interim write).
+  const fnBody = slice(batchUnitSource, "function committed(base: number, delta: number", 1600);
+  assert.match(fnBody, /return Math\.max\(base \+ delta, latest \?\? 0\);/);
+  assert.match(fnBody, /const insertedCount = committed\(job\.inserted_count, result\.totalImported, latestPersisted\?\.inserted_count\);/);
+  assert.match(fnBody, /const queriesCompleted = committed\(job\.queries_completed \?\? 0, result\.totalQueriesCompleted, latestPersisted\?\.queries_completed\);/);
 });
 
 test("monotonic counters: current_round only advances when this attempt's cancellation is confirmed — an unconfirmed attempt cannot move it at all", () => {
