@@ -11,7 +11,7 @@
 //     title, an <h1>, price-looking text, brand/size-looking elements) to
 //     fill in whatever's still missing — there's no universal product-page
 //     structure across marketplaces, so these are intentionally loose.
-import { chromium } from "playwright";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { extractFromHtml, detectBlockedPageContent, type RawExtraction } from "./html-extractor";
 import {
   acquireBrowserSlot,
@@ -182,10 +182,18 @@ const READ_VISIBLE_DOM_SIGNALS_SCRIPT = `
 // try/catch as a second safety net, but every failure mode we can
 // anticipate (launch failure, navigation timeout, page crash) is caught
 // here too so a Playwright hiccup degrades to "no browser data" instead of
-// propagating.
-export async function runBrowserExtraction(url: string): Promise<RawExtraction | null> {
-  let browser: Awaited<ReturnType<typeof chromium.launch>> | null = null;
+// propagating. `signal`, when passed (only ever by Inventory Growth's own
+// per-attempt AbortController — every other caller omits it and keeps its
+// exact current behavior), closes the page/context immediately on abort —
+// page.goto()/waitForLoadState() have no AbortSignal of their own, so
+// this is the supported way to interrupt them (both reject almost
+// immediately once their page is closed out from under them).
+export async function runBrowserExtraction(url: string, signal?: AbortSignal): Promise<RawExtraction | null> {
+  let browser: Browser | null = null;
+  let context: BrowserContext | null = null;
+  let page: Page | null = null;
   let slotAcquired = false;
+  let abortedThisAttempt = false;
   const hostname = (() => {
     try {
       return new URL(url).hostname;
@@ -194,17 +202,29 @@ export async function runBrowserExtraction(url: string): Promise<RawExtraction |
     }
   })();
 
+  if (signal?.aborted) {
+    debugLog(`Browser extraction skipped for ${url} — batch aborted before it started`);
+    return null;
+  }
+
+  const onAbort = () => {
+    abortedThisAttempt = true;
+    page?.close().catch(() => {});
+    context?.close().catch(() => {});
+  };
+  signal?.addEventListener("abort", onAbort, { once: true });
+
   try {
     debugLog(`Browser extraction started for ${url}`);
     await acquireBrowserSlot();
     slotAcquired = true;
     browser = await chromium.launch(await resolveBrowserLaunchOptions({ headless: true, timeout: LAUNCH_TIMEOUT_MS }));
     registerBrowserLaunch(browser);
-    const context = await browser.newContext({
+    context = await browser.newContext({
       userAgent: BROWSER_USER_AGENT,
       viewport: { width: 1280, height: 900 },
     });
-    const page = await context.newPage();
+    page = await context.newPage();
 
     // "networkidle" as a goto() condition is too strict for SPAs that keep
     // background traffic going indefinitely (analytics beacons, feature-flag
@@ -287,9 +307,17 @@ export async function runBrowserExtraction(url: string): Promise<RawExtraction |
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    console.warn(`[listing-extraction] Browser extraction threw for ${url}: ${reason}`);
+    // Cancellation fix — an abort-caused close is never silently folded
+    // into the same "Browser extraction threw" log a genuine Playwright
+    // failure gets; it's visible and distinctly labeled, not swallowed.
+    if (abortedThisAttempt || signal?.aborted) {
+      console.warn(`[listing-extraction] Browser extraction cancelled for ${url} (batch aborted): ${reason}`);
+    } else {
+      console.warn(`[listing-extraction] Browser extraction threw for ${url}: ${reason}`);
+    }
     return null;
   } finally {
+    signal?.removeEventListener("abort", onAbort);
     if (browser) {
       await browser.close();
       registerBrowserClose(browser);

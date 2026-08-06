@@ -111,11 +111,18 @@ import {
 import { scoreListingQuality, QUALITY_REJECTION_THRESHOLD, type QualityScoreBreakdown } from "@/lib/listing-quality";
 import { PipelineFunnel } from "@/lib/pipeline-debug";
 import { scoreImagesOutfitPotentialBatch } from "@/lib/image-score";
-import { mapWithConcurrency } from "@/lib/concurrency";
+import { mapWithConcurrency, abortableDelay, BatchAbortedError } from "@/lib/concurrency";
 import type { ListingsDatabase } from "@/lib/supabase/listings.types";
 import { extractMarketplaceId, computeImageHash, fallbackFingerprintKey } from "@/lib/inventory/duplicate-detection";
 import { flagListing } from "@/lib/inventory/listing-flagging";
-import { enqueueUrls, claimNextUrls, markUrlExtracted, markUrlFailed, getUrlQueueStats } from "@/lib/inventory/url-queue";
+import {
+  enqueueUrls,
+  claimNextUrls,
+  markUrlExtracted,
+  markUrlFailed,
+  getUrlQueueStats,
+  releaseClaimedUrl,
+} from "@/lib/inventory/url-queue";
 import type { UrlQueueRow } from "@/lib/supabase/url-queue.types";
 import { runInventoryIndexer } from "@/lib/inventory/inventory-indexer";
 import { getAllMarketplaceHealth, type MarketplaceHealth } from "@/lib/inventory/marketplace-health";
@@ -485,7 +492,13 @@ export type AdminScraperStopReason =
   | "low_yield"
   | "high_failure_rate"
   | "partial_batch_timeout"
-  | "error";
+  | "error"
+  // Cancellation fix — distinct from "error": this round stopped because
+  // it was deliberately aborted (the batch watchdog fired, or the caller
+  // aborted for pause/lease-loss reasons), never because of a genuine
+  // marketplace/network failure. Callers must not treat this as a
+  // circuit-breaker-worthy failure or a poison-URL attempt.
+  | "aborted";
 
 export interface AdminScraperResult {
   imported: number;
@@ -619,16 +632,18 @@ export async function runInBatches<T, R>(
 }
 
 /**
- * Races a single extraction against EXTRACTION_TIMEOUT_MS (Step 5) — see
- * that constant's own comment for why this doesn't (and can't) actually
- * cancel the underlying Playwright work, only frees the calling worker
- * slot so the batch keeps moving.
+ * Races a single extraction against EXTRACTION_TIMEOUT_MS (Step 5). The
+ * per-URL timeout race here is unrelated to cancellation (it always
+ * applies, signal or not) — `signal`, when passed (Inventory Growth's own
+ * per-attempt AbortController), is threaded into extractListingFromUrl so
+ * an aborted batch can actually interrupt the underlying fetch/page.goto
+ * rather than only abandoning this Promise.race.
  */
-async function extractWithTimeout(url: string, timeoutMs: number): Promise<ExtractedListing> {
+async function extractWithTimeout(url: string, timeoutMs: number, signal?: AbortSignal): Promise<ExtractedListing> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
-      extractListingFromUrl(url),
+      extractListingFromUrl(url, signal),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error(`extraction timed out after ${timeoutMs}ms`)), timeoutMs);
       }),
@@ -719,7 +734,18 @@ const URL_QUEUE_MAX_ATTEMPTS = 3;
 // returning within the whole diagnostic window), this is what stops
 // extraction from blocking the pipeline forever rather than a diagnostic
 // timeout catching it after the fact.
-const QUEUE_EXTRACTION_ROUND_MAX_WAIT_MS = 90_000;
+//
+// Lowered from 90s (Inventory Growth zero-progress investigation) — this
+// constant was sized before process-batch/route.ts's SINGLE_BATCH_CALL_
+// TIMEOUT_MS (50s) existed and became the ONLY way this code actually
+// runs; 90s alone already exceeds that outer watchdog's entire budget,
+// so extraction was never the thing actually deciding when a round
+// ended — the outer watchdog always fired first, discarding whatever
+// real discovery+extraction progress had happened with nothing credited
+// and no error surfaced. 30s leaves room for this to matter (still ends
+// a round on its own terms most of the time) while fitting inside the
+// same call's real budget alongside discovery and the DB writes around it.
+const QUEUE_EXTRACTION_ROUND_MAX_WAIT_MS = 30_000;
 // Once discovery is done producing for this call (aggressive: the
 // background discovery promise resolved; non-aggressive: discovery
 // already finished synchronously before extraction even starts — see
@@ -804,12 +830,22 @@ export interface DrainQueueOptions<TItem, TResult> {
   run: (item: TItem) => Promise<TResult>;
   onSuccess: (item: TItem, result: TResult) => Promise<void> | void;
   onFailure: (item: TItem, error: unknown) => Promise<void> | void;
+  // Cancellation fix — called instead of onFailure for an item that never
+  // ran (or whose run() was interrupted) BECAUSE the batch was aborted,
+  // never a genuine extraction failure. The queue binding
+  // (runQueueDrivenExtraction) uses this to release the row back to
+  // 'pending' rather than counting a poison-URL attempt.
+  onAborted?: (item: TItem) => Promise<void> | void;
   onBatchComplete?: (summary: BatchRunSummary & { claimedCount: number }) => void;
   // Test-only override for the empty-claim poll delay (real callers never
   // pass this, defaulting to a real 1s wait) — lets a "keeps polling until
   // the producer catches up" scenario run in milliseconds instead of
   // actual wall-clock seconds.
   pollDelayMs?: number;
+  // Cancellation fix — only ever set by Inventory Growth's own per-attempt
+  // AbortController. Checked before claiming a new batch (stop launching
+  // new extraction work) and before/during running each claimed item.
+  signal?: AbortSignal;
 }
 
 /**
@@ -838,11 +874,23 @@ export async function drainQueue<TItem, TResult>(opts: DrainQueueOptions<TItem, 
       break;
     }
 
+    // Cancellation fix — never claim a new batch after abort; whatever's
+    // already been claimed in an EARLIER iteration was already resolved
+    // (succeeded/failed/released) before this loop came back around.
+    if (opts.signal?.aborted) {
+      console.log("[admin-scraper] drainQueue — aborted, no further claims.");
+      break;
+    }
+
     const claimed = await opts.claim();
 
     if (claimed.length === 0) {
       if (opts.isProducerDone() && Date.now() - lastClaimAt > opts.idleCutoffMs) break;
-      await new Promise((resolve) => setTimeout(resolve, opts.pollDelayMs ?? 1_000));
+      try {
+        await abortableDelay(opts.pollDelayMs ?? 1_000, opts.signal);
+      } catch {
+        break;
+      }
       continue;
     }
 
@@ -853,12 +901,20 @@ export async function drainQueue<TItem, TResult>(opts: DrainQueueOptions<TItem, 
       opts.batchSize,
       opts.concurrency,
       async (item) => {
+        if (opts.signal?.aborted) {
+          await opts.onAborted?.(item);
+          throw new BatchAbortedError("Skipped — batch aborted before this item started");
+        }
         try {
           const result = await opts.run(item);
           await opts.onSuccess(item, result);
           return result;
         } catch (error) {
-          await opts.onFailure(item, error);
+          if (error instanceof BatchAbortedError || opts.signal?.aborted) {
+            await opts.onAborted?.(item);
+          } else {
+            await opts.onFailure(item, error);
+          }
           throw error;
         }
       },
@@ -886,6 +942,8 @@ interface QueueDrivenExtractionOptions {
   concurrency: number;
   counters: { onScraped: () => void; onExtractionFailed: () => void; onUrlStarted: (url: string) => void };
   funnel: PipelineFunnel;
+  // Cancellation fix — see runAdminScraper's own comment.
+  signal?: AbortSignal;
 }
 
 /**
@@ -930,6 +988,7 @@ async function runQueueDrivenExtraction(opts: QueueDrivenExtractionOptions): Pro
     isProducerDone: opts.isDiscoveryDone,
     batchSize: opts.batchSize,
     concurrency: opts.concurrency,
+    signal: opts.signal,
     claim: () => claimNextUrls(opts.batchSize),
     run: async (row) => {
       opts.counters.onUrlStarted(row.url);
@@ -938,7 +997,7 @@ async function runQueueDrivenExtraction(opts: QueueDrivenExtractionOptions): Pro
         platform: row.platform,
         attemptNumber: row.attempt_count + 1,
       });
-      const extractedListing = await extractWithTimeout(row.url, EXTRACTION_TIMEOUT_MS);
+      const extractedListing = await extractWithTimeout(row.url, EXTRACTION_TIMEOUT_MS, opts.signal);
       opts.counters.onScraped();
       const gotRealData = Boolean(extractedListing.title) && extractedListing.images.length > 0;
       opts.funnel.recordExtraction(row.url, gotRealData, gotRealData ? undefined : "extracted_but_empty");
@@ -950,6 +1009,14 @@ async function runQueueDrivenExtraction(opts: QueueDrivenExtractionOptions): Pro
       opts.counters.onExtractionFailed();
       opts.funnel.recordExtraction(row.url, false, error instanceof Error ? error.message : "unknown_error");
       return markUrlFailed(row, URL_QUEUE_MAX_ATTEMPTS);
+    },
+    // Cancellation fix — the batch was aborted, not the marketplace or
+    // this row: release it back to 'pending' (safe to claim again by a
+    // future run) instead of markUrlFailed, which would count against its
+    // attempt_count and could eventually poison a perfectly good URL.
+    onAborted: (row) => {
+      console.log("[EXTRACTION WORKER] releasing claimed row — batch aborted", { url: row.url, id: row.id });
+      return releaseClaimedUrl(row.id);
     },
     onBatchComplete: (summary) => {
       console.log("[FUNNEL][EXTRACTION]", {
@@ -1006,6 +1073,8 @@ async function runAggressiveRound(
   counters: { onScraped: () => void; onExtractionFailed: () => void; onUrlStarted: (url: string) => void },
   funnel: PipelineFunnel,
   onDiscoveryStats: (stats: { queriesCompleted: number; pagesSearched: number; uniqueUrlsDiscovered: number }) => void,
+  // Cancellation fix — see runAdminScraper's own comment.
+  signal?: AbortSignal,
 ): Promise<AggressiveRoundResult> {
   let discoveryDone = false;
   let enqueuedThisRound = 0;
@@ -1034,6 +1103,7 @@ async function runAggressiveRound(
         })),
       );
     },
+    signal,
   );
 
   discoveryPromise
@@ -1061,6 +1131,7 @@ async function runAggressiveRound(
     concurrency: OVERNIGHT_AGGRESSIVE_CONFIG.extractionWorkers,
     counters,
     funnel,
+    signal,
   });
 
   return { extracted, enqueuedThisRound };
@@ -1104,6 +1175,8 @@ async function runNonAggressiveStreamingRound(
   options: AdminScraperOptions,
   extractionCounters: { onScraped: () => void; onExtractionFailed: () => void; onUrlStarted: (url: string) => void },
   funnel: PipelineFunnel,
+  // Cancellation fix — see runAdminScraper's own comment.
+  signal?: AbortSignal,
 ): Promise<StreamingScaledRoundResult> {
   let discoveryDone = false;
   let queuedThisRound = 0;
@@ -1141,6 +1214,7 @@ async function runNonAggressiveStreamingRound(
       // does for aggressive mode (Step 6: no backpressure here).
       await logQueueFunnelAndCheckDepth({ discovered: queuedThisRound, queued: queuedThisRound });
     },
+    signal,
   ).finally(() => {
     discoveryDone = true;
   });
@@ -1157,6 +1231,7 @@ async function runNonAggressiveStreamingRound(
     concurrency: MAX_EXTRACTION_CONCURRENCY,
     counters: extractionCounters,
     funnel,
+    signal,
   });
 
   const [discoveryResult, extractionResult] = await Promise.all([discoveryPromise, extractionPromise]);
@@ -1520,6 +1595,13 @@ async function enrichAndScoreBatch(
 export async function runAdminScraper(
   options: AdminScraperOptions,
   onProgress?: (progress: AdminScraperProgress) => void | Promise<void>,
+  // Cancellation fix — only ever set by runLargeScaleAdminScraper's own
+  // per-attempt AbortController (Inventory Growth); every other existing
+  // caller (Style-Aware Scraper, Continuous Import) omits it and keeps
+  // its exact current behavior. Checked at the top of each round (stop
+  // starting new discovery/extraction work) and threaded into
+  // useScaledDiscovery's own round functions.
+  signal?: AbortSignal,
 ): Promise<AdminScraperResult> {
   const startedAt = Date.now();
   const elapsed = () => Date.now() - startedAt;
@@ -1639,6 +1721,16 @@ export async function runAdminScraper(
         break;
       }
 
+      // Cancellation fix — checked BEFORE starting a new round, never
+      // mid-round: stop launching new discovery/extraction work the
+      // moment an abort is observed, rather than only reacting to it deep
+      // inside a round already in flight.
+      if (signal?.aborted) {
+        console.log(`[admin-scraper] Round ${rounds + 1} not started — aborted.`);
+        stopReason = "aborted";
+        break;
+      }
+
       rounds++;
       const remainingNeeded = options.limit - totalImported;
       const roundTarget = Math.min(
@@ -1695,6 +1787,7 @@ export async function runAdminScraper(
             pagesSearched += stats.pagesSearched;
             uniqueUrlsDiscovered += stats.uniqueUrlsDiscovered;
           },
+          signal,
         );
         extracted = roundResult.extracted;
 
@@ -1715,7 +1808,7 @@ export async function runAdminScraper(
         // runNonAggressiveStreamingRound's own comment for how this
         // differs from aggressive mode's overlap (no backpressure, and
         // this round still fully awaits discovery before moving on).
-        const roundResult = await runNonAggressiveStreamingRound(roundTarget, seenUrls, options, extractionCounters, funnel);
+        const roundResult = await runNonAggressiveStreamingRound(roundTarget, seenUrls, options, extractionCounters, funnel, signal);
         extracted = roundResult.extracted;
         queriesCompleted += roundResult.queriesCompleted;
         pagesSearched += roundResult.pagesSearched;
@@ -2460,7 +2553,16 @@ export interface LargeScaleAdminScraperOptions extends AdminScraperFilterOptions
   aggressiveAcquisition?: boolean;
 }
 
-export type LargeScaleStopReason = "target_reached" | "max_batches_reached" | "consecutive_failures" | "paused";
+export type LargeScaleStopReason =
+  | "target_reached"
+  | "max_batches_reached"
+  | "consecutive_failures"
+  | "paused"
+  // Cancellation fix — this call's own attempt(s) were aborted (watchdog
+  // timeout, or an external signal) rather than genuinely failing;
+  // process-batch/route.ts uses this to decide the response status
+  // (timed_out) instead of silently reporting "running" progress.
+  | "aborted";
 
 export interface LargeScaleAdminScraperResult {
   totalImported: number;
@@ -2489,6 +2591,21 @@ export interface LargeScaleAdminScraperResult {
   totalQueriesCompleted: number;
   totalPagesSearched: number;
   totalUniqueUrlsDiscovered: number;
+  // Zero-progress-watchdog fix (Inventory Growth investigation) — the
+  // most recent batch attempt's own failure reason (a real exception, or
+  // "Batch watchdog: exceeded Nms without completing"), so a caller can
+  // tell a genuinely erroring/timing-out batch apart from one that
+  // legitimately found nothing, instead of both looking identical
+  // ("batchesRun: 1, everything else 0") with the actual reason only
+  // ever reaching a server log. Null when the last (or only) attempt
+  // succeeded.
+  lastBatchError: string | null;
+  // Cancellation fix — false means the last attempt's abort (if its
+  // watchdog fired) could NOT be confirmed to have stopped within
+  // WATCHDOG_GRACE_MS; the underlying work may still be running in the
+  // background. The caller (process-batch/route.ts) must not release the
+  // batch lease when this is false.
+  cancellationConfirmed: boolean;
 }
 
 export interface LargeScaleProgress {
@@ -2595,73 +2712,125 @@ async function getListingsInventoryCount(supabase: ReturnType<typeof createAdmin
   return count ?? 0;
 }
 
-// Reliability watchdog — races ONE batch attempt against `timeoutMs` (the
-// caller decides this — see runLargeScaleAdminScraper's own hooks.
-// perBatchTimeoutMs — since what's SAFE depends entirely on the caller's
-// own execution budget: process-batch/route.ts is a real Vercel Function
-// bounded by its own `maxDuration`, and this watchdog is only useful if it
-// can actually fire BEFORE that platform-level kill does) so a hung
-// attempt (no error, no progress, just never resolving — the exact
+// Reliability + cancellation watchdog — races ONE batch attempt against
+// `timeoutMs` (the caller decides this — see runLargeScaleAdminScraper's
+// own hooks.perBatchTimeoutMs — since what's SAFE depends entirely on the
+// caller's own execution budget: process-batch/route.ts is a real Vercel
+// Function bounded by its own `maxDuration`, and this watchdog is only
+// useful if it can actually fire BEFORE that platform-level kill does) so
+// a hung attempt (no error, no progress, just never resolving — the exact
 // failure mode found live: batch 20/86 frozen for 40+ minutes with status
 // still 'running') gets treated as a failed attempt instead of blocking
 // this loop forever OR, worse, getting silently killed by the platform
-// with no error, no log, no DB write at all (the "0 across every metric,
-// no visible error" root cause — see SINGLE_BATCH_CALL_TIMEOUT_MS's own
-// comment in scraper-config.ts). This does NOT cancel the underlying
-// runAdminScraper() call — there's no AbortController threaded through
-// discovery/extraction to make that safe, and adding one would be a real
-// change to the scraper itself, not a reliability wrapper around it. The
-// abandoned call is simply left running in the background and its
-// eventual result (if any) is discarded; existing retry/consecutive-
-// failure handling takes it from here exactly as if runAdminScraper had
-// itself returned stopReason: "error".
-function withBatchWatchdog(
+// with no error, no log, no DB write at all.
+//
+// CANCELLATION FIX: on timeout, this now actually aborts `abortController`
+// — threaded all the way through runAdminScraper -> discovery/extraction
+// -> page/context handles, each of which stops launching new work and
+// closes its own active page/context the moment `signal.aborted` is
+// observed (see scaled-discovery.ts's crawlPlatform, admin-scraper.ts's
+// drainQueue). A short GRACE_MS window after aborting gives that a real
+// chance to land before concluding the attempt is genuinely unstoppable —
+// `cancellationConfirmed` on the returned result tells the caller which
+// happened: `true` means the underlying work is confirmed stopped (safe
+// to release the batch lease normally); `false` means it MAY still be
+// running in the background (this is the residual, disclosed limitation
+// — Playwright/fetch calls that don't respond to their context closing
+// or an in-flight synchronous stretch — see process-batch/route.ts's own
+// comment on why the lease must NOT be released in that case).
+const WATCHDOG_GRACE_MS = 3_000;
+
+async function withBatchWatchdog(
   work: Promise<AdminScraperResult>,
   context: { batch: number; attempt: number; requested: number },
   timeoutMs: number,
-): Promise<AdminScraperResult> {
-  let timer: ReturnType<typeof setTimeout>;
-  const watchdog = new Promise<AdminScraperResult>((resolve) => {
-    timer = setTimeout(() => {
-      console.error(
-        `[watchdog] Batch ${context.batch} attempt ${context.attempt} exceeded ` +
-          `${timeoutMs}ms with no result — marking this attempt failed so retry/next-batch ` +
-          "logic can continue. The underlying scrape call is left running in the background (it cannot be " +
-          "cancelled) and its eventual result, if any, is discarded.",
-      );
-      // Fire-and-forget (not awaited) — forcing this attempt's browsers
-      // closed must not delay resolve() below, which is what actually lets
-      // the retry loop proceed; see forceCloseAllTrackedBrowsers's own
-      // comment on why this prevents orphaned Chromium processes from a
-      // batch abandoned by this exact watchdog.
-      forceCloseAllTrackedBrowsers(
-        `batch ${context.batch} attempt ${context.attempt} exceeded ${timeoutMs}ms`,
-      ).catch((error) => {
-        console.error("[watchdog] Forced browser cleanup itself failed:", error);
-      });
-      resolve({
-        imported: 0,
-        requested: context.requested,
-        scraped: 0,
-        scored: 0,
-        rejected: 0,
-        duplicates: 0,
-        insertFailed: 0,
-        extractedSuccessfully: 0,
-        extractionFailuresByReason: {},
-        remainingNeeded: context.requested,
-        elapsedMs: timeoutMs,
-        rounds: 0,
-        stopReason: "error",
-        error: `Batch watchdog: exceeded ${timeoutMs}ms without completing.`,
-        queriesCompleted: 0,
-        pagesSearched: 0,
-        uniqueUrlsDiscovered: 0,
-      });
-    }, timeoutMs);
+  abortController: AbortController,
+): Promise<AdminScraperResult & { cancellationConfirmed: boolean }> {
+  let settled = false;
+  let settledResult: AdminScraperResult | null = null;
+  let settledError: unknown = null;
+  work.then(
+    (result) => {
+      settled = true;
+      settledResult = result;
+    },
+    (error) => {
+      settled = true;
+      settledError = error;
+    },
+  );
+
+  function zeroResult(message: string): AdminScraperResult {
+    return {
+      imported: 0,
+      requested: context.requested,
+      scraped: 0,
+      scored: 0,
+      rejected: 0,
+      duplicates: 0,
+      insertFailed: 0,
+      extractedSuccessfully: 0,
+      extractionFailuresByReason: {},
+      remainingNeeded: context.requested,
+      elapsedMs: timeoutMs,
+      rounds: 0,
+      stopReason: "error",
+      error: message,
+      queriesCompleted: 0,
+      pagesSearched: 0,
+      uniqueUrlsDiscovered: 0,
+    };
+  }
+
+  const timedOut = await Promise.race([
+    work.then(
+      () => false,
+      () => false,
+    ),
+    new Promise<boolean>((resolve) => setTimeout(() => resolve(true), timeoutMs)),
+  ]);
+
+  if (!timedOut) {
+    if (settledError) throw settledError;
+    return { ...(settledResult as unknown as AdminScraperResult), cancellationConfirmed: true };
+  }
+
+  console.error(
+    `[watchdog] Batch ${context.batch} attempt ${context.attempt} exceeded ${timeoutMs}ms with no result — ` +
+      `aborting and waiting up to ${WATCHDOG_GRACE_MS}ms to confirm cancellation.`,
+  );
+  abortController.abort(new BatchAbortedError(`Batch watchdog: exceeded ${timeoutMs}ms without completing.`));
+
+  await new Promise((resolve) => setTimeout(resolve, WATCHDOG_GRACE_MS));
+
+  if (settled) {
+    console.log(
+      `[watchdog] Batch ${context.batch} attempt ${context.attempt} — abort took effect within the grace ` +
+        "period; cancellation confirmed.",
+    );
+    const finalResult = settledResult as unknown as AdminScraperResult | null;
+    if (finalResult) return { ...finalResult, cancellationConfirmed: true };
+    const reason = settledError instanceof Error ? settledError.message : String(settledError);
+    return { ...zeroResult(`Batch watchdog: exceeded ${timeoutMs}ms; aborted with: ${reason}`), cancellationConfirmed: true };
+  }
+
+  console.error(
+    `[watchdog] Batch ${context.batch} attempt ${context.attempt} — abort did NOT take effect within ` +
+      `${WATCHDOG_GRACE_MS}ms; the underlying work may still be running in the background. Forcing browser ` +
+      "cleanup as a last resort (this alone cannot guarantee the work has actually stopped).",
+  );
+  await forceCloseAllTrackedBrowsers(
+    `batch ${context.batch} attempt ${context.attempt} exceeded ${timeoutMs}ms and did not confirm cancellation within ${WATCHDOG_GRACE_MS}ms`,
+  ).catch((error) => {
+    console.error("[watchdog] Forced browser cleanup itself failed:", error);
   });
 
-  return Promise.race([work.finally(() => clearTimeout(timer)), watchdog]);
+  return {
+    ...zeroResult(
+      `Batch watchdog: exceeded ${timeoutMs}ms without completing; cancellation could not be confirmed within ${WATCHDOG_GRACE_MS}ms.`,
+    ),
+    cancellationConfirmed: false,
+  };
 }
 
 // Merges two "reason -> count" maps (extraction failures by reason) —
@@ -2691,6 +2860,12 @@ export async function runLargeScaleAdminScraper(
     // defaults below, which assume a standalone, not-request-bounded run.
     perBatchTimeoutMs?: number;
     maxAttemptsPerBatch?: number;
+    // Cancellation fix — external abort source (process-batch/route.ts
+    // ties this to the batch lease being lost/superseded, or the job
+    // being paused/failed out from under this attempt). Composed with
+    // this function's OWN per-attempt AbortController below — either one
+    // firing aborts the attempt currently in flight.
+    signal?: AbortSignal;
   } = {},
 ): Promise<LargeScaleAdminScraperResult> {
   const perBatchTimeoutMs = hooks.perBatchTimeoutMs ?? PER_BATCH_MAX_RUNTIME_MS;
@@ -2737,6 +2912,10 @@ export async function runLargeScaleAdminScraper(
   let totalExtractedSuccessfully = 0;
   const extractionFailuresByReason: Record<string, number> = {};
   let batchesRun = 0;
+  // Zero-progress-watchdog fix — see LargeScaleAdminScraperResult's own
+  // comment on lastBatchError.
+  let lastBatchError: string | null = null;
+  let lastAttemptCancellationConfirmed = true;
   let consecutiveBatchFailures = 0;
   let stopReason: LargeScaleStopReason = "max_batches_reached";
   // Discovery-scaling dashboard numbers, cumulative across every batch.
@@ -2835,6 +3014,23 @@ export async function runLargeScaleAdminScraper(
           `inventory ${inventoryNow}/${targetInventorySize}, asking for ${thisBatchLimit}`,
       );
 
+      // Cancellation fix — one AbortController per attempt (a fresh
+      // attempt needs its own; a previous attempt's watchdog-fired abort
+      // must never carry over and immediately cancel the next one).
+      // Composed with the caller's own external signal (process-batch/
+      // route.ts ties this to the batch lease being lost/superseded, or
+      // the job being paused/failed) — either source aborts this attempt.
+      const attemptAbortController = new AbortController();
+      if (hooks.signal) {
+        if (hooks.signal.aborted) {
+          attemptAbortController.abort(hooks.signal.reason);
+        } else {
+          hooks.signal.addEventListener("abort", () => attemptAbortController.abort(hooks.signal!.reason), {
+            once: true,
+          });
+        }
+      }
+
       const attemptResult = await withBatchWatchdog(
         runAdminScraper(batchOptions, (progress) => {
           if (progress.lastProcessedUrl) seenUrls.add(progress.lastProcessedUrl);
@@ -2894,10 +3090,12 @@ export async function runLargeScaleAdminScraper(
                 });
             }
           }
-        }),
+        }, attemptAbortController.signal),
         { batch, attempt, requested: thisBatchLimit },
         perBatchTimeoutMs,
+        attemptAbortController,
       );
+      lastAttemptCancellationConfirmed = attemptResult.cancellationConfirmed;
 
       if (attemptResult.stopReason !== "error") {
         result = attemptResult;
@@ -2917,6 +3115,7 @@ export async function runLargeScaleAdminScraper(
       // on to the NEXT batch rather than aborting the whole run (this
       // feature's own explicit resilience requirement).
       consecutiveBatchFailures++;
+      lastBatchError = lastError ?? "Unknown batch failure.";
       console.error(
         `[admin-scraper] Batch ${batch} failed after ${maxAttemptsPerBatch} attempt(s) — moving on. Last error: ${lastError}`,
       );
@@ -2963,6 +3162,7 @@ export async function runLargeScaleAdminScraper(
     }
 
     consecutiveBatchFailures = 0;
+    lastBatchError = null;
     totalImported += result.imported;
     // Dashboard-metrics fix (Inventory Growth/Bulk Importer architecture
     // parity) — "Valid" is real inserted rows, not "cleared the quality
@@ -3047,5 +3247,12 @@ export async function runLargeScaleAdminScraper(
     totalQueriesCompleted,
     totalPagesSearched,
     totalUniqueUrlsDiscovered,
+    lastBatchError,
+    // Cancellation fix — whether the LAST attempt's own cancellation (if
+    // any watchdog fired) was confirmed to have actually stopped the
+    // underlying work. True whenever no watchdog ever fired this call
+    // (the common case). See process-batch/route.ts's own use of this to
+    // decide whether releasing the batch lease is safe.
+    cancellationConfirmed: lastAttemptCancellationConfirmed,
   };
 }

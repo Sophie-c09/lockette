@@ -32,6 +32,7 @@ import { cleanListingDescription } from "@/lib/extraction/clean-description";
 import { generateCleanTitle } from "@/lib/extraction/generate-title";
 import { inferAestheticTags } from "@/lib/extraction/infer-aesthetic-tags";
 import { enrichWithRelatedStyles } from "@/lib/style-relationships";
+import { BatchAbortedError } from "@/lib/concurrency";
 
 export type { ExtractedListing };
 
@@ -129,6 +130,11 @@ function mergeRaw(
  */
 export async function extractListingFromUrl(
   url: string,
+  // Cancellation fix — only ever set by Inventory Growth's own per-attempt
+  // AbortController (see admin-scraper.ts's extractWithTimeout); every
+  // other caller (the /admin/import single-URL importer, bulk-import)
+  // omits it and keeps its exact current behavior.
+  signal?: AbortSignal,
 ): Promise<ExtractedListing> {
   let parsed: URL;
   try {
@@ -141,22 +147,26 @@ export async function extractListingFromUrl(
     throw new Error("The URL must start with http:// or https://.");
   }
 
+  if (signal?.aborted) {
+    throw new BatchAbortedError("Extraction skipped — batch aborted before it started");
+  }
+
   const pageUrl = parsed.toString();
   const platform = detectPlatform(parsed.hostname);
   debugLog(`Processing URL: ${pageUrl} — platform detected: ${platform ?? "unknown"}`);
 
-  const htmlResult = await runHtmlExtraction(pageUrl);
+  const htmlResult = await runHtmlExtraction(pageUrl, signal);
   const htmlIncomplete = isMissingImportantFields(htmlResult);
   debugLog(`HTML extraction: ${htmlResult ? (htmlIncomplete ? "incomplete" : "complete") : "failed"}`);
 
   let finalRaw = htmlResult;
 
-  if (htmlIncomplete) {
+  if (htmlIncomplete && !signal?.aborted) {
     debugLog("Browser extraction: attempted");
 
     let browserResult: RawExtraction | null = null;
     try {
-      browserResult = await runBrowserExtraction(pageUrl);
+      browserResult = await runBrowserExtraction(pageUrl, signal);
     } catch (error) {
       // runBrowserExtraction already catches internally and returns null on
       // failure — this is a second safety net in case Playwright itself

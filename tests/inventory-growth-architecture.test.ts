@@ -32,6 +32,18 @@ const metricsSource = readFileSync(
   join(__dirname, "../src/app/api/admin-scraper/large-scale/metrics/route.ts"),
   "utf-8",
 );
+// Render-worker migration — process-batch/route.ts no longer imports/calls
+// runLargeScaleAdminScraper directly; that now happens one level deeper,
+// in the shared batch-unit pipeline both process-batch/route.ts AND
+// src/workers/inventory-growth-worker.ts invoke (see batch-unit.ts's own
+// header comment). "process-batch is the only place the scraper actually
+// runs — not the Start/Resume route" is still exactly true; it's just
+// reached via runBatchUnit -> runLargeScaleAdminScraper now instead of
+// directly.
+const batchUnitSource = readFileSync(
+  join(__dirname, "../src/lib/inventory/batch-unit.ts"),
+  "utf-8",
+);
 
 test("the Start/Resume route never imports the long-running scraper", () => {
   assert.doesNotMatch(routeSource, /from ["']@\/lib\/admin-scraper["']/);
@@ -59,11 +71,18 @@ test("every non-2xx branch style used in the Start/Resume route returns NextResp
 });
 
 test("process-batch runs at most one batch per call (bounded, not open-ended)", () => {
-  assert.match(processBatchSource, /maxBatches:\s*1\b/);
-  // And it, not the Start/Resume route, is the one place the scraper is
-  // actually imported/invoked.
-  assert.match(processBatchSource, /from ["']@\/lib\/admin-scraper["']/);
-  assert.match(processBatchSource, /runLargeScaleAdminScraper\(/);
+  // The bounded-unit pipeline itself (maxBatches: 1, and the actual
+  // runLargeScaleAdminScraper call) lives in the shared batch-unit module
+  // process-batch/route.ts delegates to — see that file's own header
+  // comment on why (both it and the Render worker invoke the exact same
+  // implementation, never duplicated).
+  assert.match(batchUnitSource, /maxBatches:\s*1\b/);
+  assert.match(batchUnitSource, /from ["']@\/lib\/admin-scraper["']/);
+  assert.match(batchUnitSource, /runLargeScaleAdminScraper\(/);
+  // And process-batch/route.ts (not the Start/Resume route) is the only
+  // route that reaches this pipeline at all.
+  assert.match(processBatchSource, /from ["']@\/lib\/inventory\/batch-unit["']/);
+  assert.match(processBatchSource, /runBatchUnit\(/);
 });
 
 test("process-batch never uses after() either — it awaits its one bounded batch synchronously", () => {
@@ -108,9 +127,14 @@ test("the single-call override is genuinely smaller than the standalone defaults
 });
 
 test("process-batch actually passes the single-call overrides and an interim onProgress hook to runLargeScaleAdminScraper", () => {
-  assert.match(processBatchSource, /perBatchTimeoutMs:\s*SINGLE_BATCH_CALL_TIMEOUT_MS/);
+  // process-batch/route.ts supplies the single-call-sized values...
+  assert.match(processBatchSource, /batchTimeoutMs:\s*SINGLE_BATCH_CALL_TIMEOUT_MS/);
   assert.match(processBatchSource, /maxAttemptsPerBatch:\s*SINGLE_BATCH_CALL_MAX_ATTEMPTS/);
-  assert.match(processBatchSource, /onProgress:\s*async/);
+  // ...and the shared batch-unit pipeline forwards them (under runLargeScaleAdminScraper's
+  // own hook names) plus an interim onProgress hook, straight through.
+  assert.match(batchUnitSource, /perBatchTimeoutMs:\s*batchTimeoutMs/);
+  assert.match(batchUnitSource, /maxAttemptsPerBatch,/);
+  assert.match(batchUnitSource, /onProgress:\s*async/);
 });
 
 // Regression guard for the "Next.js HTML 500 error page" fix: the metrics

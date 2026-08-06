@@ -226,6 +226,28 @@ export async function markUrlFailed(row: UrlQueueRow, maxAttempts: number): Prom
   }
 }
 
+/**
+ * Cancellation fix — releases a row THIS execution had claimed but never
+ * got a definite outcome for (the batch was aborted before extraction
+ * finished), back to 'pending' so a future run can claim and try it for
+ * real — never markUrlFailed, which would count against attempt_count for
+ * a URL that was never actually given a real attempt. Scoped by exact row
+ * id AND `status = 'claimed'` — if this same row somehow already reached
+ * 'extracted'/'failed' by the time this runs (a genuine result landed in
+ * the same narrow window as the abort), that outcome is left alone rather
+ * than being overwritten back to 'pending'.
+ */
+export async function releaseClaimedUrl(id: string): Promise<void> {
+  const supabase = client();
+  const { error } = await supabase
+    .from("scraper_url_queue")
+    .update({ status: "pending" })
+    .eq("id", id)
+    .eq("status", "claimed");
+
+  if (error) console.error("[url-queue] Failed to release claimed URL back to pending:", id, error);
+}
+
 export interface UrlQueueStats {
   pending: number;
   claimed: number;

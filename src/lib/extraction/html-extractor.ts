@@ -97,13 +97,19 @@ const BROWSER_HEADERS: HeadersInit = {
 // redirect to a login/CAPTCHA wall, etc.) is a normal, expected outcome,
 // not a bug. Callers fall back to browser extraction (or a placeholder
 // listing) when this returns null.
-export async function fetchHtml(url: string): Promise<string | null> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+export async function fetchHtml(url: string, signal?: AbortSignal): Promise<string | null> {
+  // Own internal timeout controller, ALWAYS present — composed with the
+  // caller's external signal (only ever Inventory Growth's own per-attempt
+  // AbortController; every other caller omits it) via AbortSignal.any so
+  // either one aborts the actual fetch. Native fetch() accepts an
+  // AbortSignal directly — no extra plumbing needed beyond this.
+  const timeoutController = new AbortController();
+  const timeout = setTimeout(() => timeoutController.abort(), FETCH_TIMEOUT_MS);
+  const combinedSignal = signal ? AbortSignal.any([timeoutController.signal, signal]) : timeoutController.signal;
 
   try {
     const response = await fetch(url, {
-      signal: controller.signal,
+      signal: combinedSignal,
       redirect: "follow",
       headers: BROWSER_HEADERS,
     });
@@ -160,7 +166,16 @@ export async function fetchHtml(url: string): Promise<string | null> {
     return bodyText;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    debugLog(`Fetch threw for ${url}: ${reason}`);
+    // Cancellation fix — distinguish "the batch was cancelled" from a
+    // genuine fetch failure (still returns null either way — this
+    // function's own contract — but the log is never folded into a
+    // generic "Fetch threw" line that would look like a marketplace/
+    // network problem).
+    if (signal?.aborted && !timeoutController.signal.aborted) {
+      debugLog(`Fetch cancelled for ${url} (batch aborted): ${reason}`);
+    } else {
+      debugLog(`Fetch threw for ${url}: ${reason}`);
+    }
     return null;
   } finally {
     clearTimeout(timeout);
@@ -461,8 +476,9 @@ export function extractFromHtml(html: string): RawExtraction {
 
 // Fetch + parse in one call — the "first attempt" of the pipeline.
 // Never throws; returns null if the page couldn't be fetched at all.
-export async function runHtmlExtraction(url: string): Promise<RawExtraction | null> {
-  const html = await fetchHtml(url);
+// `signal` — see fetchHtml's own comment.
+export async function runHtmlExtraction(url: string, signal?: AbortSignal): Promise<RawExtraction | null> {
+  const html = await fetchHtml(url, signal);
   if (!html) return null;
   return extractFromHtml(html);
 }

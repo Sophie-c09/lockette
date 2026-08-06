@@ -34,15 +34,26 @@ test("releaseBatchLease is guarded by leaseId, not just jobId — a reclaimed le
   assert.match(fnBody, /\.eq\("batch_lease_id", leaseId\)/);
 });
 
-test("process-batch/route.ts claims the lease before running a batch and releases it via finally", () => {
+test("process-batch/route.ts claims the lease before running a batch", () => {
   assert.match(routeSource, /claimBatchLease\(jobId\)/);
-  assert.match(routeSource, /finally\s*\{\s*await releaseBatchLease\(jobId, leaseId\);/);
+});
+
+test("process-batch/route.ts's lease release is CONDITIONAL on cancellation being confirmed (concurrency fix) — never an unconditional finally anymore", () => {
+  // ROOT CAUSE REGRESSION GUARD: releasing unconditionally in a bare
+  // `finally` (the original P0 shape) is exactly what let a leaked,
+  // still-running background execution and a brand-new execution both
+  // hold a valid lease at overlapping times — see the concurrency fix's
+  // own header comment on shouldReleaseLease.
+  assert.doesNotMatch(routeSource, /finally\s*\{\s*await releaseBatchLease\(jobId, leaseId\);\s*\}/);
+  const finallyBlock = routeSource.slice(routeSource.indexOf("} finally {", routeSource.indexOf("runOneBatch(")));
+  assert.match(finallyBlock, /if \(releaseLease\)/);
+  assert.match(finallyBlock, /await releaseBatchLease\(jobId, leaseId\);/);
 });
 
 test("losing the batch-lease race is treated as 'nothing to do this tick', not an error", () => {
   const claimBlock = routeSource.slice(
     routeSource.indexOf("const { claimed, leaseId }"),
-    routeSource.indexOf("try {\n      return await runOneBatch"),
+    routeSource.indexOf("let releaseLease = true;"),
   );
   assert.match(claimBlock, /if \(!claimed\)/);
   assert.match(claimBlock, /batchRan: false/);

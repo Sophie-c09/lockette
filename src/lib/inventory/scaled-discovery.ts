@@ -30,7 +30,7 @@ import {
   BLOCKED_STATUS_CODES,
   type DiscoveredCandidate,
 } from "@/lib/marketplace-discovery";
-import { mapWithConcurrency } from "@/lib/concurrency";
+import { mapWithConcurrency, abortableDelay, BatchAbortedError } from "@/lib/concurrency";
 import { allGeneratedQueries } from "@/lib/inventory/query-generator";
 import {
   getProcessedQueries,
@@ -175,10 +175,23 @@ export const AGGRESSIVE_DISCOVERY_PLATFORMS = ["Vinted", "Depop", "Poshmark"];
 // can't monopolize a whole crawl pass once page 1 is exhausted for
 // everything else.
 const DEFAULT_MAX_PAGES_PER_QUERY = 5;
-// How many (query, page) combinations one platform worker pulls per call
-// — generous relative to its own concurrency so a full pass keeps workers
-// busy without re-fetching discovery-history mid-pass.
-const COMBINATIONS_PER_CALL = 60;
+// How many (query, page) combinations one platform worker pulls per call.
+//
+// INVENTORY GROWTH ZERO-PROGRESS ROOT CAUSE (confirmed live): every large-
+// scale run now goes through process-batch/route.ts's single bounded
+// call (SINGLE_BATCH_CALL_TIMEOUT_MS, scraper-config.ts) — there is no
+// standalone/overnight process anymore that this constant's old value of
+// 60 was actually sized for. A real page visit measured live at ~6.5-7s
+// average latency; at a platform's own concurrency (3-4), 60 combinations
+// alone need multiple minutes to finish — the outer batch watchdog fires
+// long before a single round can complete, discarding all of that
+// round's real (in-memory) progress and advancing current_round on zero
+// credited work, forever, with no error ever surfaced (see
+// process-batch/route.ts's own zero-progress-watchdog fix). Lowered so a
+// full discovery pass for one platform reliably finishes within a few
+// concurrency waves, leaving real time in the same call's budget for
+// extraction.
+const COMBINATIONS_PER_CALL = 15;
 
 function debugLog(message: string): void {
   console.warn(`[scaled-discovery] ${message}`);
@@ -253,10 +266,19 @@ export function checkStartupResources(): void {
 // calls span that window over the course of a long overnight run.
 const lastRequestAtByPlatform: Record<string, number> = {};
 
-async function waitForRateLimit(platform: string, minDelayMs: number): Promise<void> {
+async function waitForRateLimit(platform: string, minDelayMs: number, signal?: AbortSignal): Promise<void> {
   const last = lastRequestAtByPlatform[platform] ?? 0;
   const wait = last + minDelayMs - Date.now();
-  if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+  // Cancellation fix — exits early on abort instead of always waiting out
+  // the full rate-limit gap; the caller (crawlPlatform) checks
+  // signal.aborted again immediately after this returns.
+  if (wait > 0) {
+    try {
+      await abortableDelay(wait, signal);
+    } catch {
+      return;
+    }
+  }
   lastRequestAtByPlatform[platform] = Date.now();
 }
 
@@ -377,7 +399,17 @@ async function crawlPlatform(
   // still populated exactly as before for callers that only want the
   // final batched return.
   onUrlsFound?: (candidates: DiscoveredCandidate[]) => Promise<void> | void,
+  // Cancellation fix — see discoverListingUrlsAtScale's own comment.
+  signal?: AbortSignal,
 ): Promise<PlatformCrawlResult> {
+  const queriesUsed = new Set<string>();
+  let pagesSearched = 0;
+
+  if (signal?.aborted) {
+    debugLog(`${source.platform}: aborted before starting — no new work launched`);
+    return { pagesSearched, queriesUsed };
+  }
+
   const [processed, yields] = await Promise.all([
     getProcessedQueries(source.platform),
     getQueryYields(source.platform),
@@ -385,9 +417,6 @@ async function crawlPlatform(
   const exhaustedQueries = computeExhaustedQueries(yields);
   const prioritizedQueries = prioritizeQueriesByYield(allGeneratedQueries(), yields);
   const picks = pickNextCombinations(prioritizedQueries, processed, exhaustedQueries, COMBINATIONS_PER_CALL, maxPagesPerQuery);
-
-  const queriesUsed = new Set<string>();
-  let pagesSearched = 0;
 
   if (picks.length === 0) {
     debugLog(`${source.platform}: no unprocessed query/page combinations left within ${maxPagesPerQuery} pages`);
@@ -415,6 +444,11 @@ async function crawlPlatform(
     await mapWithConcurrency(picks, concurrency, async ({ query, page }, index) => {
       if (sharedFound.size >= targetTotal) return;
 
+      // Cancellation fix — stop launching new attempts the moment an
+      // abort is observed; in-flight attempts (already past this check)
+      // are interrupted separately below via their own page/context.
+      if (signal?.aborted) return;
+
       // Discovery redesign requirement 2/4 — marketplace-health's circuit
       // breaker. Skipped WITHOUT calling recordDiscoveryRun below, so this
       // exact combination is retried later (once the platform recovers)
@@ -434,7 +468,8 @@ async function crawlPlatform(
         return;
       }
 
-      await waitForRateLimit(source.platform, source.minDelayMs);
+      await waitForRateLimit(source.platform, source.minDelayMs, signal);
+      if (signal?.aborted) return;
 
       // Global discovery concurrency gate (DISCOVERY_CONCURRENCY) — see
       // its own header comment. Acquired per-attempt, right before the
@@ -451,6 +486,21 @@ async function crawlPlatform(
       let pageHandle: Page | null = null;
       let urlsFoundThisPage = 0;
       const attemptStart = Date.now();
+      let abortedThisAttempt = false;
+      let wasAborted = false;
+      // Cancellation fix — page.goto()/waitForLoadState() have no
+      // AbortSignal support of their own; closing the page/context out
+      // from under them is the supported way to interrupt an in-flight
+      // navigation (both reject almost immediately with a "Target
+      // closed"-style error, which the catch block below recognizes via
+      // `abortedThisAttempt`/signal.aborted rather than treating it as a
+      // genuine marketplace failure).
+      const onAbort = () => {
+        abortedThisAttempt = true;
+        pageHandle?.close().catch(() => {});
+        context?.close().catch(() => {});
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
 
       try {
         context = await browser!.newContext({
@@ -541,19 +591,40 @@ async function crawlPlatform(
           error: outcome === "empty_response" ? "responded successfully but returned no usable data" : null,
         });
       } catch (error) {
-        const reason = error instanceof Error ? error.message : String(error);
-        const outcome = /timeout/i.test(reason) ? "timeout" : "error";
-        if (outcome === "timeout") timeoutCount++;
-        recordDiscoveryAttempt(source.platform, outcome, Date.now() - attemptStart);
-        debugLog(`${source.platform} / "${query}" page ${page} failed: ${reason}`);
-        console.log("[DISCOVERY WORKER]", {
-          marketplace: source.platform,
-          query,
-          success: false,
-          urlsFound: 0,
-          error: reason,
-        });
+        // Cancellation fix — a page/context closed BECAUSE of our own
+        // abort must never be classified as a marketplace/network
+        // failure: no circuit-breaker hit (recordDiscoveryAttempt below)
+        // and no "already tried, found nothing" history entry
+        // (recordDiscoveryRun in the finally block, skipped when aborted)
+        // — this combination genuinely was never attempted to completion,
+        // so a future run must still be free to try it for real.
+        wasAborted = abortedThisAttempt || error instanceof BatchAbortedError || Boolean(signal?.aborted);
+
+        if (wasAborted) {
+          debugLog(`${source.platform} / "${query}" page ${page} — cancelled (batch aborted), not a failure`);
+          console.log("[DISCOVERY WORKER]", {
+            marketplace: source.platform,
+            query,
+            success: false,
+            urlsFound: 0,
+            error: "cancelled (batch aborted)",
+          });
+        } else {
+          const reason = error instanceof Error ? error.message : String(error);
+          const outcome = /timeout/i.test(reason) ? "timeout" : "error";
+          if (outcome === "timeout") timeoutCount++;
+          recordDiscoveryAttempt(source.platform, outcome, Date.now() - attemptStart);
+          debugLog(`${source.platform} / "${query}" page ${page} failed: ${reason}`);
+          console.log("[DISCOVERY WORKER]", {
+            marketplace: source.platform,
+            query,
+            success: false,
+            urlsFound: 0,
+            error: reason,
+          });
+        }
       } finally {
+        signal?.removeEventListener("abort", onAbort);
         releaseDiscoverySlot();
         // Pages are always closed before their context — closing a
         // context implicitly closes its pages too, but doing this
@@ -568,35 +639,50 @@ async function crawlPlatform(
           }
         }
         if (context) await context.close();
-        pagesSearched++;
-        queriesUsed.add(query);
-        // Recorded even on 0 results / a failed visit — a page that's
-        // been tried and came up empty is exactly the combination that
-        // must NOT be retried next round; only that (never re-crawling a
-        // combination whether or not it panned out) is what keeps the
-        // duplicate rate from climbing the way it did before this module
-        // existed.
-        await recordDiscoveryRun(source.platform, query, page, urlsFoundThisPage);
-        // Logged unconditionally here (not in the success-only branch
-        // above) so it always matches exactly what recordDiscoveryRun just
-        // persisted, whether this attempt succeeded, was blocked, or threw.
-        console.log(`[discovery] query="${query}" results=${urlsFoundThisPage}`);
+
+        if (!wasAborted) {
+          pagesSearched++;
+          queriesUsed.add(query);
+          // Recorded even on 0 results / a failed visit — a page that's
+          // been tried and came up empty is exactly the combination that
+          // must NOT be retried next round; only that (never re-crawling
+          // a combination whether or not it panned out) is what keeps the
+          // duplicate rate from climbing the way it did before this
+          // module existed. Skipped entirely when aborted (see the catch
+          // block above) — an aborted attempt was never really tried.
+          await recordDiscoveryRun(source.platform, query, page, urlsFoundThisPage);
+          // Logged unconditionally here (not in the success-only branch
+          // above) so it always matches exactly what recordDiscoveryRun
+          // just persisted, whether this attempt succeeded, was blocked,
+          // or threw.
+          console.log(`[discovery] query="${query}" results=${urlsFoundThisPage}`);
+        }
       }
     });
   }
 
   try {
+    // Cancellation fix — never acquire a new browser after abort.
+    if (signal?.aborted) {
+      debugLog(`${source.platform}: aborted before acquiring a browser — no new work launched`);
+      return { pagesSearched, queriesUsed };
+    }
     browser = await acquirePooledBrowser(await resolveBrowserLaunchOptions({ headless: true, timeout: LAUNCH_TIMEOUT_MS }));
 
     await runPass(concurrencyOverride ?? source.concurrency);
 
-    if (attemptedCount > 0 && timeoutCount === attemptedCount) {
+    if (!signal?.aborted && attemptedCount > 0 && timeoutCount === attemptedCount) {
       console.warn(
         `[scaled-discovery] ${source.platform}: all ${attemptedCount} attempt(s) timed out this pass — ` +
           `waiting ${RECOVERY_WAIT_MS / 1000}s and retrying once at reduced concurrency ` +
           "(likely local resource exhaustion, not a marketplace-specific problem).",
       );
-      await new Promise((resolve) => setTimeout(resolve, RECOVERY_WAIT_MS));
+      try {
+        await abortableDelay(RECOVERY_WAIT_MS, signal);
+      } catch {
+        debugLog(`${source.platform}: aborted during recovery-wait backoff — skipping the retry pass`);
+        return { pagesSearched, queriesUsed };
+      }
       const reducedConcurrency = Math.max(1, Math.floor((concurrencyOverride ?? source.concurrency) / 2));
       await runPass(reducedConcurrency);
     }
@@ -686,13 +772,18 @@ export async function discoverListingUrlsAtScale(
   // the same sharedFound map exactly as before for any caller that only
   // wants the final batched result.
   onUrlsFound?: (candidates: DiscoveredCandidate[]) => Promise<void> | void,
+  // Cancellation fix — only ever set by Inventory Growth's own per-attempt
+  // AbortController (runLargeScaleAdminScraper via runAdminScraper); every
+  // other caller omits it. crawlPlatform stops launching new page-search
+  // attempts and closes its active page/context the moment this aborts.
+  signal?: AbortSignal,
 ): Promise<ScaledDiscoveryResult> {
   const sharedFound = new Map<string, DiscoveredCandidate>();
   const sources = allowedPlatforms ? SCALED_SOURCES.filter((s) => allowedPlatforms.includes(s.platform)) : SCALED_SOURCES;
 
   const results = await Promise.all(
     sources.map((source) =>
-      crawlPlatform(source, excludeUrls, sharedFound, targetCount, maxPagesPerQuery, concurrencyOverride, onUrlsFound),
+      crawlPlatform(source, excludeUrls, sharedFound, targetCount, maxPagesPerQuery, concurrencyOverride, onUrlsFound, signal),
     ),
   );
 
